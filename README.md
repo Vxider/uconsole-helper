@@ -1,67 +1,139 @@
-# Network Helper 图形界面
+# Network Helper
 
-这是一个本机运行的 GTK 桌面图形界面，用于 DHCP Server 配置和 LAN Scan。典型用途是把本机 `eth0` 通过网线直连到另一台服务器，让对方从本机获取 IP，然后扫描同网段设备，方便后续登录和维护。
+Network Helper is a local GTK desktop utility for small network maintenance tasks:
+running a DHCP server on a selected interface, scanning a LAN, checking interface
+status, and viewing Tailscale devices.
 
-## 依赖
+It is designed for workflows such as connecting a machine directly to a server
+over Ethernet, assigning an address with DHCP, and then finding the target device
+on the local network.
+
+## Features
+
+- DHCP Server tab for serving addresses on a selected wired interface.
+- LAN Scan tab for scanning hosts in the selected interface's IPv4 subnet.
+- Interface tab with NetworkManager-style device status, addresses, Wi-Fi signal,
+  cellular signal, and Tailscale interface state.
+- Tailscale tab with a device list, online state, Tailscale IPv4 address, and a
+  right-click copy menu for IPv4, IPv6, and DNS name.
+- Keyboard shortcuts for tab switching and common actions.
+
+## Requirements
 
 - Python 3
 - PyGObject / GTK 3
 - `dnsmasq`
 - `iproute2`
 - `iputils-ping`
-- `pkexec` 或 `sudo`，用于启动/停止时提权
+- `pkexec` or `sudo` for DHCP start/stop privilege elevation
 
-Debian/Ubuntu 可安装：
+Optional integrations:
+
+- `nmcli` for NetworkManager interface state
+- `mmcli` for cellular modem signal
+- `tailscale` for Tailscale device status
+- `avahi-resolve` for mDNS hostname lookup
+
+On Debian/Ubuntu:
 
 ```bash
 sudo apt install python3-gi gir1.2-gtk-3.0 dnsmasq iproute2 iputils-ping policykit-1
 ```
 
-## 启动
+## Run
 
 ```bash
 ./run.sh
 ```
 
-会直接打开本地 GTK 桌面窗口。启动 DHCP Server 或停止时会通过 `pkexec` 或 `sudo` 请求管理员权限。
+Starting or stopping the DHCP server may prompt for administrator privileges via
+`pkexec` or `sudo`.
 
-也可以把 `network-helper.desktop` 放到 `~/.local/share/applications/`，之后从桌面应用菜单启动。
+## Install Desktop Launcher
 
-## 使用方式
+Install the app launcher and icon for the current user:
 
-顶部标签支持点击切换，也支持快捷键：
+```bash
+./scripts/install-user-desktop.sh
+```
 
-- `Ctrl+1`: DHCP
-- `Ctrl+2`: LAN Scan
-- `Alt+Left` / `Alt+Right`: 前后切换标签
+This installs:
 
-### DHCP
+- `~/.local/share/applications/network-helper.desktop`
+- `~/.local/share/icons/hicolor/scalable/apps/network-helper.svg`
 
-1. 选择要作为 DHCP Server 的网口，例如 `eth0`。支持的网口会显示“已连接 / 未连接 / 不可用”；无线、Tailscale/tun、loopback、虚拟网口、蜂窝/USB modem 网络设备会置灰并标注“不支持”。
-2. 设置本机地址，例如 `192.168.50.1`。
-3. 设置地址池，例如 `192.168.50.100` 到 `192.168.50.200`。
-4. 点击“启动 DHCP Server”。
-5. 将该网口通过网线连接到目标服务器，目标服务器设置为 DHCP 获取地址。
+## Shortcuts
 
-启动时程序会把所选网口配置为静态地址，并在该网口上提供 DHCP 服务。运行时文件位于 `/tmp/network-helper/dhcp`。
+Tabs:
 
-### LAN Scan
+- `D`: DHCP Server
+- `L`: LAN Scan
+- `I`: Interface
+- `T`: Tailscale
+- `Ctrl+1` through `Ctrl+4`: switch tabs directly
+- `Alt+Left` / `Alt+Right`: switch to the previous or next tab
 
-1. 切换到 `LAN Scan` 标签。
-2. 选择要扫描的网口。
-3. 点击“扫描 LAN”。
+Actions:
 
-扫描会根据该网口当前 IPv4 地址计算网段，对网段内主机做一次 ping 探测，然后读取系统邻居表展示 IP、MAC、状态和主机名。为避免误扫大网段，当前限制为 /23 或更小网段。
+- `R`: refresh the current page
+- `S`: run the current primary action, such as Start, Stop, or Scan
 
-## 注意
+Text fields do not trigger direct letter shortcuts while focused.
 
-- 不要选择当前正在上网的网口，否则程序会刷新该网口地址，可能导致网络中断。
-- 默认不提供 NAT，只负责给直连设备分配 IP。如需让对方通过本机上网，需要额外配置转发和 NAT。
-- 停止 DHCP Server 不会自动恢复网口启动前的地址配置。
+## DHCP Server
 
-## 调试网口识别
+1. Select the wired interface to serve DHCP on.
+2. Set the local server address, netmask, address pool, lease time, and optional
+   gateway/DNS values.
+3. Click `Start`.
+4. Connect the selected interface to the target machine.
+5. Stop the server with `Stop` when finished.
 
-不用打开 GUI 也可以查看筛选结果：
+Runtime files are stored under:
+
+```text
+/tmp/network-helper/dhcp
+```
+
+Notes:
+
+- Do not select an interface currently used for remote access or internet access.
+  Starting DHCP flushes and reconfigures addresses on the selected interface.
+- NAT is not configured automatically. The DHCP server only assigns addresses.
+- Stopping the DHCP server does not restore the interface's previous address
+  configuration.
+
+## LAN Scan
+
+1. Select the interface to scan.
+2. Click `Scan`.
+
+The default scan interface is selected from the highest-priority IPv4 default
+route. Scanning is limited to `/23` or smaller subnets to avoid accidental large
+network scans.
+
+Hostnames are resolved from local hosts files, DHCP leases, reverse DNS, mDNS,
+and NetBIOS when available. Devices that do not expose a hostname will show `-`.
+
+## Interface
+
+The Interface tab shows device status similar to `nmcli dev status`, plus
+addresses and signal details:
+
+- Wi-Fi signal is shown as a percentage with a four-bar indicator.
+- Cellular signal is read from ModemManager when available.
+- Tailscale interface state is read from `tailscale status --json`.
+
+## Tailscale
+
+The Tailscale tab shows devices from `tailscale status --json`.
+
+The address column displays only the Tailscale IPv4 address. Right-click a device
+row to copy its IPv4 address, IPv6 address, or DNS name.
+
+## Debug Interface Detection
+
+List DHCP Server interface filtering without opening the GUI:
 
 ```bash
 /usr/bin/python3 network_helper_gui.py --list-interfaces
