@@ -42,6 +42,16 @@ DEFAULTS = {
     "dns": "",
 }
 
+DHCP_NETWORK_CANDIDATES = [
+    "192.168.50.0/24",
+    "192.168.60.0/24",
+    "192.168.70.0/24",
+    "192.168.80.0/24",
+    "10.50.0.0/24",
+    "10.60.0.0/24",
+    "172.20.50.0/24",
+]
+
 
 @dataclass(frozen=True)
 class InterfaceInfo:
@@ -78,8 +88,9 @@ class NetworkHelperWindow(Gtk.Window):
         self.interface_combo.set_row_separator_func(interface_row_is_separator)
         self.message_label = Gtk.Label(label="", xalign=0)
         self.entries = {key: Gtk.Entry() for key in DEFAULTS}
+        self.dhcp_defaults = dhcp_defaults()
         for key, entry in self.entries.items():
-            entry.set_text(DEFAULTS[key])
+            entry.set_text(self.dhcp_defaults[key])
 
         self.scan_interface_store = Gtk.ListStore(str, str, bool, str, bool, str)
         self.scan_interface_combo = Gtk.ComboBox.new_with_model(self.scan_interface_store)
@@ -510,6 +521,7 @@ class NetworkHelperWindow(Gtk.Window):
         grid.attach(entry, col + 1, row, 1, 1)
 
     def refresh_interfaces(self) -> None:
+        self.refresh_dhcp_defaults()
         interfaces = discover_interfaces()
         scan_interfaces = discover_scan_interfaces()
         current = self.selected_interface_name()
@@ -532,6 +544,15 @@ class NetworkHelperWindow(Gtk.Window):
             self.interface_combo.set_active(selected_index)
         if scan_selected_index != -1:
             self.scan_interface_combo.set_active(scan_selected_index)
+
+    def refresh_dhcp_defaults(self) -> None:
+        current_defaults = self.dhcp_defaults
+        current_values = {key: entry.get_text().strip() for key, entry in self.entries.items()}
+        if any(current_values.get(key, "") != current_defaults.get(key, "") for key in DEFAULTS):
+            return
+        self.dhcp_defaults = dhcp_defaults()
+        for key, entry in self.entries.items():
+            entry.set_text(self.dhcp_defaults[key])
 
     def refresh_interface_status(self) -> None:
         self.interface_status_store.clear()
@@ -1577,6 +1598,57 @@ def run_helper(action: str, config: dict[str, str] | None = None) -> subprocess.
 
 def combine_output(result: subprocess.CompletedProcess[str]) -> str:
     return "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part)
+
+
+def dhcp_defaults() -> dict[str, str]:
+    network = choose_dhcp_network()
+    values = dict(DEFAULTS)
+    values["server_ip"] = str(network.network_address + 1)
+    values["netmask"] = str(network.netmask)
+    values["pool_start"] = str(network.network_address + 100)
+    values["pool_end"] = str(network.network_address + 200)
+    return values
+
+
+def choose_dhcp_network() -> ipaddress.IPv4Network:
+    used_networks = current_ipv4_networks()
+    for candidate in DHCP_NETWORK_CANDIDATES:
+        network = ipaddress.IPv4Network(candidate)
+        if not any(network.overlaps(used) for used in used_networks):
+            return network
+
+    for third_octet in range(50, 255):
+        network = ipaddress.IPv4Network(f"192.168.{third_octet}.0/24")
+        if not any(network.overlaps(used) for used in used_networks):
+            return network
+
+    return ipaddress.IPv4Network(DEFAULTS["server_ip"] + "/" + DEFAULTS["netmask"], strict=False)
+
+
+def current_ipv4_networks() -> list[ipaddress.IPv4Network]:
+    networks: list[ipaddress.IPv4Network] = []
+    if shutil.which("ip") is not None:
+        result = subprocess.run(["ip", "-4", "-o", "addr", "show"], text=True, capture_output=True, check=False)
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                match = re.search(r"\binet\s+(\d+\.\d+\.\d+\.\d+/\d+)", line)
+                if not match:
+                    continue
+                try:
+                    networks.append(ipaddress.IPv4Interface(match.group(1)).network)
+                except ValueError:
+                    continue
+
+    for route in ipv4_routes():
+        line = str(route["line"])
+        first = line.split(maxsplit=1)[0]
+        if first == "default":
+            continue
+        try:
+            networks.append(ipaddress.IPv4Network(first, strict=False))
+        except ValueError:
+            continue
+    return networks
 
 
 def interface_ipv4_network(interface: str) -> ipaddress.IPv4Network | None:
