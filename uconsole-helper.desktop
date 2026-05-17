@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=Network Helper
+Name=uConsole Helper
 Comment=Run DHCP and scan LAN devices on selected network interfaces
-Exec=/home/vxider/WorkSpace/network-helper/run.sh
-Path=/home/vxider/WorkSpace/network-helper
-Icon=network-helper
+Exec=/home/vxider/WorkSpace/uconsole-helper/run.sh
+Path=/home/vxider/WorkSpace/uconsole-helper
+Icon=uconsole-helper
 Terminal=false
 Categories=Network;Settings;

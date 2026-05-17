@@ -1,0 +1,16 @@
+[Unit]
+Description=uConsole Helper background service
+After=basic.target NetworkManager.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/uconsole-helper-service
+Restart=always
+RestartSec=2
+User=root
+Group=root
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=basic.target

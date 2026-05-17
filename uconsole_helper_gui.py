@@ -11,6 +11,7 @@ gi.require_version("Gdk", "3.0")
 import ipaddress
 import json
 import os
+import platform
 import re
 import shutil
 import socket
@@ -27,9 +28,11 @@ from gi.repository import Gdk, GLib, Gtk
 
 
 APP_DIR = Path(__file__).resolve().parent
-HELPER = APP_DIR / "network_helper_dhcp.py"
+HELPER = APP_DIR / "uconsole_helper_dhcp.py"
 SYS_NET = Path("/sys/class/net")
-LEASE_FILE = Path("/tmp/network-helper/dhcp/dnsmasq.leases")
+LEASE_FILE = Path("/tmp/uconsole-helper/dhcp/dnsmasq.leases")
+SYSTEM_SERVICE = "uconsole-helper.service"
+SERVICE_CONFIG = Path("/etc/uconsole-helper/uconsole-helper.conf")
 
 
 DEFAULTS = {
@@ -67,15 +70,16 @@ class InterfaceInfo:
         return f"{self.name} (不支持)"
 
 
-class NetworkHelperWindow(Gtk.Window):
+class UConsoleHelperWindow(Gtk.Window):
     def __init__(self) -> None:
-        super().__init__(title="Network Helper")
+        super().__init__(title="uConsole Helper")
         self.set_default_size(920, 640)
         self.connect("destroy", Gtk.main_quit)
         self.connect("key-press-event", self.on_key_press)
         self.scan_running = False
         self.scan_cancel = threading.Event()
         self.dhcp_running = False
+        self.tailscale_reconnecting = False
 
         self.interface_store = Gtk.ListStore(str, str, bool, str, bool, str)
         self.interface_combo = Gtk.ComboBox.new_with_model(self.interface_store)
@@ -107,11 +111,16 @@ class NetworkHelperWindow(Gtk.Window):
         self.tailscale_store = Gtk.ListStore(str, str, str, str, str, str, str, str, str, str)
         self.tailscale_summary_label = Gtk.Label(label="", xalign=0)
         self.tailscale_summary_label.get_style_context().add_class("muted")
+        self.power_labels: dict[str, Gtk.Label] = {}
+        self.power_controls: dict[str, Gtk.Widget] = {}
+        self.dashboard_labels: dict[str, Gtk.Label] = {}
 
         self._build_ui()
+        self.refresh_dashboard()
         self.refresh_interfaces()
         self.refresh_interface_status()
         self.refresh_tailscale_status()
+        self.refresh_power_status()
         self.refresh_status()
 
     def _build_ui(self) -> None:
@@ -122,10 +131,12 @@ class NetworkHelperWindow(Gtk.Window):
         self.stack = Gtk.Stack()
         self.stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
         self.stack.set_transition_duration(140)
+        self.stack.add_titled(scrolled_page(self._build_dashboard_page()), "dashboard", "Dashboard")
         self.stack.add_titled(scrolled_page(self._build_dhcp_page()), "dhcp", "DHCP")
         self.stack.add_titled(scrolled_page(self._build_lanscan_page()), "lanscan", "LAN SCAN")
         self.stack.add_titled(scrolled_page(self._build_interface_page()), "interface", "Interface")
         self.stack.add_titled(scrolled_page(self._build_tailscale_page()), "tailscale", "Tailscale")
+        self.stack.add_titled(scrolled_page(self._build_power_page()), "power", "Power")
         self.stack.connect("notify::visible-child-name", lambda *_args: self.update_header())
 
         header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
@@ -135,6 +146,11 @@ class NetworkHelperWindow(Gtk.Window):
         tabs = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         tabs.get_style_context().add_class("app-tabs")
         header.pack_start(tabs, False, False, 0)
+        self.dashboard_tab = underlined_button("Dashboard", "B")
+        self.dashboard_tab.connect("clicked", lambda _button: self.set_tab("dashboard"))
+        self.dashboard_tab.get_style_context().add_class("tab-button")
+        tabs.pack_start(self.dashboard_tab, False, False, 0)
+
         self.dhcp_tab_label = Gtk.Label()
         self.dhcp_tab_label.set_use_markup(True)
         self.dhcp_tab = Gtk.Button()
@@ -158,12 +174,22 @@ class NetworkHelperWindow(Gtk.Window):
         self.tailscale_tab.get_style_context().add_class("tab-button")
         tabs.pack_start(self.tailscale_tab, False, False, 0)
 
+        self.power_tab = underlined_button("Power", "P")
+        self.power_tab.connect("clicked", lambda _button: self.set_tab("power"))
+        self.power_tab.get_style_context().add_class("tab-button")
+        tabs.pack_start(self.power_tab, False, False, 0)
+
         spacer = Gtk.Box()
         header.pack_start(spacer, True, True, 0)
         self.context_action_button = underlined_button("Start", "S")
         self.context_action_button.connect("clicked", lambda _button: self.run_context_action())
         self.context_action_button.get_style_context().add_class("context-action")
         header.pack_start(self.context_action_button, False, False, 0)
+        self.tailscale_reconnect_button = underlined_button("Reconnect", "C")
+        self.tailscale_reconnect_button.connect("clicked", lambda _button: self.reconnect_tailscale())
+        self.tailscale_reconnect_button.get_style_context().add_class("context-action")
+        self.tailscale_reconnect_button.get_style_context().add_class("action-ready")
+        header.pack_start(self.tailscale_reconnect_button, False, False, 0)
         self.header_refresh_button = underlined_button("Refresh", "R")
         self.header_refresh_button.connect("clicked", lambda _button: self.run_refresh_action())
         self.header_refresh_button.get_style_context().add_class("context-action")
@@ -174,6 +200,36 @@ class NetworkHelperWindow(Gtk.Window):
 
         self._install_css()
         self.update_header()
+
+    def _build_dashboard_page(self) -> Gtk.Widget:
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        page.get_style_context().add_class("page")
+
+        grid = Gtk.Grid(column_spacing=12, row_spacing=12)
+        grid.set_column_homogeneous(True)
+        page.pack_start(grid, False, False, 0)
+
+        cards = [
+            ("system", "System"),
+            ("power", "Power"),
+            ("cpu", "CPU"),
+            ("memory", "Memory"),
+            ("storage", "Storage"),
+            ("network", "Network"),
+            ("cellular", "Cellular"),
+            ("tailscale", "Tailscale"),
+        ]
+        for index, (key, title) in enumerate(cards):
+            card = dashboard_card(title)
+            label = Gtk.Label(label="-", xalign=0, yalign=0)
+            label.set_line_wrap(True)
+            label.set_selectable(True)
+            label.get_style_context().add_class("dashboard-value")
+            card.pack_start(label, True, True, 6)
+            self.dashboard_labels[key] = label
+            grid.attach(card, index % 3, index // 3, 1, 1)
+
+        return page
 
     def _build_dhcp_page(self) -> Gtk.Widget:
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
@@ -284,6 +340,78 @@ class NetworkHelperWindow(Gtk.Window):
         devices_card.pack_start(scroll, True, True, 0)
         return page
 
+    def _build_power_page(self) -> Gtk.Widget:
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        page.get_style_context().add_class("page")
+
+        status_card = card_box()
+        page.pack_start(status_card, False, False, 0)
+        status_grid = Gtk.Grid(column_spacing=14, row_spacing=10)
+        status_card.pack_start(status_grid, False, False, 0)
+
+        rows = [
+            ("service", "Service"),
+            ("power", "Power"),
+            ("cpu", "CPU"),
+            ("wwan", "WWAN"),
+            ("powersaver", "Powersaver"),
+        ]
+        for row, (key, title) in enumerate(rows):
+            title_label = Gtk.Label(label=title, xalign=0)
+            title_label.get_style_context().add_class("muted")
+            value_label = Gtk.Label(label="-", xalign=0)
+            value_label.set_selectable(True)
+            value_label.set_hexpand(True)
+            status_grid.attach(title_label, 0, row, 1, 1)
+            status_grid.attach(value_label, 1, row, 1, 1)
+            self.power_labels[key] = value_label
+
+        policy_card = card_box()
+        page.pack_start(policy_card, False, False, 0)
+        policy_grid = Gtk.Grid(column_spacing=14, row_spacing=10)
+        policy_card.pack_start(policy_grid, False, False, 0)
+
+        enabled = Gtk.Switch()
+        enabled.set_halign(Gtk.Align.START)
+        self.power_controls["POWERSAVER_ENABLED"] = enabled
+        self._attach_power_control(policy_grid, "Powersaver", enabled, 0)
+
+        battery_freq = combo_text_from_values(("1500,1500", "1800,1800", "1500,2400"))
+        self.power_controls["POWERSAVER_BATTERY_CPU_FREQ"] = battery_freq
+        self._attach_power_control(policy_grid, "Battery CPU MHz", battery_freq, 1)
+
+        ac_freq = combo_text_from_values(("restore", "1500,1500", "1800,1800", "1500,2400"))
+        self.power_controls["POWERSAVER_AC_CPU_FREQ"] = ac_freq
+        self._attach_power_control(policy_grid, "AC CPU MHz", ac_freq, 2)
+
+        unknown_action = combo_text_from_values(("restore", "battery", "keep"))
+        self.power_controls["POWERSAVER_UNKNOWN_POWER_ACTION"] = unknown_action
+        self._attach_power_control(policy_grid, "Unknown Power", unknown_action, 3)
+
+        wwan_policy = combo_text_from_values(("ondemand", "keep", "off"))
+        self.power_controls["POWERSAVER_WWAN_POLICY"] = wwan_policy
+        self._attach_power_control(policy_grid, "WWAN Policy", wwan_policy, 4)
+
+        poll_interval = combo_text_from_values(("3", "5", "10", "30", "60"))
+        self.power_controls["POWERSAVER_POLL_INTERVAL_SEC"] = poll_interval
+        self._attach_power_control(policy_grid, "Poll Seconds", poll_interval, 5)
+
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        policy_card.pack_start(buttons, False, False, 12)
+        save_button = Gtk.Button(label="Save Policy")
+        save_button.connect("clicked", lambda _button: self.save_power_policy())
+        buttons.pack_start(save_button, False, False, 0)
+
+        self.load_power_policy_controls()
+
+        return page
+
+    def _attach_power_control(self, grid: Gtk.Grid, title: str, widget: Gtk.Widget, row: int) -> None:
+        label = Gtk.Label(label=title, xalign=0)
+        label.get_style_context().add_class("muted")
+        grid.attach(label, 0, row, 1, 1)
+        grid.attach(widget, 1, row, 1, 1)
+
     def on_tailscale_tree_button_press(self, tree: Gtk.TreeView, event: Gdk.EventButton) -> bool:
         if event.button != 3:
             return False
@@ -316,12 +444,27 @@ class NetworkHelperWindow(Gtk.Window):
             .topbar { padding: 0 0 2px 0; }
             .page { padding: 2px; }
             .section-title { font-size: 17px; font-weight: 700; color: #f2f2f2; }
+            .dashboard-title {
+                font-family: monospace;
+                font-size: 14px;
+                font-weight: 700;
+                color: #61d6d6;
+                background: #111820;
+                border: 1px solid #2f6f6d;
+                border-radius: 6px;
+                padding: 3px 8px;
+            }
+            .dashboard-value {
+                font-family: monospace;
+                font-size: 13px;
+                color: #d9f7ef;
+            }
             .muted { color: #b7b7b7; }
             .card {
-                background: #1e1e1e;
-                border: 1px solid #4a4a4a;
-                border-radius: 18px;
-                padding: 16px;
+                background: #111418;
+                border: 1px solid #2a5258;
+                border-radius: 8px;
+                padding: 10px;
             }
             .tab-button,
             .context-action {
@@ -397,13 +540,26 @@ class NetworkHelperWindow(Gtk.Window):
         self.stack.set_visible_child_name(name)
 
     def update_header(self) -> None:
-        page = self.stack.get_visible_child_name() or "dhcp"
+        page = self.stack.get_visible_child_name() or "dashboard"
         dot = "●" if self.dhcp_running else "○"
         self.dhcp_tab_label.set_markup(f"{dot} {underlined_markup('DHCP Server', 'D')}")
+        toggle_style_class(self.dashboard_tab, "tab-active", page == "dashboard")
         toggle_style_class(self.dhcp_tab, "tab-active", page == "dhcp")
         toggle_style_class(self.lanscan_tab, "tab-active", page == "lanscan")
         toggle_style_class(self.interface_tab, "tab-active", page == "interface")
         toggle_style_class(self.tailscale_tab, "tab-active", page == "tailscale")
+        toggle_style_class(self.power_tab, "tab-active", page == "power")
+        self.tailscale_reconnect_button.set_visible(page == "tailscale")
+        self.tailscale_reconnect_button.set_sensitive(not self.tailscale_reconnecting)
+        reconnect_context = self.tailscale_reconnect_button.get_style_context()
+        for class_name in ("action-ready", "action-active", "action-busy"):
+            reconnect_context.remove_class(class_name)
+        if self.tailscale_reconnecting:
+            set_underlined_button_label(self.tailscale_reconnect_button, "Reconnecting", "C")
+            reconnect_context.add_class("action-busy")
+        else:
+            set_underlined_button_label(self.tailscale_reconnect_button, "Reconnect", "C")
+            reconnect_context.add_class("action-ready")
         action_context = self.context_action_button.get_style_context()
         for class_name in ("action-ready", "action-active", "action-busy"):
             action_context.remove_class(class_name)
@@ -444,6 +600,12 @@ class NetworkHelperWindow(Gtk.Window):
         if page == "tailscale":
             self.refresh_tailscale_status()
             return
+        if page == "power":
+            self.refresh_power_status()
+            return
+        if page == "dashboard":
+            self.refresh_dashboard()
+            return
 
         if self.scan_running:
             self.stop_lan_scan()
@@ -452,12 +614,16 @@ class NetworkHelperWindow(Gtk.Window):
 
     def run_refresh_action(self) -> None:
         page = self.stack.get_visible_child_name()
-        if page in {"dhcp", "lanscan"}:
+        if page == "dashboard":
+            self.refresh_dashboard()
+        elif page in {"dhcp", "lanscan"}:
             self.refresh_interfaces()
         elif page == "interface":
             self.refresh_interface_status()
         elif page == "tailscale":
             self.refresh_tailscale_status()
+        elif page == "power":
+            self.refresh_power_status()
 
     def on_key_press(self, _widget: Gtk.Widget, event: Gdk.EventKey) -> bool:
         key = Gdk.keyval_name(event.keyval) or ""
@@ -465,22 +631,31 @@ class NetworkHelperWindow(Gtk.Window):
         ctrl = bool(event.state & Gdk.ModifierType.CONTROL_MASK)
         alt = bool(event.state & Gdk.ModifierType.MOD1_MASK)
         if ctrl and key == "1":
-            self.set_tab("dhcp")
+            self.set_tab("dashboard")
             return True
         if ctrl and key == "2":
-            self.set_tab("lanscan")
+            self.set_tab("dhcp")
             return True
         if ctrl and key == "3":
-            self.set_tab("interface")
+            self.set_tab("lanscan")
             return True
         if ctrl and key == "4":
+            self.set_tab("interface")
+            return True
+        if ctrl and key == "5":
             self.set_tab("tailscale")
+            return True
+        if ctrl and key == "6":
+            self.set_tab("power")
             return True
         if alt and key in {"Left", "Right"}:
             self.switch_tab(-1 if key == "Left" else 1)
             return True
         if is_text_input_focus(self):
             return False
+        if key_lower == "b":
+            self.set_tab("dashboard")
+            return True
         if key_lower == "d":
             self.set_tab("dhcp")
             return True
@@ -493,6 +668,9 @@ class NetworkHelperWindow(Gtk.Window):
         if key_lower == "t":
             self.set_tab("tailscale")
             return True
+        if key_lower == "p":
+            self.set_tab("power")
+            return True
         if key_lower == "r":
             self.run_refresh_action()
             return True
@@ -502,7 +680,7 @@ class NetworkHelperWindow(Gtk.Window):
         return False
 
     def switch_tab(self, direction: int) -> None:
-        pages = ["dhcp", "lanscan", "interface", "tailscale"]
+        pages = ["dashboard", "dhcp", "lanscan", "interface", "tailscale", "power"]
         current = self.stack.get_visible_child_name()
         try:
             index = pages.index(current)
@@ -571,7 +749,7 @@ class NetworkHelperWindow(Gtk.Window):
             elif device["type"] in {"gsm", "cdma"} or device["device"] in modem_signals:
                 modem_signal = modem_signals.get(device["device"], {})
                 signal = modem_signal.get("signal", "-")
-                if modem_signal.get("connection"):
+                if modem_signal.get("connected") and modem_signal.get("connection"):
                     connection = modem_signal["connection"]
             elif device["device"].startswith("tailscale") or device["type"] == "tun":
                 signal = tailscale_summary(tailscale)
@@ -614,6 +792,127 @@ class NetworkHelperWindow(Gtk.Window):
                     device["dns"],
                 ]
             )
+
+    def reconnect_tailscale(self) -> None:
+        if self.tailscale_reconnecting:
+            return
+        if shutil.which("tailscale") is None:
+            self.show_error("缺少依赖", "未找到 tailscale 命令。")
+            return
+        self.tailscale_reconnecting = True
+        self.tailscale_summary_label.set_text("Reconnecting Tailscale...")
+        self.update_header()
+        thread = threading.Thread(target=self._tailscale_reconnect_worker, daemon=True)
+        thread.start()
+
+    def _tailscale_reconnect_worker(self) -> None:
+        for command in (["tailscale", "down"], ["tailscale", "up"]):
+            result = subprocess.run(command, text=True, capture_output=True, check=False)
+            if result.returncode != 0:
+                error = f"{' '.join(command)} failed:\n{combine_output(result) or '命令执行失败。'}"
+                GLib.idle_add(self.finish_tailscale_reconnect, error)
+                return
+        GLib.idle_add(self.finish_tailscale_reconnect, None)
+
+    def finish_tailscale_reconnect(self, error: str | None) -> bool:
+        self.tailscale_reconnecting = False
+        self.refresh_tailscale_status()
+        self.update_header()
+        if error:
+            self.show_error("Tailscale reconnect failed", error)
+        return False
+
+    def refresh_dashboard(self) -> None:
+        data = dashboard_status()
+        for key, label in self.dashboard_labels.items():
+            label.set_text(data.get(key, "-"))
+
+    def refresh_power_status(self) -> None:
+        status = power_status()
+        for key, label in self.power_labels.items():
+            label.set_text(status.get(key, "-"))
+        self.load_power_policy_controls()
+
+    def load_power_policy_controls(self) -> None:
+        config = helper_service_config()
+        for key, widget in self.power_controls.items():
+            value = config.get(key, "")
+            if isinstance(widget, Gtk.Switch):
+                widget.set_active(value.lower() in {"1", "yes", "true", "on", "enabled"})
+            elif isinstance(widget, Gtk.ComboBoxText):
+                set_combo_text(widget, value)
+            elif isinstance(widget, Gtk.Entry):
+                widget.set_text(value)
+
+    def save_power_policy(self) -> None:
+        try:
+            values = self.power_policy_values()
+        except ValueError as exc:
+            self.show_error("Power policy error", str(exc))
+            return
+        config_text = power_policy_config_text(values)
+        command = ["pkexec", "tee", str(SERVICE_CONFIG)]
+        if shutil.which("pkexec") is None:
+            command = ["sudo", "tee", str(SERVICE_CONFIG)]
+        result = subprocess.run(
+            command,
+            input=config_text,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            self.show_error("Save policy failed", combine_output(result) or "命令执行失败。")
+            return
+        restart = self.run_systemctl(["restart", SYSTEM_SERVICE], "Restart service")
+        if restart.returncode != 0:
+            return
+        self.refresh_power_status()
+
+    def power_policy_values(self) -> dict[str, str]:
+        enabled = self.power_controls["POWERSAVER_ENABLED"]
+        battery = self.power_controls["POWERSAVER_BATTERY_CPU_FREQ"]
+        ac = self.power_controls["POWERSAVER_AC_CPU_FREQ"]
+        unknown = self.power_controls["POWERSAVER_UNKNOWN_POWER_ACTION"]
+        wwan = self.power_controls["POWERSAVER_WWAN_POLICY"]
+        poll = self.power_controls["POWERSAVER_POLL_INTERVAL_SEC"]
+        values = {
+            "POWERSAVER_ENABLED": "1" if isinstance(enabled, Gtk.Switch) and enabled.get_active() else "0",
+            "POWERSAVER_BATTERY_CPU_FREQ": widget_text(battery),
+            "POWERSAVER_AC_CPU_FREQ": widget_text(ac),
+            "POWERSAVER_UNKNOWN_POWER_ACTION": widget_text(unknown),
+            "POWERSAVER_WWAN_POLICY": widget_text(wwan),
+            "POWERSAVER_POLL_INTERVAL_SEC": widget_text(poll),
+        }
+        validate_freq_pair(values["POWERSAVER_BATTERY_CPU_FREQ"], "Battery CPU MHz")
+        if values["POWERSAVER_AC_CPU_FREQ"] != "restore":
+            validate_freq_pair(values["POWERSAVER_AC_CPU_FREQ"], "AC CPU MHz")
+        if values["POWERSAVER_UNKNOWN_POWER_ACTION"] not in {"restore", "battery", "keep"}:
+            raise ValueError("Unknown Power must be restore, battery, or keep.")
+        if values["POWERSAVER_WWAN_POLICY"] not in {"keep", "off", "ondemand"}:
+            raise ValueError("WWAN Policy must be keep, off, or ondemand.")
+        try:
+            if float(values["POWERSAVER_POLL_INTERVAL_SEC"]) < 1:
+                raise ValueError
+        except ValueError as exc:
+            raise ValueError("Poll Seconds must be 1 or greater.") from exc
+        config = helper_service_config()
+        values["POWERSAVER_CPU_POLICY_PATH"] = config.get(
+            "POWERSAVER_CPU_POLICY_PATH", "/sys/devices/system/cpu/cpufreq/policy0"
+        )
+        values["POWERSAVER_POWER_SUPPLY_DIR"] = config.get(
+            "POWERSAVER_POWER_SUPPLY_DIR", "/sys/class/power_supply"
+        )
+        return values
+
+    def run_systemctl(self, args: list[str], title: str) -> subprocess.CompletedProcess[str]:
+        command = ["pkexec", "systemctl", *args]
+        if shutil.which("pkexec") is None:
+            command = ["sudo", "systemctl", *args]
+        result = subprocess.run(command, text=True, capture_output=True, check=False)
+        if result.returncode != 0:
+            self.show_error(f"{title} failed", combine_output(result) or "命令执行失败。")
+        return result
 
     def refresh_status(self) -> None:
         result = run_helper("status")
@@ -839,6 +1138,14 @@ def card_box() -> Gtk.Box:
     return box
 
 
+def dashboard_card(title: str) -> Gtk.Box:
+    box = card_box()
+    title_label = Gtk.Label(label=f" {title.upper()} ", xalign=0)
+    title_label.get_style_context().add_class("dashboard-title")
+    box.pack_start(title_label, False, False, 0)
+    return box
+
+
 def scrolled_page(content: Gtk.Widget) -> Gtk.ScrolledWindow:
     scroll = Gtk.ScrolledWindow()
     scroll.set_hexpand(True)
@@ -882,6 +1189,88 @@ def toggle_style_class(widget: Gtk.Widget, class_name: str, enabled: bool) -> No
         context.add_class(class_name)
     else:
         context.remove_class(class_name)
+
+
+def combo_text_from_values(values: tuple[str, ...]) -> Gtk.ComboBoxText:
+    combo = Gtk.ComboBoxText()
+    for value in values:
+        combo.append_text(value)
+    if values:
+        combo.set_active(0)
+    return combo
+
+
+def set_combo_text(combo: Gtk.ComboBoxText, value: str) -> None:
+    model = combo.get_model()
+    if model is not None:
+        for index, row in enumerate(model):
+            if row[0] == value:
+                combo.set_active(index)
+                return
+    if model is not None and len(model) > 0:
+        combo.set_active(0)
+
+
+def widget_text(widget: Gtk.Widget) -> str:
+    if isinstance(widget, Gtk.Entry):
+        return widget.get_text().strip()
+    if isinstance(widget, Gtk.ComboBoxText):
+        text = widget.get_active_text()
+        if text:
+            return text.strip()
+        child = widget.get_child()
+        if isinstance(child, Gtk.Entry):
+            return child.get_text().strip()
+    return ""
+
+
+def validate_freq_pair(value: str, title: str) -> None:
+    parts = value.split(",", 1)
+    if len(parts) != 2:
+        raise ValueError(f"{title} must be min,max MHz, for example 1500,1500.")
+    try:
+        min_mhz = int(parts[0])
+        max_mhz = int(parts[1])
+    except ValueError as exc:
+        raise ValueError(f"{title} must contain integer MHz values.") from exc
+    if min_mhz < 1500 or max_mhz < 1500 or min_mhz > max_mhz:
+        raise ValueError(f"{title} must be at least 1500 MHz and min must be <= max.")
+
+
+def power_policy_config_text(values: dict[str, str]) -> str:
+    return "\n".join(
+        [
+            "###########################################################################",
+            "#                   uConsole Helper background service                     #",
+            "###########################################################################",
+            "",
+            "### POWERSAVER_ENABLED --- [1|0] --- Enable AC/battery CPU policy task",
+            f"POWERSAVER_ENABLED={values['POWERSAVER_ENABLED']}",
+            "",
+            "### POWERSAVER_BATTERY_CPU_FREQ --- [1500,1500~] <min,max> --- MHz on battery",
+            f"POWERSAVER_BATTERY_CPU_FREQ={values['POWERSAVER_BATTERY_CPU_FREQ']}",
+            "",
+            "### POWERSAVER_AC_CPU_FREQ --- [restore|1500,2400~] <min,max|restore> --- MHz on AC",
+            "### restore: put back the frequencies captured when uconsole-helper.service starts",
+            f"POWERSAVER_AC_CPU_FREQ={values['POWERSAVER_AC_CPU_FREQ']}",
+            "",
+            "### POWERSAVER_UNKNOWN_POWER_ACTION --- [restore|battery|keep]",
+            f"POWERSAVER_UNKNOWN_POWER_ACTION={values['POWERSAVER_UNKNOWN_POWER_ACTION']}",
+            "",
+            "### POWERSAVER_WWAN_POLICY --- [keep|off|ondemand]",
+            f"POWERSAVER_WWAN_POLICY={values['POWERSAVER_WWAN_POLICY']}",
+            "",
+            "### POWERSAVER_POLL_INTERVAL_SEC --- [1.0~]",
+            f"POWERSAVER_POLL_INTERVAL_SEC={values['POWERSAVER_POLL_INTERVAL_SEC']}",
+            "",
+            "### POWERSAVER_CPU_POLICY_PATH --- cpufreq policy directory",
+            f"POWERSAVER_CPU_POLICY_PATH={values['POWERSAVER_CPU_POLICY_PATH']}",
+            "",
+            "### POWERSAVER_POWER_SUPPLY_DIR --- power_supply sysfs directory",
+            f"POWERSAVER_POWER_SUPPLY_DIR={values['POWERSAVER_POWER_SUPPLY_DIR']}",
+            "",
+        ]
+    )
 
 
 def copy_to_clipboard(text: str) -> None:
@@ -1284,14 +1673,14 @@ def wifi_signal_by_device() -> dict[str, str]:
     return signals
 
 
-def modem_signal_by_port() -> dict[str, dict[str, str]]:
+def modem_signal_by_port() -> dict[str, dict[str, str | bool]]:
     if shutil.which("mmcli") is None:
         return {}
     list_result = subprocess.run(["mmcli", "-L"], text=True, capture_output=True, check=False)
     if list_result.returncode != 0:
         return {}
 
-    signals: dict[str, dict[str, str]] = {}
+    signals: dict[str, dict[str, str | bool]] = {}
     for modem_id in re.findall(r"/Modem/(\d+)", list_result.stdout):
         result = subprocess.run(
             ["mmcli", "-m", modem_id, "--output-keyvalue"],
@@ -1307,9 +1696,11 @@ def modem_signal_by_port() -> dict[str, dict[str, str]]:
         detail = modem_signal_detail(modem_id)
         access = first_key_value(data, "modem.generic.access-technologies.value")
         operator_name = data.get("modem.3gpp.operator-name", "")
-        signal_parts = []
+        signal_parts: list[str] = []
         if detail:
             signal_parts.append(detail)
+            if quality:
+                signal_parts.append(f"({quality})")
         elif quality:
             signal_parts.append(quality)
         connection_parts = []
@@ -1319,12 +1710,22 @@ def modem_signal_by_port() -> dict[str, dict[str, str]]:
             connection_parts.append(operator_name)
         label = " ".join(signal_parts) if signal_parts else "-"
         connection = " ".join(connection_parts)
-        value = {"signal": label, "connection": connection}
+        value = {
+            "signal": label,
+            "connection": connection,
+            "connected": modem_data_connected(data),
+        }
         if port:
             signals[port] = value
         for netdev in modem_net_devices(data.get("modem.generic.device", "")):
             signals[netdev] = value
     return signals
+
+
+def modem_data_connected(data: dict[str, str]) -> bool:
+    state = data.get("modem.generic.state", "").lower()
+    bearers = data.get("modem.generic.bearers", "").strip()
+    return state == "connected" or bool(bearers and bearers != "--")
 
 
 def modem_quality_label(data: dict[str, str]) -> str:
@@ -1521,6 +1922,355 @@ def tailscale_row_color(status: str) -> str:
     if status == "Online":
         return "#34c759"
     return "#8a8f98"
+
+
+def dashboard_status() -> dict[str, str]:
+    power = power_status()
+    tailscale = tailscale_status()
+    return {
+        "system": dashboard_system_summary(),
+        "power": "\n".join(
+            [
+                f"STATE  {power.get('power', '-')}",
+                f"CPU    {power.get('cpu', '-')}",
+                f"POLICY {power.get('powersaver', '-')}",
+            ]
+        ),
+        "cpu": dashboard_cpu_summary(),
+        "memory": dashboard_memory_summary(),
+        "storage": dashboard_storage_summary(),
+        "network": dashboard_network_summary(),
+        "cellular": dashboard_cellular_summary(),
+        "tailscale": tailscale_summary(tailscale),
+    }
+
+
+def dashboard_system_summary() -> str:
+    hostname = socket.gethostname()
+    kernel = platform.release()
+    uptime = system_uptime_label()
+    load = Path("/proc/loadavg").read_text(encoding="utf-8").split()[:3] if Path("/proc/loadavg").exists() else []
+    model = hardware_model()
+    parts = [f"HOST   {hostname}", f"KERN   {kernel}", f"UP     {uptime}"]
+    if model:
+        parts.insert(1, f"MODEL  {model}")
+    if load:
+        parts.append(f"LOAD   {' '.join(load)}")
+    return "\n".join(parts)
+
+
+def hardware_model() -> str:
+    for path in (Path("/proc/device-tree/model"), Path("/sys/firmware/devicetree/base/model")):
+        try:
+            value = path.read_text(encoding="utf-8").replace("\x00", "").strip()
+        except OSError:
+            continue
+        if value:
+            return value
+    return ""
+
+
+def system_uptime_label() -> str:
+    try:
+        seconds = int(float(Path("/proc/uptime").read_text(encoding="utf-8").split()[0]))
+    except (OSError, ValueError, IndexError):
+        return "-"
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    if days:
+        return f"{days}d {hours}h {minutes}m"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+def dashboard_cpu_summary() -> str:
+    config = helper_service_config()
+    policy = Path(config.get("POWERSAVER_CPU_POLICY_PATH", "/sys/devices/system/cpu/cpufreq/policy0"))
+    current = read_first_existing(policy / "scaling_cur_freq", policy / "cpuinfo_cur_freq")
+    governor = read_first_existing(policy / "scaling_governor")
+    temp = cpu_temperature_label()
+    lines = [f"LIMIT  {current_cpu_summary(config)}"]
+    if current:
+        lines.append(f"CUR    {int(current) // 1000} MHz {cpu_freq_bar(policy, current)}")
+    if governor:
+        lines.append(f"GOV    {governor}")
+    if temp:
+        lines.append(f"TEMP   {temp}")
+    return "\n".join(lines)
+
+
+def read_first_existing(*paths: Path) -> str:
+    for path in paths:
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+    return ""
+
+
+def cpu_temperature_label() -> str:
+    for path in sorted(Path("/sys/class/thermal").glob("thermal_zone*/temp")):
+        try:
+            milli_c = int(path.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            continue
+        if milli_c > 0:
+            return f"{milli_c / 1000:.1f} C"
+    return ""
+
+
+def cpu_freq_bar(policy: Path, current: str) -> str:
+    try:
+        cur = int(current)
+        min_freq = int((policy / "cpuinfo_min_freq").read_text(encoding="utf-8").strip())
+        max_freq = int((policy / "cpuinfo_max_freq").read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return ""
+    total = max_freq - min_freq
+    used = max(0, cur - min_freq)
+    if total <= 0:
+        return ""
+    return progress_bar(used, total)
+
+
+def dashboard_memory_summary() -> str:
+    info: dict[str, int] = {}
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                info[parts[0].rstrip(":")] = int(parts[1])
+    except (OSError, ValueError):
+        return "-"
+    total = info.get("MemTotal", 0)
+    available = info.get("MemAvailable", 0)
+    swap_total = info.get("SwapTotal", 0)
+    swap_free = info.get("SwapFree", 0)
+    used = max(0, total - available)
+    lines = [metric_line("RAM", used, total, unit="kib")]
+    if swap_total:
+        lines.append(metric_line("SWAP", swap_total - swap_free, swap_total, unit="kib"))
+    return "\n".join(lines)
+
+
+def metric_line(label: str, used: int, total: int, unit: str) -> str:
+    if total <= 0:
+        return f"{label:<6} -"
+    percent = int(max(0, min(100, used * 100 / total)))
+    if unit == "kib":
+        used_text = format_kib(used)
+        total_text = format_kib(total)
+    else:
+        used_text = format_bytes(used)
+        total_text = format_bytes(total)
+    return f"{label:<6} {progress_bar(used, total)} {percent:3d}% {used_text}/{total_text}"
+
+
+def progress_bar(used: int, total: int, width: int = 10) -> str:
+    if total <= 0:
+        return "[" + "-" * width + "]"
+    filled = int(max(0, min(width, round(used * width / total))))
+    return "[" + "#" * filled + "." * (width - filled) + "]"
+
+
+def format_kib(kib: int) -> str:
+    if kib >= 1024 * 1024:
+        return f"{kib / 1024 / 1024:.1f} GiB"
+    return f"{kib / 1024:.0f} MiB"
+
+
+def dashboard_storage_summary() -> str:
+    rows = []
+    for path in ("/", "/home"):
+        try:
+            usage = shutil.disk_usage(path)
+        except OSError:
+            continue
+        used = usage.total - usage.free
+        rows.append(metric_line(path, used, usage.total, unit="bytes"))
+    return "\n".join(rows) if rows else "-"
+
+
+def format_bytes(value: int) -> str:
+    if value >= 1024**3:
+        return f"{value / 1024**3:.1f} GiB"
+    if value >= 1024**2:
+        return f"{value / 1024**2:.0f} MiB"
+    return f"{value} B"
+
+
+def dashboard_network_summary() -> str:
+    devices = nmcli_device_status()
+    connected = [item for item in devices if clean_nm_state(item["state"]).startswith("connected")]
+    route = preferred_route_interface() or "-"
+    lines = [f"DEF    {route}", f"CONN   {len(connected)}"]
+    for item in connected[:4]:
+        connection = item["connection"] or "-"
+        lines.append(f"{item['device']:<6} {item['type']} / {connection}")
+    return "\n".join(lines)
+
+
+def dashboard_cellular_summary() -> str:
+    modems = modem_signal_by_port()
+    if not modems:
+        return "-"
+    lines = []
+    for port, info in sorted(modems.items())[:3]:
+        signal = str(info.get("signal") or "-")
+        connection = str(info.get("connection") or "-")
+        connected = "connected" if info.get("connected") else "registered"
+        lines.append(f"{port:<7} {connected}\nNET    {connection}\nSIG    {signal}")
+    return "\n".join(lines)
+
+
+def power_status() -> dict[str, str]:
+    config = helper_service_config()
+    return {
+        "service": system_service_summary(SYSTEM_SERVICE),
+        "power": current_power_state(config),
+        "cpu": current_cpu_summary(config),
+        "wwan": current_wwan_summary(),
+        "powersaver": powersaver_config_summary(config),
+    }
+
+
+def helper_service_config() -> dict[str, str]:
+    defaults = {
+        "POWERSAVER_ENABLED": "1",
+        "POWERSAVER_BATTERY_CPU_FREQ": "1500,1500",
+        "POWERSAVER_AC_CPU_FREQ": "restore",
+        "POWERSAVER_UNKNOWN_POWER_ACTION": "restore",
+        "POWERSAVER_WWAN_POLICY": "ondemand",
+        "POWERSAVER_CPU_POLICY_PATH": "/sys/devices/system/cpu/cpufreq/policy0",
+        "POWERSAVER_POWER_SUPPLY_DIR": "/sys/class/power_supply",
+    }
+    if not SERVICE_CONFIG.exists():
+        return defaults
+    values = defaults.copy()
+    try:
+        text = SERVICE_CONFIG.read_text(encoding="utf-8")
+    except OSError:
+        return values
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
+
+
+def system_service_summary(service: str) -> str:
+    if shutil.which("systemctl") is None:
+        return "systemctl unavailable"
+    active = subprocess.run(
+        ["systemctl", "is-active", service],
+        text=True,
+        capture_output=True,
+        check=False,
+    ).stdout.strip()
+    enabled = subprocess.run(
+        ["systemctl", "is-enabled", service],
+        text=True,
+        capture_output=True,
+        check=False,
+    ).stdout.strip()
+    return " / ".join(part for part in [active or "unknown", enabled or "unknown"] if part)
+
+
+def current_power_state(config: dict[str, str]) -> str:
+    power_dir = Path(config.get("POWERSAVER_POWER_SUPPLY_DIR", "/sys/class/power_supply"))
+    if not power_dir.is_dir():
+        return "unknown"
+    has_battery = False
+    ac_online = False
+    for path in sorted(power_dir.iterdir()):
+        type_path = path / "type"
+        if not path.is_dir() or not type_path.is_file():
+            continue
+        try:
+            supply_type = type_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if supply_type == "Battery" and power_supply_present(path):
+            has_battery = True
+            status_path = path / "status"
+            if status_path.is_file():
+                try:
+                    if status_path.read_text(encoding="utf-8").strip().lower() in {"charging", "full"}:
+                        ac_online = True
+                except OSError:
+                    pass
+        if supply_type in {"Mains", "USB", "USB_C", "USB_PD", "USB_DCP", "USB_CDP"}:
+            if power_supply_online(path) is True:
+                ac_online = True
+    if ac_online:
+        return "AC"
+    if has_battery:
+        return "Battery"
+    return "Unknown"
+
+
+def power_supply_present(path: Path) -> bool:
+    present_path = path / "present"
+    if not present_path.is_file():
+        return True
+    try:
+        return present_path.read_text(encoding="utf-8").strip() not in {"0", "false", "False"}
+    except OSError:
+        return False
+
+
+def power_supply_online(path: Path) -> bool | None:
+    online_path = path / "online"
+    if online_path.is_file():
+        try:
+            return online_path.read_text(encoding="utf-8").strip() == "1"
+        except OSError:
+            return None
+    status_path = path / "status"
+    if status_path.is_file():
+        try:
+            return status_path.read_text(encoding="utf-8").strip().lower() in {"charging", "full"}
+        except OSError:
+            return None
+    return None
+
+
+def current_cpu_summary(config: dict[str, str]) -> str:
+    policy = Path(config.get("POWERSAVER_CPU_POLICY_PATH", "/sys/devices/system/cpu/cpufreq/policy0"))
+    try:
+        min_freq = int((policy / "scaling_min_freq").read_text(encoding="utf-8").strip()) // 1000
+        max_freq = int((policy / "scaling_max_freq").read_text(encoding="utf-8").strip()) // 1000
+    except (OSError, ValueError):
+        return "-"
+    return f"{min_freq}-{max_freq} MHz"
+
+
+def current_wwan_summary() -> str:
+    if shutil.which("nmcli") is None:
+        return "-"
+    result = subprocess.run(
+        ["nmcli", "-t", "-f", "WWAN", "radio"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return "-"
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    return lines[-1] if lines else "-"
+
+
+def powersaver_config_summary(config: dict[str, str]) -> str:
+    enabled = config.get("POWERSAVER_ENABLED", "1")
+    battery = config.get("POWERSAVER_BATTERY_CPU_FREQ", "1500,1500")
+    ac = config.get("POWERSAVER_AC_CPU_FREQ", "restore")
+    wwan = config.get("POWERSAVER_WWAN_POLICY", "ondemand")
+    state = "enabled" if enabled.lower() in {"1", "yes", "true", "on", "enabled"} else "disabled"
+    return f"{state}; battery {battery} MHz; AC {ac}; WWAN {wwan}"
 
 
 def interface_addresses() -> dict[str, str]:
@@ -2120,7 +2870,7 @@ def main() -> int:
                 print(f"{info.name}: 不支持, {info.reason}")
         return 0
 
-    window = NetworkHelperWindow()
+    window = UConsoleHelperWindow()
     window.show_all()
     Gtk.main()
     return 0

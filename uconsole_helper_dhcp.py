@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Privileged helper for the Network Helper DHCP."""
+"""Privileged helper for the uConsole Helper DHCP."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 
-RUN_DIR = Path("/tmp/network-helper/dhcp")
+RUN_DIR = Path("/tmp/uconsole-helper/dhcp")
 PID_FILE = RUN_DIR / "dnsmasq.pid"
 CONFIG_FILE = RUN_DIR / "dnsmasq.conf"
 LEASE_FILE = RUN_DIR / "dnsmasq.leases"
@@ -20,7 +20,7 @@ LEASE_FILE = RUN_DIR / "dnsmasq.leases"
 
 def main() -> int:
     if len(sys.argv) < 2:
-        print("usage: network_helper_dhcp.py start|stop|status [json-config]", file=sys.stderr)
+        print("usage: uconsole_helper_dhcp.py start|stop|status [json-config]", file=sys.stderr)
         return 2
 
     action = sys.argv[1]

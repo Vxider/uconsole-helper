@@ -1,6 +1,6 @@
-# Network Helper
+# uConsole Helper
 
-Network Helper is a local GTK desktop utility for small network maintenance tasks:
+uConsole Helper is a local GTK desktop utility for small network maintenance tasks:
 running a DHCP server on a selected interface, scanning a LAN, checking interface
 status, and viewing Tailscale devices.
 
@@ -11,11 +11,15 @@ on the local network.
 ## Features
 
 - DHCP Server tab for serving addresses on a selected wired interface.
+- Dashboard tab with system, power, CPU, memory, storage, network, cellular,
+  and Tailscale summaries.
 - LAN Scan tab for scanning hosts in the selected interface's IPv4 subnet.
 - Interface tab with NetworkManager-style device status, addresses, Wi-Fi signal,
   cellular signal, and Tailscale interface state.
 - Tailscale tab with a device list, online state, Tailscale IPv4 address, and a
   right-click copy menu for IPv4, IPv6, and DNS name.
+- Power tab for monitoring and controlling the `uconsole-helper.service`
+  background task runner.
 - Keyboard shortcuts for tab switching and common actions.
 
 ## Requirements
@@ -49,28 +53,44 @@ sudo apt install python3-gi gir1.2-gtk-3.0 dnsmasq iproute2 iputils-ping policyk
 Starting or stopping the DHCP server may prompt for administrator privileges via
 `pkexec` or `sudo`.
 
-## Install Desktop Launcher
+## Install
 
-Install the app launcher and icon for the current user:
+Install the desktop launcher, icon, and root background service:
 
 ```bash
-./scripts/install-user-desktop.sh
+./scripts/install.sh
 ```
 
 This installs:
 
-- `~/.local/share/applications/network-helper.desktop`
-- `~/.local/share/icons/hicolor/scalable/apps/network-helper.svg`
+- `~/.local/share/applications/uconsole-helper.desktop`
+- `~/.local/share/icons/hicolor/scalable/apps/uconsole-helper.svg`
+- `/usr/local/bin/uconsole-helper-service`
+- `/etc/uconsole-helper/uconsole-helper.conf`
+- `/etc/systemd/system/uconsole-helper.service`
+
+The service is a background task runner. Its first task is an AC/battery-aware
+powersaver that can adjust CPU frequency limits and optionally manage WWAN.
+The GUI does not need to be open for this service to run.
+
+Install only one side when needed:
+
+```bash
+./scripts/install.sh --desktop-only
+./scripts/install.sh --service-only
+```
 
 ## Shortcuts
 
 Tabs:
 
 - `D`: DHCP Server
+- `B`: Dashboard
 - `L`: LAN Scan
 - `I`: Interface
 - `T`: Tailscale
-- `Ctrl+1` through `Ctrl+4`: switch tabs directly
+- `P`: Power
+- `Ctrl+1` through `Ctrl+6`: switch tabs directly
 - `Alt+Left` / `Alt+Right`: switch to the previous or next tab
 
 Actions:
@@ -92,7 +112,7 @@ Text fields do not trigger direct letter shortcuts while focused.
 Runtime files are stored under:
 
 ```text
-/tmp/network-helper/dhcp
+/tmp/uconsole-helper/dhcp
 ```
 
 Notes:
@@ -131,10 +151,28 @@ The Tailscale tab shows devices from `tailscale status --json`.
 The address column displays only the Tailscale IPv4 address. Right-click a device
 row to copy its IPv4 address, IPv6 address, or DNS name.
 
+## Power
+
+The Power tab shows the status of `uconsole-helper.service`, current power
+state, CPU frequency limits, WWAN radio state, and the active powersaver
+configuration summary.
+
+The controls edit the powersaver policy in `/etc/uconsole-helper/uconsole-helper.conf`:
+
+- `Powersaver`: enable or disable the AC/battery CPU policy task
+- `Battery CPU MHz`: CPU min/max MHz while on battery, such as `1500,1500`
+- `AC CPU MHz`: `restore` or CPU min/max MHz while charging
+- `Unknown Power`: `restore`, `battery`, or `keep`
+- `WWAN Policy`: `ondemand`, `keep`, or `off`
+- `Poll Seconds`: background polling interval
+
+`Save Policy` writes the config through `pkexec` or `sudo` and restarts
+`uconsole-helper.service`.
+
 ## Debug Interface Detection
 
 List DHCP Server interface filtering without opening the GUI:
 
 ```bash
-/usr/bin/python3 network_helper_gui.py --list-interfaces
+/usr/bin/python3 uconsole_helper_gui.py --list-interfaces
 ```
