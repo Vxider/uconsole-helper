@@ -19,12 +19,13 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from html import escape
 from pathlib import Path
 
-from gi.repository import Gdk, GLib, Gtk
+from gi.repository import Gdk, GLib, Gtk, Pango
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -114,6 +115,13 @@ class UConsoleHelperWindow(Gtk.Window):
         self.power_labels: dict[str, Gtk.Label] = {}
         self.power_controls: dict[str, Gtk.Widget] = {}
         self.dashboard_labels: dict[str, Gtk.Label] = {}
+        self.dashboard_bars: dict[str, Gtk.ProgressBar] = {}
+        self.dashboard_secondary_bars: dict[str, Gtk.ProgressBar] = {}
+        self.dashboard_cpu_sample: tuple[int, int] | None = None
+        self.dashboard_net_sample: tuple[float, int, int] | None = None
+        self.dashboard_grid: Gtk.Grid | None = None
+        self.dashboard_cards: list[Gtk.Widget] = []
+        self.dashboard_columns = 3
 
         self._build_ui()
         self.refresh_dashboard()
@@ -122,6 +130,7 @@ class UConsoleHelperWindow(Gtk.Window):
         self.refresh_tailscale_status()
         self.refresh_power_status()
         self.refresh_status()
+        GLib.timeout_add_seconds(2, self.auto_refresh_dashboard)
 
     def _build_ui(self) -> None:
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
@@ -131,7 +140,7 @@ class UConsoleHelperWindow(Gtk.Window):
         self.stack = Gtk.Stack()
         self.stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
         self.stack.set_transition_duration(140)
-        self.stack.add_titled(scrolled_page(self._build_dashboard_page()), "dashboard", "Dashboard")
+        self.stack.add_titled(self._build_dashboard_page(), "dashboard", "Dashboard")
         self.stack.add_titled(scrolled_page(self._build_dhcp_page()), "dhcp", "DHCP")
         self.stack.add_titled(scrolled_page(self._build_lanscan_page()), "lanscan", "LAN SCAN")
         self.stack.add_titled(scrolled_page(self._build_interface_page()), "interface", "Interface")
@@ -143,7 +152,7 @@ class UConsoleHelperWindow(Gtk.Window):
         header.get_style_context().add_class("topbar")
         root.pack_start(header, False, False, 0)
 
-        tabs = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        tabs = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         tabs.get_style_context().add_class("app-tabs")
         header.pack_start(tabs, False, False, 0)
         self.dashboard_tab = underlined_button("Dashboard", "B")
@@ -169,12 +178,18 @@ class UConsoleHelperWindow(Gtk.Window):
         self.interface_tab.get_style_context().add_class("tab-button")
         tabs.pack_start(self.interface_tab, False, False, 0)
 
-        self.tailscale_tab = underlined_button("Tailscale", "T")
+        self.tailscale_tab_label = Gtk.Label()
+        self.tailscale_tab_label.set_use_markup(True)
+        self.tailscale_tab = Gtk.Button()
+        self.tailscale_tab.add(self.tailscale_tab_label)
         self.tailscale_tab.connect("clicked", lambda _button: self.set_tab("tailscale"))
         self.tailscale_tab.get_style_context().add_class("tab-button")
         tabs.pack_start(self.tailscale_tab, False, False, 0)
 
-        self.power_tab = underlined_button("Power", "P")
+        self.power_tab_label = Gtk.Label()
+        self.power_tab_label.set_use_markup(True)
+        self.power_tab = Gtk.Button()
+        self.power_tab.add(self.power_tab_label)
         self.power_tab.connect("clicked", lambda _button: self.set_tab("power"))
         self.power_tab.get_style_context().add_class("tab-button")
         tabs.pack_start(self.power_tab, False, False, 0)
@@ -202,12 +217,15 @@ class UConsoleHelperWindow(Gtk.Window):
         self.update_header()
 
     def _build_dashboard_page(self) -> Gtk.Widget:
-        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         page.get_style_context().add_class("page")
 
-        grid = Gtk.Grid(column_spacing=12, row_spacing=12)
+        grid = Gtk.Grid(column_spacing=8, row_spacing=8)
         grid.set_column_homogeneous(True)
-        page.pack_start(grid, False, False, 0)
+        grid.set_row_homogeneous(True)
+        grid.set_hexpand(True)
+        self.dashboard_grid = grid
+        page.pack_start(grid, True, True, 0)
 
         cards = [
             ("system", "System"),
@@ -217,17 +235,49 @@ class UConsoleHelperWindow(Gtk.Window):
             ("storage", "Storage"),
             ("network", "Network"),
             ("cellular", "Cellular"),
-            ("tailscale", "Tailscale"),
+            ("placeholder-1", ""),
+            ("placeholder-2", ""),
         ]
         for index, (key, title) in enumerate(cards):
+            if key.startswith("placeholder"):
+                card = card_box()
+                card.set_opacity(0)
+                card.set_sensitive(False)
+                card.set_hexpand(True)
+                card.set_vexpand(True)
+                grid.attach(card, index % 3, index // 3, 1, 1)
+                continue
+
             card = dashboard_card(title)
             label = Gtk.Label(label="-", xalign=0, yalign=0)
             label.set_line_wrap(True)
+            label.set_line_wrap_mode(Pango.WrapMode.CHAR)
             label.set_selectable(True)
+            label.set_hexpand(True)
+            label.set_max_width_chars(14)
             label.get_style_context().add_class("dashboard-value")
-            card.pack_start(label, True, True, 6)
+            bar = Gtk.ProgressBar()
+            bar.set_show_text(True)
+            bar.get_style_context().add_class("dashboard-meter")
+            if key == "network":
+                meter_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+                meter_row.pack_start(bar, True, True, 0)
+                secondary_bar = Gtk.ProgressBar()
+                secondary_bar.set_show_text(True)
+                secondary_bar.get_style_context().add_class("dashboard-meter")
+                meter_row.pack_start(secondary_bar, True, True, 0)
+                card.pack_start(meter_row, False, False, 4)
+                self.dashboard_secondary_bars[key] = secondary_bar
+            else:
+                card.pack_start(bar, False, False, 4)
+            card.pack_start(label, True, True, 3)
+            self.dashboard_bars[key] = bar
             self.dashboard_labels[key] = label
+            card.set_hexpand(True)
+            card.set_vexpand(True)
+            self.dashboard_cards.append(card)
             grid.attach(card, index % 3, index // 3, 1, 1)
+        self.dashboard_columns = 3
 
         return page
 
@@ -373,6 +423,7 @@ class UConsoleHelperWindow(Gtk.Window):
 
         enabled = Gtk.Switch()
         enabled.set_halign(Gtk.Align.START)
+        enabled.get_style_context().add_class("power-switch")
         self.power_controls["POWERSAVER_ENABLED"] = enabled
         self._attach_power_control(policy_grid, "Powersaver", enabled, 0)
 
@@ -446,30 +497,42 @@ class UConsoleHelperWindow(Gtk.Window):
             .section-title { font-size: 17px; font-weight: 700; color: #f2f2f2; }
             .dashboard-title {
                 font-family: monospace;
-                font-size: 14px;
+                font-size: 17px;
                 font-weight: 700;
                 color: #61d6d6;
                 background: #111820;
                 border: 1px solid #2f6f6d;
                 border-radius: 6px;
-                padding: 3px 8px;
+                padding: 2px 7px;
             }
             .dashboard-value {
                 font-family: monospace;
-                font-size: 13px;
+                font-size: 17px;
                 color: #d9f7ef;
+            }
+            .dashboard-meter {
+                min-height: 10px;
+            }
+            .dashboard-meter trough {
+                background: #080d10;
+                border: 1px solid #24444a;
+                border-radius: 6px;
+            }
+            .dashboard-meter progress {
+                background: #2fdf84;
+                border-radius: 6px;
             }
             .muted { color: #b7b7b7; }
             .card {
                 background: #111418;
                 border: 1px solid #2a5258;
                 border-radius: 8px;
-                padding: 10px;
+                padding: 6px;
             }
             .tab-button,
             .context-action {
                 min-height: 34px;
-                padding: 6px 18px;
+                padding: 6px 10px;
                 border-radius: 12px;
                 border: 1px solid #4a4a4a;
                 background: #1e1e1e;
@@ -488,7 +551,7 @@ class UConsoleHelperWindow(Gtk.Window):
             .context-action {
                 background: #4a4b50;
                 color: #ffffff;
-                min-width: 92px;
+                min-width: 72px;
             }
             .context-action.action-ready,
             .context-action.action-active {
@@ -509,20 +572,46 @@ class UConsoleHelperWindow(Gtk.Window):
                 border-color: #4a4a4a;
                 color: #f0f0f0;
             }
-            entry, combobox, treeview, textview, scrolledwindow {
+            switch.power-switch {
+                color: transparent;
+                text-shadow: none;
+            }
+            switch.power-switch:checked {
+                background: #34e88a;
+                border-color: #34e88a;
+                color: transparent;
+                text-shadow: none;
+            }
+            switch.power-switch:checked slider {
+                background: #f7fff9;
+                border-color: #f7fff9;
+            }
+            entry, combobox, textview {
                 background: #171717;
                 color: #f0f0f0;
                 border-color: #4a4a4a;
+            }
+            treeview, scrolledwindow {
+                background: #111418;
+                color: #f0f0f0;
+                border-color: #2a5258;
             }
             entry {
                 border: 1px solid #4a4a4a;
             }
             treeview.view {
-                background: #171717;
+                background: #111418;
                 color: #f0f0f0;
+                border: 1px solid #2a5258;
             }
             treeview.view:selected {
                 background: #2f6f6d;
+            }
+            treeview header button {
+                background: #111820;
+                border-color: #2a5258;
+                color: #d9f7ef;
+                font-weight: 700;
             }
             textview {
                 font-family: monospace;
@@ -543,6 +632,8 @@ class UConsoleHelperWindow(Gtk.Window):
         page = self.stack.get_visible_child_name() or "dashboard"
         dot = "●" if self.dhcp_running else "○"
         self.dhcp_tab_label.set_markup(f"{dot} {underlined_markup('DHCP Server', 'D')}")
+        self.tailscale_tab_label.set_markup(tailscale_tab_markup())
+        self.power_tab_label.set_markup(power_tab_markup())
         toggle_style_class(self.dashboard_tab, "tab-active", page == "dashboard")
         toggle_style_class(self.dhcp_tab, "tab-active", page == "dhcp")
         toggle_style_class(self.lanscan_tab, "tab-active", page == "lanscan")
@@ -736,11 +827,12 @@ class UConsoleHelperWindow(Gtk.Window):
         self.interface_status_store.clear()
         wifi_signals = wifi_signal_by_device()
         modem_signals = modem_signal_by_port()
+        hidden_modem_ports = hidden_duplicate_modem_ports()
         tailscale = tailscale_status()
         addresses = interface_addresses()
 
         for device in nmcli_device_status():
-            if device["device"] == "lo":
+            if device["device"] == "lo" or device["device"] in hidden_modem_ports:
                 continue
             signal = "-"
             connection = device["connection"] or "-"
@@ -823,9 +915,37 @@ class UConsoleHelperWindow(Gtk.Window):
         return False
 
     def refresh_dashboard(self) -> None:
-        data = dashboard_status()
+        cpu_sample = read_cpu_sample()
+        cpu_percent = cpu_usage_percent(self.dashboard_cpu_sample, cpu_sample)
+        self.dashboard_cpu_sample = cpu_sample
+        net_sample = read_network_sample()
+        net_rates = network_rates(self.dashboard_net_sample, net_sample)
+        self.dashboard_net_sample = net_sample
+        data = dashboard_status(cpu_percent=cpu_percent, net_rates=net_rates)
         for key, label in self.dashboard_labels.items():
-            label.set_text(data.get(key, "-"))
+            item = data.get(key, {})
+            if isinstance(item, dict):
+                label.set_text(str(item.get("text") or "-"))
+                bar = self.dashboard_bars.get(key)
+                if bar is not None:
+                    percent = max(0, min(100, int(item.get("percent", 0))))
+                    hidden = bool(item.get("hide_meter"))
+                    bar.set_visible(not hidden)
+                    if not hidden:
+                        bar.set_fraction(percent / 100)
+                        bar.set_text(str(item.get("meter") or f"{percent}%"))
+                secondary_bar = self.dashboard_secondary_bars.get(key)
+                if secondary_bar is not None:
+                    second_percent = max(0, min(100, int(item.get("second_percent", 0))))
+                    secondary_bar.set_fraction(second_percent / 100)
+                    secondary_bar.set_text(str(item.get("second_meter") or f"{second_percent}%"))
+            else:
+                label.set_text(str(item or "-"))
+
+    def auto_refresh_dashboard(self) -> bool:
+        if self.stack.get_visible_child_name() == "dashboard":
+            self.refresh_dashboard()
+        return True
 
     def refresh_power_status(self) -> None:
         status = power_status()
@@ -1782,6 +1902,82 @@ def modem_net_devices(device_path: str) -> list[str]:
     return sorted(set(devices))
 
 
+def hidden_duplicate_modem_ports() -> set[str]:
+    hidden = hidden_duplicate_modem_ports_from_sysfs()
+    if shutil.which("mmcli") is None:
+        return hidden
+    list_result = subprocess.run(["mmcli", "-L"], text=True, capture_output=True, check=False)
+    if list_result.returncode != 0:
+        return hidden
+
+    sys_net_names = {path.name for path in SYS_NET.iterdir()} if SYS_NET.exists() else set()
+    for modem_id in re.findall(r"/Modem/(\d+)", list_result.stdout):
+        result = subprocess.run(
+            ["mmcli", "-m", modem_id, "--output-keyvalue"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            continue
+        data = parse_key_value_output(result.stdout)
+        port = data.get("modem.generic.primary-port", "")
+        device_path = data.get("modem.generic.device", "")
+        if not port or not device_path or device_path == "--":
+            continue
+        sibling_netdevs = modem_sibling_net_devices(port, device_path)
+        if any(name in sys_net_names for name in sibling_netdevs):
+            hidden.add(port)
+    return hidden
+
+
+def hidden_duplicate_modem_ports_from_sysfs() -> set[str]:
+    hidden: set[str] = set()
+    if not SYS_NET.exists():
+        return hidden
+    net_roots: list[Path] = []
+    for netdev in SYS_NET.iterdir():
+        if netdev.name == "lo" or netdev.name.startswith("tailscale"):
+            continue
+        root = usb_device_root(netdev)
+        if root is not None:
+            net_roots.append(root)
+    if not net_roots:
+        return hidden
+    for tty_dir in Path("/sys/class/tty").glob("ttyUSB*"):
+        tty_root = usb_device_root(tty_dir)
+        if tty_root is not None and any(tty_root == net_root for net_root in net_roots):
+            hidden.add(tty_dir.name)
+    for tty_dir in Path("/sys/class/tty").glob("ttyACM*"):
+        tty_root = usb_device_root(tty_dir)
+        if tty_root is not None and any(tty_root == net_root for net_root in net_roots):
+            hidden.add(tty_dir.name)
+    return hidden
+
+
+def usb_device_root(path: Path) -> Path | None:
+    try:
+        real = path.resolve()
+    except OSError:
+        return None
+    for parent in [real, *real.parents]:
+        if re.fullmatch(r"\d+(?:-\d+(?:\.\d+)*)+", parent.name):
+            return parent
+    return None
+
+
+def modem_sibling_net_devices(port: str, device_path: str) -> list[str]:
+    root = Path(device_path)
+    tty_path = Path(f"/sys/class/tty/{port}")
+    if not root.exists() or not tty_path.exists():
+        return []
+    try:
+        tty_path.resolve().relative_to(root)
+    except (OSError, ValueError):
+        return []
+    return modem_net_devices(str(root))
+
+
 def parse_key_value_output(text: str) -> dict[str, str]:
     data: dict[str, str] = {}
     for line in text.splitlines():
@@ -1826,6 +2022,58 @@ def tailscale_summary(status: dict[str, object]) -> str:
         online = "online" if self_info.get("Online") else "offline"
     parts = [part for part in [backend, online] if part and part != "-"]
     return " / ".join(parts) if parts else "-"
+
+
+def tailscale_tab_markup() -> str:
+    status = tailscale_status()
+    color = tailscale_status_color(status)
+    return f'<span foreground="{color}">●</span> {underlined_markup("Tailscale", "T")}'
+
+
+def tailscale_status_color(status: dict[str, object]) -> str:
+    if not status:
+        return "#8a8f98"
+    backend = str(status.get("BackendState") or "").lower()
+    self_info = status.get("Self")
+    online = isinstance(self_info, dict) and bool(self_info.get("Online"))
+    if backend == "running" and online:
+        return "#34c759"
+    if backend in {"stopped", "no state"}:
+        return "#8a8f98"
+    if backend == "needslogin" or "login" in backend:
+        return "#d68a24"
+    if backend in {"running", "starting"}:
+        return "#d68a24"
+    return "#ff6b5f"
+
+
+def power_tab_markup() -> str:
+    color = power_service_status_color()
+    return f'<span foreground="{color}">●</span> {underlined_markup("Power", "P")}'
+
+
+def power_service_status_color() -> str:
+    if shutil.which("systemctl") is None:
+        return "#8a8f98"
+    active = subprocess.run(
+        ["systemctl", "is-active", SYSTEM_SERVICE],
+        text=True,
+        capture_output=True,
+        check=False,
+    ).stdout.strip()
+    enabled = subprocess.run(
+        ["systemctl", "is-enabled", SYSTEM_SERVICE],
+        text=True,
+        capture_output=True,
+        check=False,
+    ).stdout.strip()
+    if active == "active":
+        return "#34c759"
+    if active == "failed":
+        return "#ff6b5f"
+    if enabled == "enabled":
+        return "#d68a24"
+    return "#8a8f98"
 
 
 def tailscale_admin_summary(status: dict[str, object]) -> str:
@@ -1924,24 +2172,60 @@ def tailscale_row_color(status: str) -> str:
     return "#8a8f98"
 
 
-def dashboard_status() -> dict[str, str]:
+def dashboard_status(
+    cpu_percent: int | None = None,
+    net_rates: dict[str, float] | None = None,
+) -> dict[str, dict[str, object]]:
     power = power_status()
-    tailscale = tailscale_status()
+    memory = memory_metrics()
+    storage = storage_metrics("/")
+    cpu = cpu_metrics()
+    if cpu_percent is not None:
+        cpu["percent"] = cpu_percent
+        cpu["meter"] = f"CPU {cpu_percent}%"
+    net_rates = net_rates or {"rx": 0.0, "tx": 0.0}
     return {
-        "system": dashboard_system_summary(),
-        "power": "\n".join(
-            [
-                f"STATE  {power.get('power', '-')}",
-                f"CPU    {power.get('cpu', '-')}",
-                f"POLICY {power.get('powersaver', '-')}",
-            ]
+        "system": dashboard_item(dashboard_system_summary(), 100, "LIVE"),
+        "power": dashboard_item(
+            "\n".join(
+                [
+                    f"STATE  {power.get('power', '-')}",
+                    f"CPU    {power.get('cpu', '-')}",
+                    f"WWAN   {power.get('wwan', '-')}",
+                ]
+            ),
+            100 if power.get("power") == "AC" else 55,
+            str(power.get("power", "-")).upper(),
         ),
-        "cpu": dashboard_cpu_summary(),
-        "memory": dashboard_memory_summary(),
-        "storage": dashboard_storage_summary(),
-        "network": dashboard_network_summary(),
-        "cellular": dashboard_cellular_summary(),
-        "tailscale": tailscale_summary(tailscale),
+        "cpu": dashboard_item(dashboard_cpu_summary(cpu), int(cpu.get("percent", 0)), cpu.get("meter", "CPU")),
+        "memory": dashboard_item(dashboard_memory_summary(memory), int(memory.get("percent", 0)), memory.get("meter", "RAM")),
+        "storage": dashboard_item(dashboard_storage_summary(), int(storage.get("percent", 0)), storage.get("meter", "DISK")),
+        "network": dashboard_item(
+            dashboard_network_summary(net_rates),
+            network_activity_percent(net_rates.get("rx", 0.0)),
+            f"DOWN {format_rate(net_rates['rx'])}",
+            second_percent=network_activity_percent(net_rates.get("tx", 0.0)),
+            second_meter=f"UP {format_rate(net_rates['tx'])}",
+        ),
+        "cellular": dashboard_item(dashboard_cellular_summary(), cellular_meter_percent(), "WWAN"),
+    }
+
+
+def dashboard_item(
+    text: str,
+    percent: int,
+    meter: object,
+    hide_meter: bool = False,
+    second_percent: int | None = None,
+    second_meter: object | None = None,
+) -> dict[str, object]:
+    return {
+        "text": text,
+        "percent": percent,
+        "meter": str(meter),
+        "hide_meter": hide_meter,
+        "second_percent": 0 if second_percent is None else second_percent,
+        "second_meter": "" if second_meter is None else str(second_meter),
     }
 
 
@@ -1950,10 +2234,7 @@ def dashboard_system_summary() -> str:
     kernel = platform.release()
     uptime = system_uptime_label()
     load = Path("/proc/loadavg").read_text(encoding="utf-8").split()[:3] if Path("/proc/loadavg").exists() else []
-    model = hardware_model()
     parts = [f"HOST   {hostname}", f"KERN   {kernel}", f"UP     {uptime}"]
-    if model:
-        parts.insert(1, f"MODEL  {model}")
     if load:
         parts.append(f"LOAD   {' '.join(load)}")
     return "\n".join(parts)
@@ -1985,20 +2266,64 @@ def system_uptime_label() -> str:
     return f"{minutes}m"
 
 
-def dashboard_cpu_summary() -> str:
+def dashboard_cpu_summary(metrics: dict[str, object] | None = None) -> str:
+    metrics = metrics or cpu_metrics()
     config = helper_service_config()
     policy = Path(config.get("POWERSAVER_CPU_POLICY_PATH", "/sys/devices/system/cpu/cpufreq/policy0"))
-    current = read_first_existing(policy / "scaling_cur_freq", policy / "cpuinfo_cur_freq")
+    current = str(metrics.get("current") or read_first_existing(policy / "scaling_cur_freq", policy / "cpuinfo_cur_freq"))
     governor = read_first_existing(policy / "scaling_governor")
     temp = cpu_temperature_label()
-    lines = [f"LIMIT  {current_cpu_summary(config)}"]
+    lines = []
     if current:
-        lines.append(f"CUR    {int(current) // 1000} MHz {cpu_freq_bar(policy, current)}")
+        lines.append(f"FREQ   {int(current) // 1000} MHz")
     if governor:
         lines.append(f"GOV    {governor}")
     if temp:
         lines.append(f"TEMP   {temp}")
     return "\n".join(lines)
+
+
+def cpu_metrics() -> dict[str, object]:
+    config = helper_service_config()
+    policy = Path(config.get("POWERSAVER_CPU_POLICY_PATH", "/sys/devices/system/cpu/cpufreq/policy0"))
+    current = read_first_existing(policy / "scaling_cur_freq", policy / "cpuinfo_cur_freq")
+    try:
+        cur = int(current)
+        min_freq = int((policy / "cpuinfo_min_freq").read_text(encoding="utf-8").strip())
+        max_freq = int((policy / "cpuinfo_max_freq").read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return {"percent": 0, "current": current, "meter": "CPU"}
+    total = max_freq - min_freq
+    used = max(0, cur - min_freq)
+    percent = int(max(0, min(100, used * 100 / total))) if total > 0 else 0
+    return {"percent": percent, "current": current, "meter": f"{cur // 1000} MHz"}
+
+
+def read_cpu_sample() -> tuple[int, int] | None:
+    try:
+        parts = Path("/proc/stat").read_text(encoding="utf-8").splitlines()[0].split()
+    except (OSError, IndexError):
+        return None
+    if not parts or parts[0] != "cpu":
+        return None
+    try:
+        values = [int(value) for value in parts[1:]]
+    except ValueError:
+        return None
+    idle = values[3] + (values[4] if len(values) > 4 else 0)
+    total = sum(values)
+    return total, idle
+
+
+def cpu_usage_percent(previous: tuple[int, int] | None, current: tuple[int, int] | None) -> int | None:
+    if previous is None or current is None:
+        return None
+    total_delta = current[0] - previous[0]
+    idle_delta = current[1] - previous[1]
+    if total_delta <= 0:
+        return None
+    busy = max(0, total_delta - idle_delta)
+    return int(max(0, min(100, busy * 100 / total_delta)))
 
 
 def read_first_existing(*paths: Path) -> str:
@@ -2021,21 +2346,16 @@ def cpu_temperature_label() -> str:
     return ""
 
 
-def cpu_freq_bar(policy: Path, current: str) -> str:
-    try:
-        cur = int(current)
-        min_freq = int((policy / "cpuinfo_min_freq").read_text(encoding="utf-8").strip())
-        max_freq = int((policy / "cpuinfo_max_freq").read_text(encoding="utf-8").strip())
-    except (OSError, ValueError):
-        return ""
-    total = max_freq - min_freq
-    used = max(0, cur - min_freq)
-    if total <= 0:
-        return ""
-    return progress_bar(used, total)
+def dashboard_memory_summary(metrics: dict[str, object] | None = None) -> str:
+    metrics = metrics or memory_metrics()
+    lines = [str(metrics.get("ram", "-"))]
+    swap = str(metrics.get("swap", ""))
+    if swap:
+        lines.append(swap)
+    return "\n".join(lines)
 
 
-def dashboard_memory_summary() -> str:
+def memory_metrics() -> dict[str, object]:
     info: dict[str, int] = {}
     try:
         for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
@@ -2049,10 +2369,12 @@ def dashboard_memory_summary() -> str:
     swap_total = info.get("SwapTotal", 0)
     swap_free = info.get("SwapFree", 0)
     used = max(0, total - available)
-    lines = [metric_line("RAM", used, total, unit="kib")]
+    ram = metric_line("RAM", used, total, unit="kib")
+    percent = int(max(0, min(100, used * 100 / total))) if total else 0
+    swap = ""
     if swap_total:
-        lines.append(metric_line("SWAP", swap_total - swap_free, swap_total, unit="kib"))
-    return "\n".join(lines)
+        swap = metric_line("SWAP", swap_total - swap_free, swap_total, unit="kib")
+    return {"percent": percent, "ram": ram, "swap": swap, "meter": f"RAM {percent}%"}
 
 
 def metric_line(label: str, used: int, total: int, unit: str) -> str:
@@ -2065,14 +2387,7 @@ def metric_line(label: str, used: int, total: int, unit: str) -> str:
     else:
         used_text = format_bytes(used)
         total_text = format_bytes(total)
-    return f"{label:<6} {progress_bar(used, total)} {percent:3d}% {used_text}/{total_text}"
-
-
-def progress_bar(used: int, total: int, width: int = 10) -> str:
-    if total <= 0:
-        return "[" + "-" * width + "]"
-    filled = int(max(0, min(width, round(used * width / total))))
-    return "[" + "#" * filled + "." * (width - filled) + "]"
+    return f"{label:<6} {percent:3d}% {used_text}/{total_text}"
 
 
 def format_kib(kib: int) -> str:
@@ -2093,6 +2408,16 @@ def dashboard_storage_summary() -> str:
     return "\n".join(rows) if rows else "-"
 
 
+def storage_metrics(path: str) -> dict[str, object]:
+    try:
+        usage = shutil.disk_usage(path)
+    except OSError:
+        return {"percent": 0, "meter": "DISK"}
+    used = usage.total - usage.free
+    percent = int(max(0, min(100, used * 100 / usage.total))) if usage.total else 0
+    return {"percent": percent, "meter": f"{path} {percent}%"}
+
+
 def format_bytes(value: int) -> str:
     if value >= 1024**3:
         return f"{value / 1024**3:.1f} GiB"
@@ -2101,9 +2426,14 @@ def format_bytes(value: int) -> str:
     return f"{value} B"
 
 
-def dashboard_network_summary() -> str:
+def dashboard_network_summary(rates: dict[str, float] | None = None) -> str:
+    rates = rates or {"rx": 0.0, "tx": 0.0}
     devices = nmcli_device_status()
-    connected = [item for item in devices if clean_nm_state(item["state"]).startswith("connected")]
+    connected = [
+        item
+        for item in devices
+        if clean_nm_state(item["state"]).startswith("connected") and dashboard_network_device_visible(item)
+    ]
     route = preferred_route_interface() or "-"
     lines = [f"DEF    {route}", f"CONN   {len(connected)}"]
     for item in connected[:4]:
@@ -2112,17 +2442,104 @@ def dashboard_network_summary() -> str:
     return "\n".join(lines)
 
 
+def read_network_sample() -> tuple[float, int, int]:
+    rx_total = 0
+    tx_total = 0
+    for path in Path("/sys/class/net").iterdir():
+        if path.name == "lo" or path.name.startswith("tailscale"):
+            continue
+        operstate = read_first_existing(path / "operstate")
+        if operstate and operstate == "down":
+            continue
+        try:
+            rx_total += int((path / "statistics" / "rx_bytes").read_text(encoding="utf-8").strip())
+            tx_total += int((path / "statistics" / "tx_bytes").read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            continue
+    return time.time(), rx_total, tx_total
+
+
+def dashboard_network_device_visible(device: dict[str, str]) -> bool:
+    name = device.get("device", "")
+    dev_type = device.get("type", "")
+    if name == "lo" or name.startswith("tailscale"):
+        return False
+    if dev_type in {"loopback", "tun"}:
+        return False
+    return True
+
+
+def network_rates(
+    previous: tuple[float, int, int] | None,
+    current: tuple[float, int, int],
+) -> dict[str, float]:
+    if previous is None:
+        return {"rx": 0.0, "tx": 0.0}
+    elapsed = current[0] - previous[0]
+    if elapsed <= 0:
+        return {"rx": 0.0, "tx": 0.0}
+    return {
+        "rx": max(0.0, (current[1] - previous[1]) / elapsed),
+        "tx": max(0.0, (current[2] - previous[2]) / elapsed),
+    }
+
+
+def network_activity_percent(bytes_per_sec: float) -> int:
+    if bytes_per_sec <= 0:
+        return 0
+    if bytes_per_sec < 64 * 1024:
+        return 10
+    if bytes_per_sec < 512 * 1024:
+        return 30
+    if bytes_per_sec < 2 * 1024 * 1024:
+        return 55
+    if bytes_per_sec < 8 * 1024 * 1024:
+        return 75
+    return 100
+
+
+def format_rate(bytes_per_sec: float) -> str:
+    if bytes_per_sec >= 1024 * 1024:
+        return f"{bytes_per_sec / 1024 / 1024:.1f} MiB/s"
+    if bytes_per_sec >= 1024:
+        return f"{bytes_per_sec / 1024:.0f} KiB/s"
+    return f"{bytes_per_sec:.0f} B/s"
+
+
 def dashboard_cellular_summary() -> str:
+    wwan = current_wwan_summary()
+    config = helper_service_config()
+    policy = config.get("POWERSAVER_WWAN_POLICY", "ondemand")
+    if wwan.lower() in {"disabled", "off", "已禁用"}:
+        return f"PWR    OFF\nWWAN   {wwan}\nPOL    {policy}"
     modems = modem_signal_by_port()
+    hidden_ports = hidden_duplicate_modem_ports()
     if not modems:
-        return "-"
+        return f"WWAN   {wwan}\nPOL    {policy}\nMODEM  -"
     lines = []
-    for port, info in sorted(modems.items())[:3]:
+    visible_modems = [(port, info) for port, info in sorted(modems.items()) if port not in hidden_ports]
+    for port, info in visible_modems[:3]:
         signal = str(info.get("signal") or "-")
         connection = str(info.get("connection") or "-")
         connected = "connected" if info.get("connected") else "registered"
         lines.append(f"{port:<7} {connected}\nNET    {connection}\nSIG    {signal}")
-    return "\n".join(lines)
+    return "\n".join(lines) if lines else "-"
+
+
+def cellular_meter_percent() -> int:
+    wwan = current_wwan_summary()
+    if wwan.lower() in {"disabled", "off", "已禁用"}:
+        return 0
+    modems = modem_signal_by_port()
+    hidden_ports = hidden_duplicate_modem_ports()
+    best = 0
+    for port, info in modems.items():
+        if port in hidden_ports:
+            continue
+        bars = signal_bars(str(info.get("signal") or ""))
+        if bars is not None:
+            best = max(best, int(bars * 100 / 4))
+    return best
 
 
 def power_status() -> dict[str, str]:
@@ -2252,16 +2669,14 @@ def current_cpu_summary(config: dict[str, str]) -> str:
 def current_wwan_summary() -> str:
     if shutil.which("nmcli") is None:
         return "-"
-    result = subprocess.run(
-        ["nmcli", "-t", "-f", "WWAN", "radio"],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        return "-"
-    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-    return lines[-1] if lines else "-"
+    for command in (["nmcli", "-t", "-f", "WWAN", "radio"], ["nmcli", "radio", "wwan"]):
+        result = subprocess.run(command, text=True, capture_output=True, check=False)
+        if result.returncode != 0:
+            continue
+        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        if lines:
+            return lines[-1]
+    return "-"
 
 
 def powersaver_config_summary(config: dict[str, str]) -> str:

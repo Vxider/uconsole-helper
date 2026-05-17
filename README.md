@@ -18,7 +18,7 @@ on the local network.
 
 - DHCP Server tab for serving addresses on a selected wired interface.
 - Dashboard tab with htop/btop-style cards for system, power, CPU, memory,
-  storage, network, cellular, and Tailscale summaries.
+  storage, network, and cellular summaries.
 - LAN Scan tab for scanning hosts in the selected interface's IPv4 subnet.
 - Interface tab with NetworkManager-style device status, addresses, Wi-Fi signal,
   cellular signal, and Tailscale interface state.
@@ -115,7 +115,7 @@ The Dashboard is the first tab. It uses compact monitor-style cards for:
 - AC/battery state and powersaver policy
 - CPU limits, current frequency, governor, and temperature
 - RAM, swap, and storage usage with text progress bars
-- Network, cellular modem, and Tailscale summaries
+- Network and cellular modem summaries
 
 ## DHCP Server
 
