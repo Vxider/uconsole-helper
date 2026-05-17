@@ -4,6 +4,12 @@ uConsole Helper is a local GTK desktop utility for small network maintenance tas
 running a DHCP server on a selected interface, scanning a LAN, checking interface
 status, and viewing Tailscale devices.
 
+Repository:
+
+```text
+https://github.com/Vxider/uconsole-helper
+```
+
 It is designed for workflows such as connecting a machine directly to a server
 over Ethernet, assigning an address with DHCP, and then finding the target device
 on the local network.
@@ -11,8 +17,8 @@ on the local network.
 ## Features
 
 - DHCP Server tab for serving addresses on a selected wired interface.
-- Dashboard tab with system, power, CPU, memory, storage, network, cellular,
-  and Tailscale summaries.
+- Dashboard tab with htop/btop-style cards for system, power, CPU, memory,
+  storage, network, cellular, and Tailscale summaries.
 - LAN Scan tab for scanning hosts in the selected interface's IPv4 subnet.
 - Interface tab with NetworkManager-style device status, addresses, Wi-Fi signal,
   cellular signal, and Tailscale interface state.
@@ -78,6 +84,7 @@ Install only one side when needed:
 ```bash
 ./scripts/install.sh --desktop-only
 ./scripts/install.sh --service-only
+./scripts/install.sh --no-start
 ```
 
 ## Shortcuts
@@ -99,6 +106,16 @@ Actions:
 - `S`: run the current primary action, such as Start, Stop, or Scan
 
 Text fields do not trigger direct letter shortcuts while focused.
+
+## Dashboard
+
+The Dashboard is the first tab. It uses compact monitor-style cards for:
+
+- System identity, kernel, uptime, and load averages
+- AC/battery state and powersaver policy
+- CPU limits, current frequency, governor, and temperature
+- RAM, swap, and storage usage with text progress bars
+- Network, cellular modem, and Tailscale summaries
 
 ## DHCP Server
 
