@@ -186,7 +186,7 @@ class UConsoleHelperWindow(Gtk.Window):
         self.dhcp_tab.get_style_context().add_class("tab-button")
         tabs.pack_start(self.dhcp_tab, False, False, 0)
 
-        self.lanscan_tab = underlined_button("Scan", "S")
+        self.lanscan_tab = underlined_button("LAN Scan", "L")
         self.lanscan_tab.connect("clicked", lambda _button: self.set_tab("lanscan"))
         self.lanscan_tab.get_style_context().add_class("tab-button")
         tabs.pack_start(self.lanscan_tab, False, False, 0)
@@ -251,10 +251,11 @@ class UConsoleHelperWindow(Gtk.Window):
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         page.get_style_context().add_class("page")
 
-        grid = Gtk.Grid(column_spacing=6, row_spacing=6)
+        grid = Gtk.Grid(column_spacing=5, row_spacing=4)
         grid.set_column_homogeneous(True)
         grid.set_row_homogeneous(True)
         grid.set_hexpand(True)
+        grid.connect("size-allocate", self.on_dashboard_size_allocate)
         self.dashboard_grid = grid
         page.pack_start(grid, True, True, 0)
 
@@ -266,26 +267,15 @@ class UConsoleHelperWindow(Gtk.Window):
             ("storage", "Storage"),
             ("network", "Network"),
             ("cellular", "Cellular"),
-            ("placeholder-1", ""),
-            ("placeholder-2", ""),
         ]
-        for index, (key, title) in enumerate(cards):
-            if key.startswith("placeholder"):
-                card = card_box()
-                card.set_opacity(0)
-                card.set_sensitive(False)
-                card.set_hexpand(True)
-                card.set_vexpand(True)
-                grid.attach(card, index % 3, index // 3, 1, 1)
-                continue
-
+        for key, title in cards:
             card = dashboard_card(title)
             label = Gtk.Label(label="-", xalign=0, yalign=0)
             label.set_line_wrap(True)
             label.set_line_wrap_mode(Pango.WrapMode.CHAR)
             label.set_selectable(True)
             label.set_hexpand(True)
-            label.set_max_width_chars(14)
+            label.set_max_width_chars(20)
             label.get_style_context().add_class("dashboard-value")
             bar = Gtk.ProgressBar()
             bar.set_show_text(True)
@@ -297,16 +287,17 @@ class UConsoleHelperWindow(Gtk.Window):
                 secondary_bar.set_show_text(True)
                 secondary_bar.get_style_context().add_class("dashboard-meter")
                 meter_row.pack_start(secondary_bar, True, True, 0)
-                card.pack_start(meter_row, False, False, 2)
+                card.pack_start(meter_row, False, False, 1)
                 self.dashboard_secondary_bars[key] = secondary_bar
             else:
-                card.pack_start(bar, False, False, 2)
-            card.pack_start(label, True, True, 2)
+                card.pack_start(bar, False, False, 1)
+            card.pack_start(label, True, True, 1)
             self.dashboard_bars[key] = bar
             self.dashboard_labels[key] = label
             card.set_hexpand(True)
             card.set_vexpand(True)
             self.dashboard_cards.append(card)
+            index = len(self.dashboard_cards) - 1
             grid.attach(card, index % 3, index // 3, 1, 1)
         self.dashboard_columns = 3
 
@@ -431,8 +422,11 @@ class UConsoleHelperWindow(Gtk.Window):
         status_card.pack_start(status_grid, False, False, 0)
 
         rows = [
-            ("service", "Service"),
+            ("time", "Time"),
+            ("watts", "Watts"),
+            ("sleep", "Sleep"),
             ("power", "Power"),
+            ("cpu_freq", "CPU Freq"),
             ("cpu", "CPU"),
             ("wwan", "WWAN"),
         ]
@@ -768,7 +762,7 @@ class UConsoleHelperWindow(Gtk.Window):
             .section-title { font-size: 17px; font-weight: 700; color: #f2f2f2; }
             .dashboard-title {
                 font-family: "SauceCode Pro Mono", monospace;
-                font-size: 16px;
+                font-size: 20px;
                 font-weight: 700;
                 color: #61d6d6;
                 background: #111820;
@@ -778,11 +772,11 @@ class UConsoleHelperWindow(Gtk.Window):
             }
             .dashboard-value {
                 font-family: "SauceCode Pro Mono", monospace;
-                font-size: 16px;
+                font-size: 19px;
                 color: #d9f7ef;
             }
             .dashboard-meter {
-                min-height: 8px;
+                min-height: 6px;
             }
             .dashboard-meter trough {
                 background: #080d10;
@@ -799,6 +793,9 @@ class UConsoleHelperWindow(Gtk.Window):
                 border: 1px solid #2a5258;
                 border-radius: 8px;
                 padding: 5px;
+            }
+            .dashboard-card {
+                padding: 3px;
             }
             .power-profile-card {
                 background: #111418;
@@ -978,6 +975,28 @@ class UConsoleHelperWindow(Gtk.Window):
         else:
             self.context_action_button.hide()
 
+    def on_dashboard_size_allocate(self, _widget: Gtk.Widget, allocation: Gdk.Rectangle) -> None:
+        if allocation.width >= 860 and allocation.height < 520:
+            columns = 4
+        elif allocation.width >= 680:
+            columns = 3
+        elif allocation.width >= 440:
+            columns = 2
+        else:
+            columns = 1
+        if columns != self.dashboard_columns:
+            self.reflow_dashboard(columns)
+
+    def reflow_dashboard(self, columns: int) -> None:
+        if self.dashboard_grid is None:
+            return
+        for card in self.dashboard_cards:
+            self.dashboard_grid.remove(card)
+        for index, card in enumerate(self.dashboard_cards):
+            self.dashboard_grid.attach(card, index % columns, index // columns, 1, 1)
+        self.dashboard_columns = columns
+        self.dashboard_grid.show_all()
+
     def run_secondary_header_action(self) -> None:
         page = self.stack.get_visible_child_name()
         if page == "dhcp":
@@ -1106,7 +1125,7 @@ class UConsoleHelperWindow(Gtk.Window):
         if key_lower == "d":
             self.set_tab("dhcp")
             return True
-        if key_lower == "s":
+        if key_lower == "l":
             self.set_tab("lanscan")
             return True
         if key_lower == "i":
@@ -1126,6 +1145,9 @@ class UConsoleHelperWindow(Gtk.Window):
             return True
         if key_lower == "r":
             self.run_refresh_action()
+            return True
+        if key_lower == "s" and self.stack.get_visible_child_name() == "lanscan":
+            self.run_context_action()
             return True
         if key_lower == "v" and self.stack.get_visible_child_name() in {"power", "mapper", "asr"}:
             self.run_context_action()
@@ -1750,6 +1772,7 @@ def card_box() -> Gtk.Box:
 
 def dashboard_card(title: str) -> Gtk.Box:
     box = card_box()
+    box.get_style_context().add_class("dashboard-card")
     title_label = Gtk.Label(label=f" {title.upper()} ", xalign=0)
     title_label.get_style_context().add_class("dashboard-title")
     box.pack_start(title_label, False, False, 0)
@@ -2824,6 +2847,7 @@ def dashboard_status(
                 [
                     kv_line("TIME", power_time_estimate()),
                     power_watt_line(power.get("power", "-")),
+                    kv_line("FREQ", power.get("cpu_freq", "-")),
                     kv_line("CPU", power.get("cpu", "-")),
                 ]
             ),
@@ -3158,11 +3182,17 @@ def storage_mount_sort_key(item: dict[str, object]) -> tuple[int, int, str]:
 
 
 def format_bytes(value: int) -> str:
-    if value >= 1024**3:
-        return f"{value / 1024**3:.1f} GiB"
-    if value >= 1024**2:
-        return f"{value / 1024**2:.0f} MiB"
-    return f"{value} B"
+    units = ("B", "KB", "MB", "GB", "TB")
+    size = float(value)
+    unit_index = 0
+    while size >= 1024 and unit_index < len(units) - 1:
+        size /= 1024
+        unit_index += 1
+    if unit_index == 0:
+        return f"{int(size)} {units[unit_index]}"
+    if size >= 100:
+        return f"{size:.0f} {units[unit_index]}"
+    return f"{size:.1f} {units[unit_index]}"
 
 
 def dashboard_network_summary(rates: dict[str, float] | None = None) -> str:
@@ -3316,9 +3346,13 @@ def cellular_meter_percent() -> int:
 
 def power_status() -> dict[str, str]:
     config = helper_service_config()
+    power = current_power_state(config)
     return {
-        "service": system_service_summary(SYSTEM_SERVICE),
-        "power": current_power_state(config),
+        "time": power_time_estimate(),
+        "watts": realtime_power_label(power),
+        "sleep": power_screen_timeout_summary(config, power),
+        "power": power,
+        "cpu_freq": current_cpu_freq_summary(config),
         "cpu": current_cpu_summary(config),
         "wwan": current_wwan_summary(),
         "powersaver": powersaver_config_summary(config),
@@ -3917,6 +3951,15 @@ def power_watt_label(state: object) -> str:
     return battery_power_label()
 
 
+def realtime_power_label(state: object) -> str:
+    battery_power = battery_power_label()
+    if battery_power != "-":
+        return battery_power
+    if str(state).lower() == "ac":
+        return ac_power_label()
+    return "-"
+
+
 def power_watt_line(state: object) -> str:
     if str(state).lower() == "ac":
         ac_power = ac_power_label()
@@ -3981,6 +4024,15 @@ def current_cpu_summary(config: dict[str, str]) -> str:
     return f"{min_freq}-{max_freq} MHz"
 
 
+def current_cpu_freq_summary(config: dict[str, str]) -> str:
+    policy = Path(config.get("POWERSAVER_CPU_POLICY_PATH", "/sys/devices/system/cpu/cpufreq/policy0"))
+    current = read_first_existing(policy / "scaling_cur_freq", policy / "cpuinfo_cur_freq")
+    try:
+        return f"{int(current) // 1000} MHz"
+    except (TypeError, ValueError):
+        return "-"
+
+
 def current_wwan_summary() -> str:
     if shutil.which("nmcli") is None:
         return "-"
@@ -4019,6 +4071,32 @@ def powersaver_config_summary(config: dict[str, str]) -> str:
     state = "enabled" if enabled.lower() in {"1", "yes", "true", "on", "enabled"} else "disabled"
     screen_label = "off" if battery_screen == "0" and ac_screen == "0" else f"B {battery_screen}s / AC {ac_screen}s"
     return f"{state}; {mode}; battery {battery} MHz; AC {ac}; unknown {unknown}; WWAN {wwan}; screen {screen_label}"
+
+
+def power_screen_timeout_summary(config: dict[str, str], power_state: str) -> str:
+    mode = config.get("POWERSAVER_MODE", "balanced")
+    profile = mode.upper()
+    fallback = config.get("POWERSAVER_SCREEN_TIMEOUT_SEC", "0")
+    battery = config.get(f"POWERSAVER_{profile}_BATTERY_SCREEN_TIMEOUT_SEC", config.get("POWERSAVER_BATTERY_SCREEN_TIMEOUT_SEC", fallback))
+    ac = config.get(f"POWERSAVER_{profile}_AC_SCREEN_TIMEOUT_SEC", config.get("POWERSAVER_AC_SCREEN_TIMEOUT_SEC", fallback))
+    power_state = power_state.lower()
+    if power_state == "ac":
+        return screen_timeout_display_value(ac)
+    if power_state == "battery":
+        return screen_timeout_display_value(battery)
+    unknown = config.get(
+        f"POWERSAVER_{profile}_UNKNOWN_POWER_ACTION",
+        config.get("POWERSAVER_UNKNOWN_POWER_ACTION", "restore"),
+    )
+    if unknown == "restore":
+        return screen_timeout_display_value(ac)
+    if unknown == "battery":
+        return screen_timeout_display_value(battery)
+    battery_text = screen_timeout_display_value(battery)
+    ac_text = screen_timeout_display_value(ac)
+    if battery_text == ac_text:
+        return battery_text
+    return f"Unknown, B {battery_text} / AC {ac_text}"
 
 
 def interface_addresses() -> dict[str, str]:
