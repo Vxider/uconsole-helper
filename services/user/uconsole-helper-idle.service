@@ -1,0 +1,16 @@
+[Unit]
+Description=uConsole Helper screen idle policy
+After=graphical-session.target
+Wants=graphical-session.target
+
+[Service]
+Type=simple
+Environment=XDG_RUNTIME_DIR=%t
+Environment=WAYLAND_DISPLAY=wayland-0
+Environment=DISPLAY=:0
+ExecStart=%h/.local/share/uconsole-helper-idle/uconsole_helper_idle.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

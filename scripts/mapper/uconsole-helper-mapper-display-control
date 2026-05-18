@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+
+BACKLIGHT_POWER = Path("/sys/class/backlight/backlight@0/bl_power")
+FRAMEBUFFER_BLANK = Path("/sys/class/graphics/fb0/blank")
+DRM_ROOT = Path("/sys/class/drm")
+
+
+def find_drm_panel_status() -> Path | None:
+    for panel in DRM_ROOT.iterdir():
+        if "DSI" in panel.name:
+            status = panel / "status"
+            if status.exists():
+                return status
+    return None
+
+
+def read_screen_off() -> bool:
+    return BACKLIGHT_POWER.read_text(encoding="utf-8").strip() == "4"
+
+
+def write_text(path: Path, value: str) -> None:
+    path.write_text(value, encoding="utf-8")
+
+
+def set_display(on: bool) -> None:
+    drm_status = find_drm_panel_status()
+    if on:
+        write_text(FRAMEBUFFER_BLANK, "0")
+        write_text(BACKLIGHT_POWER, "0")
+        if drm_status is not None:
+            write_text(drm_status, "detect")
+    else:
+        if drm_status is not None:
+            write_text(drm_status, "off")
+        write_text(FRAMEBUFFER_BLANK, "1")
+        write_text(BACKLIGHT_POWER, "4")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("action", choices=("toggle", "on", "off", "status"))
+    args = parser.parse_args()
+
+    if args.action == "status":
+        print("off" if read_screen_off() else "on")
+        return 0
+    if args.action == "toggle":
+        set_display(read_screen_off())
+        return 0
+
+    set_display(args.action == "on")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

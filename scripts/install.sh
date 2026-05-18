@@ -9,13 +9,15 @@ Usage:
 Options:
   --desktop-only     install only the current-user desktop launcher and icon
   --service-only     install only the system background service
-  --no-start         install the system service but do not enable/start it
+  --mapper-only      install only the current-user input mapper and idle services
+  --no-start         install services but do not enable/start them
   -h, --help         show this help
 EOF
 }
 
 INSTALL_DESKTOP=1
 INSTALL_SERVICE=1
+INSTALL_MAPPER=1
 START_SERVICE=1
 
 while [[ $# -gt 0 ]]; do
@@ -23,11 +25,19 @@ while [[ $# -gt 0 ]]; do
     --desktop-only)
       INSTALL_DESKTOP=1
       INSTALL_SERVICE=0
+      INSTALL_MAPPER=0
       shift
       ;;
     --service-only)
       INSTALL_DESKTOP=0
       INSTALL_SERVICE=1
+      INSTALL_MAPPER=0
+      shift
+      ;;
+    --mapper-only)
+      INSTALL_DESKTOP=0
+      INSTALL_SERVICE=0
+      INSTALL_MAPPER=1
       shift
       ;;
     --no-start)
@@ -98,6 +108,27 @@ install_service() {
     sudo install -m 0644 "${APP_DIR}/config/uconsole-helper.conf" "${config_file}"
   else
     echo "Keeping existing config: ${config_file}"
+    ensure_config_key "${config_file}" "POWERSAVER_MODE" "balanced"
+    ensure_config_key "${config_file}" "POWERSAVER_ECO_BATTERY_CPU_FREQ" "1500,1500"
+    ensure_config_key "${config_file}" "POWERSAVER_ECO_AC_CPU_FREQ" "1500,1500"
+    ensure_config_key "${config_file}" "POWERSAVER_ECO_BATTERY_SCREEN_TIMEOUT_SEC" "0"
+    ensure_config_key "${config_file}" "POWERSAVER_ECO_AC_SCREEN_TIMEOUT_SEC" "0"
+    ensure_config_key "${config_file}" "POWERSAVER_ECO_UNKNOWN_POWER_ACTION" "restore"
+    ensure_config_key "${config_file}" "POWERSAVER_ECO_WWAN_POLICY" "ondemand"
+    ensure_config_key "${config_file}" "POWERSAVER_BALANCED_BATTERY_CPU_FREQ" "1500,1500"
+    ensure_config_key "${config_file}" "POWERSAVER_BALANCED_AC_CPU_FREQ" "restore"
+    ensure_config_key "${config_file}" "POWERSAVER_BALANCED_BATTERY_SCREEN_TIMEOUT_SEC" "0"
+    ensure_config_key "${config_file}" "POWERSAVER_BALANCED_AC_SCREEN_TIMEOUT_SEC" "0"
+    ensure_config_key "${config_file}" "POWERSAVER_BALANCED_UNKNOWN_POWER_ACTION" "restore"
+    ensure_config_key "${config_file}" "POWERSAVER_BALANCED_WWAN_POLICY" "ondemand"
+    ensure_config_key "${config_file}" "POWERSAVER_PERFORMANCE_BATTERY_CPU_FREQ" "1500,2400"
+    ensure_config_key "${config_file}" "POWERSAVER_PERFORMANCE_AC_CPU_FREQ" "restore"
+    ensure_config_key "${config_file}" "POWERSAVER_PERFORMANCE_BATTERY_SCREEN_TIMEOUT_SEC" "0"
+    ensure_config_key "${config_file}" "POWERSAVER_PERFORMANCE_AC_SCREEN_TIMEOUT_SEC" "0"
+    ensure_config_key "${config_file}" "POWERSAVER_PERFORMANCE_UNKNOWN_POWER_ACTION" "restore"
+    ensure_config_key "${config_file}" "POWERSAVER_PERFORMANCE_WWAN_POLICY" "ondemand"
+    ensure_config_key "${config_file}" "POWERSAVER_BATTERY_SCREEN_TIMEOUT_SEC" "0"
+    ensure_config_key "${config_file}" "POWERSAVER_AC_SCREEN_TIMEOUT_SEC" "0"
   fi
   sudo install -m 0644 "${APP_DIR}/services/uconsole-helper.service" "${service_file}"
   sudo systemctl daemon-reload
@@ -113,10 +144,171 @@ install_service() {
   echo "  ${config_file}"
 }
 
+ensure_config_key() {
+  local config_file="$1"
+  local key="$2"
+  local value="$3"
+  if ! sudo grep -Eq "^${key}=" "${config_file}"; then
+    printf '%s=%s\n' "${key}" "${value}" | sudo tee -a "${config_file}" >/dev/null
+  fi
+}
+
+install_mapper() {
+  local mapper_app_dir="${HOME}/.local/share/uconsole-helper-mapper"
+  local idle_app_dir="${HOME}/.local/share/uconsole-helper-idle"
+  local bin_dir="${HOME}/.local/bin"
+  local config_dir="${HOME}/.config/uconsole-helper-mapper"
+  local old_mapper_app_dir="${HOME}/.local/share/uconsole-mapper"
+  local old_config_dir="${HOME}/.config/uconsole-mapper"
+  local systemd_dir="${HOME}/.config/systemd/user"
+  local fcitx_lua_dir="${HOME}/.local/share/fcitx5/lua/imeapi/extensions"
+  local python_bin="${PYTHON_BIN:-/usr/bin/python3}"
+
+  mkdir -p "${mapper_app_dir}" "${idle_app_dir}" "${bin_dir}" "${config_dir}" "${systemd_dir}" "${fcitx_lua_dir}"
+
+  if systemctl --user list-unit-files uconsole-mapper.service >/dev/null 2>&1; then
+    systemctl --user disable --now uconsole-mapper.service >/dev/null 2>&1 || true
+  fi
+  if [[ -f "${systemd_dir}/uconsole-mapper.service" ]]; then
+    rm -f "${systemd_dir}/uconsole-mapper.service"
+  fi
+  if [[ -d "${old_config_dir}" ]]; then
+    for name in config.toml desktop-keybinds.toml voice.env voice-glossary.txt; do
+      if [[ -f "${old_config_dir}/${name}" && ! -f "${config_dir}/${name}" ]]; then
+        install -m 0644 "${old_config_dir}/${name}" "${config_dir}/${name}"
+      fi
+    done
+  fi
+  if [[ -d "${old_mapper_app_dir}" ]]; then
+    echo "Migrated mapper runtime name from uconsole-mapper to uconsole-helper-mapper."
+  fi
+  if [[ -f "${config_dir}/config.toml" ]]; then
+    perl -0pi -e 's#/usr/local/bin/uconsole-mapper-display-control#/usr/local/bin/uconsole-helper-mapper-display-control#g' "${config_dir}/config.toml"
+  fi
+
+  if [[ ! -x "${python_bin}" ]]; then
+    echo "Python interpreter not found: ${python_bin}" >&2
+    exit 1
+  fi
+  if ! "${python_bin}" -c 'import evdev' >/dev/null 2>&1; then
+    echo "Missing python3-evdev. Install it first:" >&2
+    echo "  sudo apt update && sudo apt install -y python3-evdev" >&2
+    exit 1
+  fi
+  if command -v apt-mark >/dev/null 2>&1; then
+    sudo apt-mark manual python3-evdev >/dev/null 2>&1 || true
+  fi
+  if [[ ! -e /dev/uinput ]]; then
+    echo "Missing /dev/uinput. Enable it first:" >&2
+    echo "  sudo modprobe uinput" >&2
+    exit 1
+  fi
+  if [[ ! -w /dev/uinput ]]; then
+    echo "Configuring /dev/uinput permissions for group input..."
+    sudo install -m 0644 "${APP_DIR}/scripts/mapper/99-uinput.rules" /etc/udev/rules.d/99-uinput.rules
+    sudo udevadm control --reload-rules
+    sudo udevadm trigger --name-match=uinput >/dev/null 2>&1 || true
+    sudo chgrp input /dev/uinput
+    sudo chmod 0660 /dev/uinput
+    if command -v setfacl >/dev/null 2>&1; then
+      sudo setfacl -m "u:${USER}:rw" /dev/uinput
+    fi
+  fi
+  if [[ ! -w /dev/uinput ]]; then
+    echo "Unable to get write access to /dev/uinput for ${USER}." >&2
+    echo "Add the user to the input group or grant a persistent ACL, then rerun install." >&2
+    echo "  sudo usermod -aG input ${USER}" >&2
+    exit 1
+  fi
+
+  install -m 0755 "${APP_DIR}/mapper/uconsole_helper_mapper.py" "${mapper_app_dir}/uconsole_helper_mapper.py"
+  install -m 0755 "${APP_DIR}/scripts/uconsole-helper-idle.py" "${idle_app_dir}/uconsole_helper_idle.py"
+  install -m 0755 "${APP_DIR}/scripts/mapper/generate_desktop_keybinds.py" "${mapper_app_dir}/generate_desktop_keybinds.py"
+  install -m 0755 "${APP_DIR}/scripts/mapper/sync_labwc_keybinds.py" "${mapper_app_dir}/sync_labwc_keybinds.py"
+  install -m 0755 "${APP_DIR}/scripts/mapper/sync_keyd_default_conf.py" "${mapper_app_dir}/sync_keyd_default_conf.py"
+  install -m 0755 "${APP_DIR}/scripts/mapper/toggle-codex-buddy.sh" "${bin_dir}/toggle-codex-buddy"
+  install -m 0755 "${APP_DIR}/scripts/mapper/toggle-lxterminal.sh" "${bin_dir}/toggle-lxterminal"
+  install -m 0755 "${APP_DIR}/scripts/mapper/run-or-raise-chromium.sh" "${bin_dir}/run-or-raise-chromium"
+  install -m 0755 "${APP_DIR}/scripts/mapper/run-or-raise-filemanager.sh" "${bin_dir}/run-or-raise-filemanager"
+  install -m 0755 "${APP_DIR}/scripts/mapper/run-or-raise-vscode.sh" "${bin_dir}/run-or-raise-vscode"
+  install -m 0755 "${APP_DIR}/scripts/mapper/run-or-raise-zdesktop.sh" "${bin_dir}/run-or-raise-zdesktop"
+  install -m 0755 "${APP_DIR}/scripts/mapper/show-desktop.sh" "${bin_dir}/uconsole-show-desktop"
+  install -m 0755 "${APP_DIR}/scripts/mapper/esc-switch-ime-english.sh" "${bin_dir}/esc-switch-ime-english"
+  install -m 0755 "${APP_DIR}/scripts/mapper/shift-enter-newline.sh" "${bin_dir}/shift-enter-newline"
+  install -m 0755 "${APP_DIR}/scripts/mapper/uconsole-paste.sh" "${bin_dir}/uconsole-paste"
+  install -m 0755 "${APP_DIR}/scripts/mapper/uconsole-voice-ptt.sh" "${bin_dir}/uconsole-voice-ptt"
+  install -m 0644 "${APP_DIR}/scripts/mapper/fcitx-uconsole-voice-commit.lua" "${fcitx_lua_dir}/uconsole_voice_commit.lua"
+  install -m 0644 "${APP_DIR}/services/user/uconsole-helper-mapper.service" "${systemd_dir}/uconsole-helper-mapper.service"
+  install -m 0644 "${APP_DIR}/services/user/uconsole-helper-idle.service" "${systemd_dir}/uconsole-helper-idle.service"
+  sudo install -m 0755 "${APP_DIR}/scripts/mapper/uconsole-launch-in-session.sh" /usr/local/bin/uconsole-launch-in-session
+  sudo install -m 0755 "${APP_DIR}/scripts/mapper/uconsole-helper-mapper-display-control" /usr/local/bin/uconsole-helper-mapper-display-control
+
+  local sudoers_file="/etc/sudoers.d/uconsole-helper-mapper-display-control"
+  local sudoers_line="${USER} ALL=(root) NOPASSWD: /usr/local/bin/uconsole-helper-mapper-display-control *"
+  if [[ ! -f "${sudoers_file}" ]] || ! sudo grep -Fxq "${sudoers_line}" "${sudoers_file}"; then
+    local tmp_sudoers
+    tmp_sudoers="$(mktemp)"
+    printf '%s\n' "${sudoers_line}" > "${tmp_sudoers}"
+    sudo visudo -cf "${tmp_sudoers}" >/dev/null
+    sudo install -m 0440 "${tmp_sudoers}" "${sudoers_file}"
+    rm -f "${tmp_sudoers}"
+  fi
+
+  if [[ ! -f "${config_dir}/config.toml" ]]; then
+    install -m 0644 "${APP_DIR}/config/mapper/config.toml.example" "${config_dir}/config.toml"
+  fi
+  if [[ ! -f "${config_dir}/desktop-keybinds.toml" ]]; then
+    install -m 0644 "${APP_DIR}/config/mapper/desktop-keybinds.toml.example" "${config_dir}/desktop-keybinds.toml"
+  fi
+  if [[ ! -f "${config_dir}/voice.env" ]]; then
+    install -m 0644 "${APP_DIR}/config/mapper/voice.env.example" "${config_dir}/voice.env"
+  fi
+  if [[ ! -f "${config_dir}/voice-glossary.txt" ]]; then
+    install -m 0644 "${APP_DIR}/config/mapper/voice-glossary.txt.example" "${config_dir}/voice-glossary.txt"
+  fi
+
+  "${python_bin}" "${mapper_app_dir}/generate_desktop_keybinds.py" --config "${config_dir}/desktop-keybinds.toml"
+  "${python_bin}" "${mapper_app_dir}/sync_labwc_keybinds.py"
+  if command -v labwc >/dev/null 2>&1; then
+    labwc --reconfigure >/dev/null 2>&1 || true
+  fi
+  if command -v keyd >/dev/null 2>&1 || command -v keyd.rvaiya >/dev/null 2>&1 || [[ -d /etc/keyd ]]; then
+    sudo install -d -m 0755 /etc/keyd
+    sudo install -m 0644 "${mapper_app_dir}/keyd-uconsole-helper-mapper" /etc/keyd/uconsole-helper-mapper
+    sudo "${python_bin}" "${mapper_app_dir}/sync_keyd_default_conf.py"
+    if command -v keyd >/dev/null 2>&1; then
+      sudo keyd reload >/dev/null 2>&1 || sudo systemctl restart keyd >/dev/null 2>&1 || true
+    elif command -v keyd.rvaiya >/dev/null 2>&1; then
+      sudo keyd.rvaiya reload >/dev/null 2>&1 || sudo systemctl restart keyd >/dev/null 2>&1 || true
+    fi
+  fi
+
+  systemctl --user daemon-reload
+  if [[ "${START_SERVICE}" -eq 1 ]]; then
+    systemctl --user enable --now uconsole-helper-mapper.service
+    systemctl --user restart uconsole-helper-mapper.service
+    systemctl --user enable --now uconsole-helper-idle.service
+    systemctl --user restart uconsole-helper-idle.service
+  fi
+
+  echo "Installed uConsole input mapper:"
+  echo "  ${systemd_dir}/uconsole-helper-mapper.service"
+  echo "Config:"
+  echo "  ${config_dir}/config.toml"
+  echo "ASR:"
+  echo "  ${config_dir}/voice.env"
+  echo "Idle:"
+  echo "  ${systemd_dir}/uconsole-helper-idle.service"
+}
+
 if [[ "${INSTALL_DESKTOP}" -eq 1 ]]; then
   install_desktop
 fi
 
 if [[ "${INSTALL_SERVICE}" -eq 1 ]]; then
   install_service
+fi
+
+if [[ "${INSTALL_MAPPER}" -eq 1 ]]; then
+  install_mapper
 fi

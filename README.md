@@ -1,8 +1,8 @@
 # uConsole Helper
 
-uConsole Helper is a local GTK desktop utility for small network maintenance tasks:
-running a DHCP server on a selected interface, scanning a LAN, checking interface
-status, and viewing Tailscale devices.
+uConsole Helper is a local GTK desktop utility and service bundle for uConsole:
+network maintenance, system monitoring, power policy control, and user-session
+input mapping.
 
 Repository:
 
@@ -11,8 +11,8 @@ https://github.com/Vxider/uconsole-helper
 ```
 
 It is designed for workflows such as connecting a machine directly to a server
-over Ethernet, assigning an address with DHCP, and then finding the target device
-on the local network.
+over Ethernet, assigning an address with DHCP, finding the target device on the
+local network, and keeping uConsole-specific helper daemons in one place.
 
 ## Features
 
@@ -26,6 +26,9 @@ on the local network.
   right-click copy menu for IPv4, IPv6, and DNS name.
 - Power tab for monitoring and controlling the `uconsole-helper.service`
   background task runner.
+- Mapper tab for displaying and editing desktop shortcuts and mapper bindings.
+- ASR tab for editing the voice input configuration used by mapper push-to-talk
+  bindings.
 - Keyboard shortcuts for tab switching and common actions.
 
 ## Requirements
@@ -43,11 +46,15 @@ Optional integrations:
 - `mmcli` for cellular modem signal
 - `tailscale` for Tailscale device status
 - `avahi-resolve` for mDNS hostname lookup
+- `python3-evdev`, `/dev/uinput`, `wtype`, `wl-clipboard`, `curl`, `jq`, and
+  `swayidle` for the input mapper, ASR push-to-talk path, and idle display
+  timeout
+- `keyd` and `labwc` for desktop shortcut integration
 
 On Debian/Ubuntu:
 
 ```bash
-sudo apt install python3-gi gir1.2-gtk-3.0 dnsmasq iproute2 iputils-ping policykit-1
+sudo apt install python3-gi gir1.2-gtk-3.0 dnsmasq iproute2 iputils-ping policykit-1 python3-evdev wtype wl-clipboard curl jq swayidle
 ```
 
 ## Run
@@ -61,7 +68,8 @@ Starting or stopping the DHCP server may prompt for administrator privileges via
 
 ## Install
 
-Install the desktop launcher, icon, and root background service:
+Install the desktop launcher, icon, root background service, and user-session
+input mapper:
 
 ```bash
 ./scripts/install.sh
@@ -74,16 +82,27 @@ This installs:
 - `/usr/local/bin/uconsole-helper-service`
 - `/etc/uconsole-helper/uconsole-helper.conf`
 - `/etc/systemd/system/uconsole-helper.service`
+- `~/.local/share/uconsole-helper-mapper/uconsole_helper_mapper.py`
+- `~/.config/systemd/user/uconsole-helper-mapper.service`
+- `~/.local/share/uconsole-helper-idle/uconsole_helper_idle.py`
+- `~/.config/systemd/user/uconsole-helper-idle.service`
+- `~/.config/uconsole-helper-mapper/config.toml`
+- `~/.config/uconsole-helper-mapper/voice.env`
+- `~/.config/uconsole-helper-mapper/voice-glossary.txt`
 
-The service is a background task runner. Its first task is an AC/battery-aware
-powersaver that can adjust CPU frequency limits and optionally manage WWAN.
-The GUI does not need to be open for this service to run.
+`uconsole-helper.service` is a system background task runner. Its first task is
+an AC/battery-aware powersaver that can adjust CPU frequency limits and
+optionally manage WWAN. `uconsole-helper-mapper.service` and
+`uconsole-helper-idle.service` remain `systemd --user` services because they
+depend on the graphical user session, Wayland, evdev, uinput, and `swayidle`.
+The GUI does not need to be open for these services to run.
 
 Install only one side when needed:
 
 ```bash
 ./scripts/install.sh --desktop-only
 ./scripts/install.sh --service-only
+./scripts/install.sh --mapper-only
 ./scripts/install.sh --no-start
 ```
 
@@ -97,7 +116,9 @@ Tabs:
 - `I`: Interface
 - `T`: Tailscale
 - `P`: Power
-- `Ctrl+1` through `Ctrl+6`: switch tabs directly
+- `M`: Mapper
+- `A`: ASR
+- `Ctrl+1` through `Ctrl+8`: switch tabs directly
 - `Alt+Left` / `Alt+Right`: switch to the previous or next tab
 
 Actions:
@@ -177,14 +198,58 @@ configuration summary.
 The controls edit the powersaver policy in `/etc/uconsole-helper/uconsole-helper.conf`:
 
 - `Powersaver`: enable or disable the AC/battery CPU policy task
-- `Battery CPU MHz`: CPU min/max MHz while on battery, such as `1500,1500`
-- `AC CPU MHz`: `restore` or CPU min/max MHz while charging
-- `Unknown Power`: `restore`, `battery`, or `keep`
-- `WWAN Policy`: `ondemand`, `keep`, or `off`
-- `Poll Seconds`: background polling interval
+- `Mode`: active policy mode, one of `eco`, `balanced`, or `performance`
+- `{Mode} Battery MHz`: CPU min/max MHz for that mode while on battery
+- `{Mode} AC MHz`: `restore` or CPU min/max MHz for that mode while charging
+- `{Mode} Battery Screen`: battery idle timeout for that mode. `Default`
+  keeps the existing system behavior, and timed values are saved as seconds.
+- `{Mode} AC Screen`: AC idle timeout for that mode. `Default` keeps the
+  existing system behavior, and timed values are saved as seconds.
+- `{Mode} Unknown`: unknown-power action for that mode, one of `AC`, `Battery`,
+  or `Keep`
+- `{Mode} WWAN`: WWAN policy for that mode, one of `ondemand`, `keep`, or `off`
 
 `Save Policy` writes the config through `pkexec` or `sudo` and restarts
-`uconsole-helper.service`.
+`uconsole-helper.service`. The user idle service watches the same config and
+switches its internal `swayidle` timeout when Battery/AC state or config changes.
+Independent `swayidle` entries outside uConsole Helper, such as compositor
+autostart commands, are not overwritten by this setting.
+
+## Mapper
+
+The Mapper tab displays and edits two configuration layers:
+
+- `Desktop Shortcuts`: keyd/labwc desktop shortcut declarations from
+  `~/.config/uconsole-helper-mapper/desktop-keybinds.toml`
+- `Mapper Bindings`: gamepad, keyboard, and mouse bindings from
+  `~/.config/uconsole-helper-mapper/config.toml`
+
+The service is installed as a user service and keeps the original mapper runtime
+paths for compatibility:
+
+```text
+~/.local/share/uconsole-helper-mapper/uconsole_helper_mapper.py
+~/.config/uconsole-helper-mapper/config.toml
+~/.config/systemd/user/uconsole-helper-mapper.service
+```
+
+Saving desktop shortcuts regenerates the keyd and labwc integration files when
+the mapper helper scripts are installed. Saving mapper bindings rewrites
+`config.toml` with the bindings shown in the table.
+
+## ASR
+
+The ASR tab edits the voice push-to-talk configuration used by
+`~/.local/bin/uconsole-voice-ptt`:
+
+```text
+~/.config/uconsole-helper-mapper/voice.env
+~/.config/uconsole-helper-mapper/voice-glossary.txt
+```
+
+The tab covers the frequently changed ASR settings: endpoint, token, language,
+correction mode, recorder, input device, output mode, tmux output mode, paste
+backend, and glossary terms.
 
 ## Debug Interface Detection
 

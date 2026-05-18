@@ -1,0 +1,93 @@
+[general]
+rescan_seconds = 3.0
+session_watch_processes = ["wf-panel-pi", "labwc"]
+session_watch_settle_ms = 1500
+
+[gamepad]
+device_name_patterns = ["ClockworkPI uConsole"]
+debounce_ms = 250
+
+[[gamepad.bindings]]
+buttons = ["BTN_TRIGGER"]
+command = "~/.local/bin/toggle-codex-buddy"
+
+[[gamepad.bindings]]
+buttons = ["BTN_TOP"]
+command = "~/.local/bin/toggle-lxterminal"
+
+[[gamepad.bindings]]
+buttons = ["BTN_THUMB"]
+command = "printf '%s' '提交git' | wl-copy && wtype -M ctrl -k v -m ctrl"
+
+[[gamepad.bindings]]
+buttons = ["BTN_THUMB"]
+hold_ms = 700
+text = "继续"
+press_enter = true
+
+# Push-to-talk voice input.
+# Replace BTN_THUMB2 with the actual B key code on your device if needed.
+# When the focused input is a tmux terminal window, the voice script will
+# automatically send the current active tmux pane visible text as correction context,
+# or fall back to recent lines when the visible area is too short.
+# [[gamepad.bindings]]
+# buttons = ["BTN_THUMB2"]
+# command = "~/.local/bin/uconsole-voice-ptt learn"
+#
+# [[gamepad.bindings]]
+# buttons = ["BTN_THUMB2"]
+# hold_ms = 600
+# press_command = "~/.local/bin/uconsole-voice-ptt start"
+# release_command = "~/.local/bin/uconsole-voice-ptt stop"
+
+[keyboard]
+enabled = true
+grab = false
+device_name_patterns = ["ClockworkPI uConsole Keyboard", "keyd virtual keyboard"]
+debounce_ms = 250
+
+# With grab disabled, bindings run side effects without intercepting the
+# original key press. Esc still reaches the focused application.
+[[keyboard.bindings]]
+buttons = ["KEY_ESC"]
+command = "~/.local/bin/esc-switch-ime-english"
+
+# Legacy keyboard interception mode is available, but disabled by default.
+# Prefer keyd + labwc for keyboard shortcuts so normal typing does not depend
+# on the mapper's virtual keyboard bridge.
+# Desktop launcher bindings now live in:
+#   ~/.config/uconsole-helper-mapper/desktop-keybinds.toml
+# Uncomment the examples below only if you intentionally want the mapper to
+# own those keyboard combos again.
+# repeat_rate = 30
+# repeat_delay_ms = 300
+# [[keyboard.bindings]]
+# buttons = ["KEY_RIGHTSHIFT", "KEY_C"]
+# command = "~/.local/bin/run-or-raise-chromium"
+# [[keyboard.bindings]]
+# buttons = ["KEY_LEFTSHIFT", "KEY_ENTER"]
+# command = "~/.local/bin/shift-enter-newline"
+# [[keyboard.bindings]]
+# buttons = ["KEY_RIGHTSHIFT", "KEY_ENTER"]
+# command = "~/.local/bin/shift-enter-newline"
+
+[lock]
+enabled = false
+key = "KEY_COFFEE"
+lock_command = "sudo -n /usr/local/bin/uconsole-helper-mapper-display-control off"
+unlock_command = "sudo -n /usr/local/bin/uconsole-helper-mapper-display-control on"
+keyboard_backlight_script = "~/WorkSpace/uconsole-keyboard/tools/keyboard_state.sh"
+
+[power_button]
+enabled = false
+device_name_patterns = ["axp20x-pek"]
+hold_ms = 700
+
+[mouse]
+enabled = true
+grab = true
+device_name_patterns = []
+
+[[mouse.remaps]]
+from = "BTN_MIDDLE"
+to = "BTN_LEFT"

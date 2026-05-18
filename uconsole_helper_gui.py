@@ -20,6 +20,7 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from html import escape
@@ -34,6 +35,12 @@ SYS_NET = Path("/sys/class/net")
 LEASE_FILE = Path("/tmp/uconsole-helper/dhcp/dnsmasq.leases")
 SYSTEM_SERVICE = "uconsole-helper.service"
 SERVICE_CONFIG = Path("/etc/uconsole-helper/uconsole-helper.conf")
+MAPPER_USER_SERVICE = "uconsole-helper-mapper.service"
+MAPPER_CONFIG = Path.home() / ".config/uconsole-helper-mapper/config.toml"
+MAPPER_DESKTOP_KEYBINDS_CONFIG = Path.home() / ".config/uconsole-helper-mapper/desktop-keybinds.toml"
+MAPPER_ASR_CONFIG = Path.home() / ".config/uconsole-helper-mapper/voice.env"
+MAPPER_GLOSSARY_FILE = Path.home() / ".config/uconsole-helper-mapper/voice-glossary.txt"
+SCREEN_TIMEOUT_OPTIONS = ("Default", "30s", "1min", "2min", "5min", "10min", "15min")
 
 
 DEFAULTS = {
@@ -114,6 +121,13 @@ class UConsoleHelperWindow(Gtk.Window):
         self.tailscale_summary_label.get_style_context().add_class("muted")
         self.power_labels: dict[str, Gtk.Label] = {}
         self.power_controls: dict[str, Gtk.Widget] = {}
+        self.power_profile_cards: dict[str, Gtk.Widget] = {}
+        self.selected_power_mode = "balanced"
+        self.mapper_desktop_store = Gtk.ListStore(str, str, str)
+        self.mapper_binding_store = Gtk.ListStore(str, str, str)
+        self.asr_controls: dict[str, Gtk.Widget] = {}
+        self.asr_status_label = Gtk.Label(label="", xalign=0)
+        self.asr_status_label.get_style_context().add_class("muted")
         self.dashboard_labels: dict[str, Gtk.Label] = {}
         self.dashboard_bars: dict[str, Gtk.ProgressBar] = {}
         self.dashboard_secondary_bars: dict[str, Gtk.ProgressBar] = {}
@@ -129,6 +143,8 @@ class UConsoleHelperWindow(Gtk.Window):
         self.refresh_interface_status()
         self.refresh_tailscale_status()
         self.refresh_power_status()
+        self.refresh_mapper_status()
+        self.load_asr_config_controls()
         self.refresh_status()
         GLib.timeout_add_seconds(2, self.auto_refresh_dashboard)
 
@@ -146,6 +162,8 @@ class UConsoleHelperWindow(Gtk.Window):
         self.stack.add_titled(scrolled_page(self._build_interface_page()), "interface", "Interface")
         self.stack.add_titled(scrolled_page(self._build_tailscale_page()), "tailscale", "Tailscale")
         self.stack.add_titled(scrolled_page(self._build_power_page()), "power", "Power")
+        self.stack.add_titled(scrolled_page(self._build_mapper_page()), "mapper", "Mapper")
+        self.stack.add_titled(scrolled_page(self._build_asr_page()), "asr", "ASR")
         self.stack.connect("notify::visible-child-name", lambda *_args: self.update_header())
 
         header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
@@ -155,7 +173,7 @@ class UConsoleHelperWindow(Gtk.Window):
         tabs = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         tabs.get_style_context().add_class("app-tabs")
         header.pack_start(tabs, False, False, 0)
-        self.dashboard_tab = underlined_button("Dashboard", "B")
+        self.dashboard_tab = underlined_button("Dash", "h")
         self.dashboard_tab.connect("clicked", lambda _button: self.set_tab("dashboard"))
         self.dashboard_tab.get_style_context().add_class("tab-button")
         tabs.pack_start(self.dashboard_tab, False, False, 0)
@@ -168,12 +186,12 @@ class UConsoleHelperWindow(Gtk.Window):
         self.dhcp_tab.get_style_context().add_class("tab-button")
         tabs.pack_start(self.dhcp_tab, False, False, 0)
 
-        self.lanscan_tab = underlined_button("LAN Scan", "L")
+        self.lanscan_tab = underlined_button("Scan", "S")
         self.lanscan_tab.connect("clicked", lambda _button: self.set_tab("lanscan"))
         self.lanscan_tab.get_style_context().add_class("tab-button")
         tabs.pack_start(self.lanscan_tab, False, False, 0)
 
-        self.interface_tab = underlined_button("Interface", "I")
+        self.interface_tab = underlined_button("IF", "I")
         self.interface_tab.connect("clicked", lambda _button: self.set_tab("interface"))
         self.interface_tab.get_style_context().add_class("tab-button")
         tabs.pack_start(self.interface_tab, False, False, 0)
@@ -194,6 +212,19 @@ class UConsoleHelperWindow(Gtk.Window):
         self.power_tab.get_style_context().add_class("tab-button")
         tabs.pack_start(self.power_tab, False, False, 0)
 
+        self.mapper_tab_label = Gtk.Label()
+        self.mapper_tab_label.set_use_markup(True)
+        self.mapper_tab = Gtk.Button()
+        self.mapper_tab.add(self.mapper_tab_label)
+        self.mapper_tab.connect("clicked", lambda _button: self.set_tab("mapper"))
+        self.mapper_tab.get_style_context().add_class("tab-button")
+        tabs.pack_start(self.mapper_tab, False, False, 0)
+
+        self.asr_tab = underlined_button("ASR", "A")
+        self.asr_tab.connect("clicked", lambda _button: self.set_tab("asr"))
+        self.asr_tab.get_style_context().add_class("tab-button")
+        tabs.pack_start(self.asr_tab, False, False, 0)
+
         spacer = Gtk.Box()
         header.pack_start(spacer, True, True, 0)
         self.context_action_button = underlined_button("Start", "S")
@@ -201,7 +232,7 @@ class UConsoleHelperWindow(Gtk.Window):
         self.context_action_button.get_style_context().add_class("context-action")
         header.pack_start(self.context_action_button, False, False, 0)
         self.tailscale_reconnect_button = underlined_button("Reconnect", "C")
-        self.tailscale_reconnect_button.connect("clicked", lambda _button: self.reconnect_tailscale())
+        self.tailscale_reconnect_button.connect("clicked", lambda _button: self.run_secondary_header_action())
         self.tailscale_reconnect_button.get_style_context().add_class("context-action")
         self.tailscale_reconnect_button.get_style_context().add_class("action-ready")
         header.pack_start(self.tailscale_reconnect_button, False, False, 0)
@@ -217,10 +248,10 @@ class UConsoleHelperWindow(Gtk.Window):
         self.update_header()
 
     def _build_dashboard_page(self) -> Gtk.Widget:
-        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         page.get_style_context().add_class("page")
 
-        grid = Gtk.Grid(column_spacing=8, row_spacing=8)
+        grid = Gtk.Grid(column_spacing=6, row_spacing=6)
         grid.set_column_homogeneous(True)
         grid.set_row_homogeneous(True)
         grid.set_hexpand(True)
@@ -266,11 +297,11 @@ class UConsoleHelperWindow(Gtk.Window):
                 secondary_bar.set_show_text(True)
                 secondary_bar.get_style_context().add_class("dashboard-meter")
                 meter_row.pack_start(secondary_bar, True, True, 0)
-                card.pack_start(meter_row, False, False, 4)
+                card.pack_start(meter_row, False, False, 2)
                 self.dashboard_secondary_bars[key] = secondary_bar
             else:
-                card.pack_start(bar, False, False, 4)
-            card.pack_start(label, True, True, 3)
+                card.pack_start(bar, False, False, 2)
+            card.pack_start(label, True, True, 2)
             self.dashboard_bars[key] = bar
             self.dashboard_labels[key] = label
             card.set_hexpand(True)
@@ -404,7 +435,6 @@ class UConsoleHelperWindow(Gtk.Window):
             ("power", "Power"),
             ("cpu", "CPU"),
             ("wwan", "WWAN"),
-            ("powersaver", "Powersaver"),
         ]
         for row, (key, title) in enumerate(rows):
             title_label = Gtk.Label(label=title, xalign=0)
@@ -416,44 +446,157 @@ class UConsoleHelperWindow(Gtk.Window):
             status_grid.attach(value_label, 1, row, 1, 1)
             self.power_labels[key] = value_label
 
-        policy_card = card_box()
-        page.pack_start(policy_card, False, False, 0)
-        policy_grid = Gtk.Grid(column_spacing=14, row_spacing=10)
-        policy_card.pack_start(policy_grid, False, False, 0)
+        profiles_grid = Gtk.Grid(column_spacing=12, row_spacing=12)
+        page.pack_start(profiles_grid, False, False, 0)
+        for column, (profile, title) in enumerate((("ECO", "Eco"), ("BALANCED", "Balanced"), ("PERFORMANCE", "Performance"))):
+            mode = profile.lower()
+            profile_event = Gtk.EventBox()
+            profile_event.set_visible_window(False)
+            profile_event.connect("button-press-event", lambda _widget, _event, value=mode: self.set_power_mode(value))
+            profile_card = card_box()
+            profile_card.set_hexpand(True)
+            profile_card.get_style_context().add_class("power-profile-card")
+            profile_event.add(profile_card)
+            profiles_grid.attach(profile_event, column, 0, 1, 1)
+            self.power_profile_cards[mode] = profile_card
 
-        enabled = Gtk.Switch()
-        enabled.set_halign(Gtk.Align.START)
-        enabled.get_style_context().add_class("power-switch")
-        self.power_controls["POWERSAVER_ENABLED"] = enabled
-        self._attach_power_control(policy_grid, "Powersaver", enabled, 0)
+            header = Gtk.Label(label=f" {title.upper()} ", xalign=0)
+            header.get_style_context().add_class("dashboard-title")
+            profile_card.pack_start(header, False, False, 0)
 
-        battery_freq = combo_text_from_values(("1500,1500", "1800,1800", "1500,2400"))
-        self.power_controls["POWERSAVER_BATTERY_CPU_FREQ"] = battery_freq
-        self._attach_power_control(policy_grid, "Battery CPU MHz", battery_freq, 1)
-
-        ac_freq = combo_text_from_values(("restore", "1500,1500", "1800,1800", "1500,2400"))
-        self.power_controls["POWERSAVER_AC_CPU_FREQ"] = ac_freq
-        self._attach_power_control(policy_grid, "AC CPU MHz", ac_freq, 2)
-
-        unknown_action = combo_text_from_values(("restore", "battery", "keep"))
-        self.power_controls["POWERSAVER_UNKNOWN_POWER_ACTION"] = unknown_action
-        self._attach_power_control(policy_grid, "Unknown Power", unknown_action, 3)
-
-        wwan_policy = combo_text_from_values(("ondemand", "keep", "off"))
-        self.power_controls["POWERSAVER_WWAN_POLICY"] = wwan_policy
-        self._attach_power_control(policy_grid, "WWAN Policy", wwan_policy, 4)
-
-        poll_interval = combo_text_from_values(("3", "5", "10", "30", "60"))
-        self.power_controls["POWERSAVER_POLL_INTERVAL_SEC"] = poll_interval
-        self._attach_power_control(policy_grid, "Poll Seconds", poll_interval, 5)
-
-        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        policy_card.pack_start(buttons, False, False, 12)
-        save_button = Gtk.Button(label="Save Policy")
-        save_button.connect("clicked", lambda _button: self.save_power_policy())
-        buttons.pack_start(save_button, False, False, 0)
+            profile_grid = Gtk.Grid(column_spacing=14, row_spacing=10)
+            profile_card.pack_start(profile_grid, False, False, 10)
+            battery_freq = combo_text_from_values(("1500,1500", "1800,1800", "1500,2400"))
+            self.power_controls[f"POWERSAVER_{profile}_BATTERY_CPU_FREQ"] = battery_freq
+            self._attach_power_control(profile_grid, "Battery MHz", battery_freq, 0)
+            ac_freq = combo_text_from_values(("restore", "1500,1500", "1800,1800", "1500,2400"))
+            self.power_controls[f"POWERSAVER_{profile}_AC_CPU_FREQ"] = ac_freq
+            self._attach_power_control(profile_grid, "AC MHz", ac_freq, 1)
+            battery_screen_timeout = combo_text_from_values(SCREEN_TIMEOUT_OPTIONS)
+            self.power_controls[f"POWERSAVER_{profile}_BATTERY_SCREEN_TIMEOUT_SEC"] = battery_screen_timeout
+            self._attach_power_control(profile_grid, "Battery Screen", battery_screen_timeout, 2)
+            ac_screen_timeout = combo_text_from_values(SCREEN_TIMEOUT_OPTIONS)
+            self.power_controls[f"POWERSAVER_{profile}_AC_SCREEN_TIMEOUT_SEC"] = ac_screen_timeout
+            self._attach_power_control(profile_grid, "AC Screen", ac_screen_timeout, 3)
+            unknown_action = combo_text_from_values(("AC", "Battery", "Keep"))
+            self.power_controls[f"POWERSAVER_{profile}_UNKNOWN_POWER_ACTION"] = unknown_action
+            self._attach_power_control(profile_grid, "Unknown", unknown_action, 4)
+            wwan_policy = combo_text_from_values(("ondemand", "keep", "off"))
+            self.power_controls[f"POWERSAVER_{profile}_WWAN_POLICY"] = wwan_policy
+            self._attach_power_control(profile_grid, "WWAN", wwan_policy, 5)
 
         self.load_power_policy_controls()
+
+        return page
+
+    def _build_mapper_page(self) -> Gtk.Widget:
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        page.get_style_context().add_class("page")
+
+        desktop_card = card_box()
+        page.pack_start(desktop_card, False, False, 0)
+        desktop_header = Gtk.Label(label="Desktop Shortcuts", xalign=0)
+        desktop_header.get_style_context().add_class("muted")
+        desktop_card.pack_start(desktop_header, False, False, 0)
+        desktop_tree = self.editable_tree(
+            self.mapper_desktop_store,
+            [
+                ("Scope", 0),
+                ("Key", 1),
+                ("Command / Action", 2),
+            ],
+        )
+        desktop_scroll = horizontal_table_scroll(desktop_tree)
+        desktop_card.pack_start(desktop_scroll, False, False, 6)
+        desktop_buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        desktop_card.pack_start(desktop_buttons, False, False, 0)
+        add_button = Gtk.Button(label="Add")
+        add_button.connect("clicked", lambda _button: self.add_mapper_desktop_shortcut())
+        desktop_buttons.pack_start(add_button, False, False, 0)
+        remove_button = Gtk.Button(label="Remove")
+        remove_button.connect("clicked", lambda _button: self.remove_selected_tree_row(desktop_tree))
+        desktop_buttons.pack_start(remove_button, False, False, 0)
+
+        bindings_card = card_box()
+        page.pack_start(bindings_card, False, False, 0)
+        bindings_header = Gtk.Label(label="Mapper Bindings", xalign=0)
+        bindings_header.get_style_context().add_class("muted")
+        bindings_card.pack_start(bindings_header, False, False, 0)
+        binding_tree = self.editable_tree(
+            self.mapper_binding_store,
+            [
+                ("Device", 0),
+                ("Buttons", 1),
+                ("Action", 2),
+            ],
+        )
+        binding_scroll = horizontal_table_scroll(binding_tree)
+        bindings_card.pack_start(binding_scroll, False, False, 6)
+        binding_buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        bindings_card.pack_start(binding_buttons, False, False, 0)
+        add_binding_button = Gtk.Button(label="Add")
+        add_binding_button.connect("clicked", lambda _button: self.add_mapper_binding())
+        binding_buttons.pack_start(add_binding_button, False, False, 0)
+        remove_binding_button = Gtk.Button(label="Remove")
+        remove_binding_button.connect("clicked", lambda _button: self.remove_selected_tree_row(binding_tree, self.mapper_binding_store))
+        binding_buttons.pack_start(remove_binding_button, False, False, 0)
+
+        self.load_mapper_shortcuts()
+        return page
+
+    def _build_asr_page(self) -> Gtk.Widget:
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        page.get_style_context().add_class("page")
+
+        config_card = card_box()
+        page.pack_start(config_card, False, False, 0)
+        grid = Gtk.Grid(column_spacing=14, row_spacing=10)
+        config_card.pack_start(grid, False, False, 0)
+
+        self.asr_controls["WHISPER_URL"] = Gtk.Entry()
+        self._attach_asr_control(grid, "Endpoint", self.asr_controls["WHISPER_URL"], 0)
+        self.asr_controls["WHISPER_AUTH_TOKEN"] = Gtk.Entry()
+        if isinstance(self.asr_controls["WHISPER_AUTH_TOKEN"], Gtk.Entry):
+            self.asr_controls["WHISPER_AUTH_TOKEN"].set_visibility(False)
+        self._attach_asr_control(grid, "Token", self.asr_controls["WHISPER_AUTH_TOKEN"], 1)
+        self.asr_controls["WHISPER_LANGUAGE"] = combo_text_from_values(("zh", "en", "ja", "auto"))
+        self._attach_asr_control(grid, "Language", self.asr_controls["WHISPER_LANGUAGE"], 2)
+        self.asr_controls["WHISPER_CORRECTION_MODE"] = combo_text_from_values(("auto", "on", "off"))
+        self.asr_controls["WHISPER_CORRECTION_MODE"].connect("changed", lambda _combo: self.sync_asr_tmux_context_state())
+        self._attach_asr_control(grid, "Correction", self.asr_controls["WHISPER_CORRECTION_MODE"], 3)
+        self.asr_controls["VOICE_RECORDER"] = combo_text_from_values(("auto", "pw-record", "ffmpeg", "arecord"))
+        self._attach_asr_control(grid, "Recorder", self.asr_controls["VOICE_RECORDER"], 4)
+        self.asr_controls["VOICE_INPUT"] = combo_text_from_values(tuple(audio_input_options()))
+        self._attach_asr_control(grid, "Input", self.asr_controls["VOICE_INPUT"], 5)
+        self.asr_controls["VOICE_OUTPUT_MODE"] = combo_text_from_values(
+            ("paste", "type", "type_enter", "clipboard", "fcitx_commit")
+        )
+        self._attach_asr_control(grid, "Output", self.asr_controls["VOICE_OUTPUT_MODE"], 6)
+        self.asr_controls["VOICE_TMUX_OUTPUT_MODE"] = combo_text_from_values(
+            ("type", "paste", "type_enter", "clipboard", "fcitx_commit")
+        )
+        self._attach_asr_control(grid, "Tmux Output", self.asr_controls["VOICE_TMUX_OUTPUT_MODE"], 7)
+        self.asr_controls["VOICE_PASTE_BACKEND"] = combo_text_from_values(("uinput", "auto", "wtype"))
+        self._attach_asr_control(grid, "Paste Backend", self.asr_controls["VOICE_PASTE_BACKEND"], 8)
+        tmux_context = Gtk.Switch()
+        tmux_context.set_halign(Gtk.Align.START)
+        self.asr_controls["VOICE_TMUX_CONTEXT"] = tmux_context
+        self._attach_asr_control(grid, "Tmux Context", tmux_context, 9)
+
+        glossary_card = card_box()
+        page.pack_start(glossary_card, True, True, 0)
+        glossary_label = Gtk.Label(label="Glossary", xalign=0)
+        glossary_label.get_style_context().add_class("muted")
+        glossary_card.pack_start(glossary_label, False, False, 0)
+        self.asr_glossary_view = Gtk.TextView()
+        self.asr_glossary_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        glossary_scroll = Gtk.ScrolledWindow()
+        glossary_scroll.set_hexpand(True)
+        glossary_scroll.set_vexpand(True)
+        glossary_scroll.add(self.asr_glossary_view)
+        glossary_card.pack_start(glossary_scroll, True, True, 6)
+
+        page.pack_start(self.asr_status_label, False, False, 0)
 
         return page
 
@@ -462,6 +605,134 @@ class UConsoleHelperWindow(Gtk.Window):
         label.get_style_context().add_class("muted")
         grid.attach(label, 0, row, 1, 1)
         grid.attach(widget, 1, row, 1, 1)
+
+    def _attach_asr_control(self, grid: Gtk.Grid, title: str, widget: Gtk.Widget, row: int) -> None:
+        label = Gtk.Label(label=title, xalign=0)
+        label.get_style_context().add_class("muted")
+        widget.set_hexpand(True)
+        grid.attach(label, 0, row, 1, 1)
+        grid.attach(widget, 1, row, 1, 1)
+
+    def editable_tree(self, store: Gtk.ListStore, columns: list[tuple[str, int]]) -> Gtk.TreeView:
+        tree = Gtk.TreeView(model=store)
+        tree.set_headers_visible(True)
+        for title, index in columns:
+            renderer = Gtk.CellRendererText()
+            renderer.set_property("editable", True)
+            renderer.connect("edited", lambda _renderer, path, text, column=index: store.set_value(store.get_iter(path), column, text))
+            column = Gtk.TreeViewColumn(title, renderer, text=index)
+            column.set_resizable(True)
+            tree.append_column(column)
+        return tree
+
+    def add_mapper_desktop_shortcut(self) -> None:
+        values = self.mapper_row_dialog(
+            "Add Desktop Shortcut",
+            [
+                ("Scope", "rightshift"),
+                ("Key", "x"),
+                ("Command / Action", "~/.local/bin/command"),
+            ],
+        )
+        if values is not None:
+            self.mapper_desktop_store.append(values)
+
+    def add_mapper_binding(self) -> None:
+        values = self.mapper_row_dialog(
+            "Add Mapper Binding",
+            [
+                ("Device", "gamepad"),
+                ("Buttons", "BTN_THUMB"),
+                ("Action", "command ~/.local/bin/command"),
+            ],
+        )
+        if values is not None:
+            self.mapper_binding_store.append(values)
+
+    def mapper_row_dialog(self, title: str, fields: list[tuple[str, str]]) -> list[str] | None:
+        dialog = Gtk.Dialog(
+            title=title,
+            transient_for=self,
+            flags=0,
+            buttons=(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OK, Gtk.ResponseType.OK),
+        )
+        dialog.set_default_response(Gtk.ResponseType.OK)
+        content = dialog.get_content_area()
+        grid = Gtk.Grid(column_spacing=12, row_spacing=10)
+        grid.set_margin_top(12)
+        grid.set_margin_bottom(12)
+        grid.set_margin_start(12)
+        grid.set_margin_end(12)
+        content.pack_start(grid, True, True, 0)
+        entries: list[Gtk.Entry] = []
+        for row, (label_text, default) in enumerate(fields):
+            label = Gtk.Label(label=label_text, xalign=0)
+            label.get_style_context().add_class("muted")
+            entry = Gtk.Entry()
+            entry.set_hexpand(True)
+            entry.set_text(default)
+            grid.attach(label, 0, row, 1, 1)
+            grid.attach(entry, 1, row, 1, 1)
+            entries.append(entry)
+        dialog.show_all()
+        response = dialog.run()
+        values = [entry.get_text().strip() for entry in entries]
+        dialog.destroy()
+        if response != Gtk.ResponseType.OK or not all(values):
+            return None
+        return values
+
+    def remove_selected_tree_row(self, tree: Gtk.TreeView, store: Gtk.ListStore | None = None) -> None:
+        _model, tree_iter = tree.get_selection().get_selected()
+        if tree_iter is not None:
+            (store or self.mapper_desktop_store).remove(tree_iter)
+
+    def load_mapper_shortcuts(self) -> None:
+        self.mapper_desktop_store.clear()
+        for row in desktop_shortcut_rows():
+            self.mapper_desktop_store.append([row["scope"], row["key"], row["action"]])
+        self.mapper_binding_store.clear()
+        for row in mapper_binding_rows():
+            self.mapper_binding_store.append([row["device"], row["buttons"], row["action"]])
+
+    def save_mapper_desktop_shortcuts(self) -> bool:
+        rows: list[dict[str, str]] = []
+        for item in self.mapper_desktop_store:
+            rows.append({"scope": item[0].strip(), "key": item[1].strip(), "action": item[2].strip()})
+        try:
+            MAPPER_DESKTOP_KEYBINDS_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+            MAPPER_DESKTOP_KEYBINDS_CONFIG.write_text(desktop_keybinds_text(rows), encoding="utf-8")
+        except OSError as exc:
+            self.show_error("Save shortcuts failed", str(exc))
+            return False
+        for command in (
+            [sys.executable, str(Path.home() / ".local/share/uconsole-helper-mapper/generate_desktop_keybinds.py"), "--config", str(MAPPER_DESKTOP_KEYBINDS_CONFIG)],
+            [sys.executable, str(Path.home() / ".local/share/uconsole-helper-mapper/sync_labwc_keybinds.py")],
+        ):
+            if not Path(command[1]).exists():
+                continue
+            result = subprocess.run(command, text=True, capture_output=True, check=False)
+            if result.returncode != 0:
+                self.show_error("Apply shortcuts failed", combine_output(result) or "命令执行失败。")
+                return False
+        self.refresh_mapper_status()
+        return True
+
+    def save_mapper_bindings(self) -> bool:
+        rows: list[dict[str, str]] = []
+        for item in self.mapper_binding_store:
+            rows.append({"device": item[0].strip(), "buttons": item[1].strip(), "action": item[2].strip()})
+        try:
+            MAPPER_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+            MAPPER_CONFIG.write_text(mapper_config_text(rows), encoding="utf-8")
+        except OSError as exc:
+            self.show_error("Save mapper bindings failed", str(exc))
+            return False
+        self.refresh_mapper_status()
+        return True
+
+    def save_mapper_all(self) -> bool:
+        return self.save_mapper_desktop_shortcuts() and self.save_mapper_bindings()
 
     def on_tailscale_tree_button_press(self, tree: Gtk.TreeView, event: Gdk.EventButton) -> bool:
         if event.button != 3:
@@ -496,22 +767,22 @@ class UConsoleHelperWindow(Gtk.Window):
             .page { padding: 2px; }
             .section-title { font-size: 17px; font-weight: 700; color: #f2f2f2; }
             .dashboard-title {
-                font-family: monospace;
-                font-size: 17px;
+                font-family: "SauceCode Pro Mono", monospace;
+                font-size: 16px;
                 font-weight: 700;
                 color: #61d6d6;
                 background: #111820;
                 border: 1px solid #2f6f6d;
                 border-radius: 6px;
-                padding: 2px 7px;
+                padding: 1px 6px;
             }
             .dashboard-value {
-                font-family: monospace;
-                font-size: 17px;
+                font-family: "SauceCode Pro Mono", monospace;
+                font-size: 16px;
                 color: #d9f7ef;
             }
             .dashboard-meter {
-                min-height: 10px;
+                min-height: 8px;
             }
             .dashboard-meter trough {
                 background: #080d10;
@@ -527,12 +798,20 @@ class UConsoleHelperWindow(Gtk.Window):
                 background: #111418;
                 border: 1px solid #2a5258;
                 border-radius: 8px;
-                padding: 6px;
+                padding: 5px;
+            }
+            .power-profile-card {
+                background: #111418;
+                border-color: #2a5258;
+            }
+            .power-profile-card.power-profile-selected {
+                background: #153034;
+                border-color: #61d6d6;
             }
             .tab-button,
             .context-action {
                 min-height: 34px;
-                padding: 6px 10px;
+                padding: 6px 8px;
                 border-radius: 12px;
                 border: 1px solid #4a4a4a;
                 background: #1e1e1e;
@@ -561,6 +840,11 @@ class UConsoleHelperWindow(Gtk.Window):
             .context-action.action-busy {
                 background: #342a1d;
                 border-color: #d68a24;
+            }
+            .context-action.action-success {
+                background: #1f8f55;
+                border-color: #39e58a;
+                color: #ffffff;
             }
             button.suggested-action {
                 background: #2f6f6d;
@@ -631,21 +915,39 @@ class UConsoleHelperWindow(Gtk.Window):
     def update_header(self) -> None:
         page = self.stack.get_visible_child_name() or "dashboard"
         dot = "●" if self.dhcp_running else "○"
-        self.dhcp_tab_label.set_markup(f"{dot} {underlined_markup('DHCP Server', 'D')}")
+        self.dhcp_tab_label.set_markup(f"{dot} {underlined_markup('DHCP', 'D')}")
         self.tailscale_tab_label.set_markup(tailscale_tab_markup())
         self.power_tab_label.set_markup(power_tab_markup())
+        self.mapper_tab_label.set_markup(mapper_tab_markup())
         toggle_style_class(self.dashboard_tab, "tab-active", page == "dashboard")
         toggle_style_class(self.dhcp_tab, "tab-active", page == "dhcp")
         toggle_style_class(self.lanscan_tab, "tab-active", page == "lanscan")
         toggle_style_class(self.interface_tab, "tab-active", page == "interface")
         toggle_style_class(self.tailscale_tab, "tab-active", page == "tailscale")
         toggle_style_class(self.power_tab, "tab-active", page == "power")
-        self.tailscale_reconnect_button.set_visible(page == "tailscale")
-        self.tailscale_reconnect_button.set_sensitive(not self.tailscale_reconnecting)
+        toggle_style_class(self.mapper_tab, "tab-active", page == "mapper")
+        toggle_style_class(self.asr_tab, "tab-active", page == "asr")
+        self.tailscale_reconnect_button.set_visible(page in {"dhcp", "tailscale", "power", "mapper"})
+        self.tailscale_reconnect_button.set_sensitive(page != "tailscale" or not self.tailscale_reconnecting)
         reconnect_context = self.tailscale_reconnect_button.get_style_context()
         for class_name in ("action-ready", "action-active", "action-busy"):
             reconnect_context.remove_class(class_name)
-        if self.tailscale_reconnecting:
+        if page == "dhcp":
+            if self.dhcp_running:
+                set_underlined_button_label(self.tailscale_reconnect_button, "Disable", "E")
+                reconnect_context.add_class("action-active")
+            else:
+                set_underlined_button_label(self.tailscale_reconnect_button, "Enable", "E")
+                reconnect_context.add_class("action-ready")
+        elif page == "power":
+            enabled = powersaver_enabled()
+            set_underlined_button_label(self.tailscale_reconnect_button, "Disable" if enabled else "Enable", "E")
+            reconnect_context.add_class("action-active" if enabled else "action-ready")
+        elif page == "mapper":
+            active = user_service_active(MAPPER_USER_SERVICE)
+            set_underlined_button_label(self.tailscale_reconnect_button, "Disable" if active else "Enable", "E")
+            reconnect_context.add_class("action-active" if active else "action-ready")
+        elif self.tailscale_reconnecting:
             set_underlined_button_label(self.tailscale_reconnect_button, "Reconnecting", "C")
             reconnect_context.add_class("action-busy")
         else:
@@ -656,13 +958,13 @@ class UConsoleHelperWindow(Gtk.Window):
             action_context.remove_class(class_name)
 
         if page == "dhcp":
+            self.context_action_button.hide()
+            return
+
+        if page in {"power", "mapper", "asr"}:
             self.context_action_button.show()
-            if self.dhcp_running:
-                set_underlined_button_label(self.context_action_button, "Stop", "S")
-                action_context.add_class("action-active")
-            else:
-                set_underlined_button_label(self.context_action_button, "Start", "S")
-                action_context.add_class("action-ready")
+            set_underlined_button_label(self.context_action_button, "Save", "V")
+            action_context.add_class("action-ready")
             return
 
         if page == "lanscan" and self.scan_running:
@@ -675,6 +977,20 @@ class UConsoleHelperWindow(Gtk.Window):
             action_context.add_class("action-ready")
         else:
             self.context_action_button.hide()
+
+    def run_secondary_header_action(self) -> None:
+        page = self.stack.get_visible_child_name()
+        if page == "dhcp":
+            if self.dhcp_running:
+                self.stop_server()
+            else:
+                self.start_server()
+        elif page == "tailscale":
+            self.reconnect_tailscale()
+        elif page == "power":
+            self.toggle_powersaver_enabled()
+        elif page == "mapper":
+            self.toggle_user_service(MAPPER_USER_SERVICE, "Mapper service")
 
     def run_context_action(self) -> None:
         page = self.stack.get_visible_child_name()
@@ -692,7 +1008,16 @@ class UConsoleHelperWindow(Gtk.Window):
             self.refresh_tailscale_status()
             return
         if page == "power":
-            self.refresh_power_status()
+            if self.save_power_policy():
+                self.flash_header_button(self.context_action_button, "Saved", "V")
+            return
+        if page == "mapper":
+            if self.save_mapper_all():
+                self.flash_header_button(self.context_action_button, "Saved", "V")
+            return
+        if page == "asr":
+            if self.save_asr_config():
+                self.flash_header_button(self.context_action_button, "Saved", "V")
             return
         if page == "dashboard":
             self.refresh_dashboard()
@@ -705,6 +1030,7 @@ class UConsoleHelperWindow(Gtk.Window):
 
     def run_refresh_action(self) -> None:
         page = self.stack.get_visible_child_name()
+        refreshed = True
         if page == "dashboard":
             self.refresh_dashboard()
         elif page in {"dhcp", "lanscan"}:
@@ -715,6 +1041,30 @@ class UConsoleHelperWindow(Gtk.Window):
             self.refresh_tailscale_status()
         elif page == "power":
             self.refresh_power_status()
+        elif page == "mapper":
+            self.refresh_mapper_status()
+        elif page == "asr":
+            self.load_asr_config_controls()
+        else:
+            refreshed = False
+        if refreshed:
+            self.flash_header_button(self.header_refresh_button, "Refreshed", "R")
+
+    def flash_header_button(self, button: Gtk.Button, text: str, key: str) -> None:
+        context = button.get_style_context()
+        for class_name in ("action-ready", "action-active", "action-busy"):
+            context.remove_class(class_name)
+        context.add_class("action-success")
+        set_underlined_button_label(button, text, key)
+        GLib.timeout_add(900, self.finish_header_button_flash, button)
+
+    def finish_header_button_flash(self, button: Gtk.Button) -> bool:
+        button.get_style_context().remove_class("action-success")
+        self.update_header()
+        if button is self.header_refresh_button:
+            set_underlined_button_label(self.header_refresh_button, "Refresh", "R")
+            self.header_refresh_button.get_style_context().add_class("action-ready")
+        return False
 
     def on_key_press(self, _widget: Gtk.Widget, event: Gdk.EventKey) -> bool:
         key = Gdk.keyval_name(event.keyval) or ""
@@ -739,18 +1089,24 @@ class UConsoleHelperWindow(Gtk.Window):
         if ctrl and key == "6":
             self.set_tab("power")
             return True
+        if ctrl and key == "7":
+            self.set_tab("mapper")
+            return True
+        if ctrl and key == "8":
+            self.set_tab("asr")
+            return True
         if alt and key in {"Left", "Right"}:
             self.switch_tab(-1 if key == "Left" else 1)
             return True
         if is_text_input_focus(self):
             return False
-        if key_lower == "b":
+        if key_lower == "h":
             self.set_tab("dashboard")
             return True
         if key_lower == "d":
             self.set_tab("dhcp")
             return True
-        if key_lower == "l":
+        if key_lower == "s":
             self.set_tab("lanscan")
             return True
         if key_lower == "i":
@@ -762,16 +1118,25 @@ class UConsoleHelperWindow(Gtk.Window):
         if key_lower == "p":
             self.set_tab("power")
             return True
+        if key_lower == "m":
+            self.set_tab("mapper")
+            return True
+        if key_lower == "a":
+            self.set_tab("asr")
+            return True
         if key_lower == "r":
             self.run_refresh_action()
             return True
-        if key_lower == "s":
+        if key_lower == "v" and self.stack.get_visible_child_name() in {"power", "mapper", "asr"}:
+            self.run_context_action()
+            return True
+        if key in {"Return", "KP_Enter"}:
             self.run_context_action()
             return True
         return False
 
     def switch_tab(self, direction: int) -> None:
-        pages = ["dashboard", "dhcp", "lanscan", "interface", "tailscale", "power"]
+        pages = ["dashboard", "dhcp", "lanscan", "interface", "tailscale", "power", "mapper", "asr"]
         current = self.stack.get_visible_child_name()
         try:
             index = pages.index(current)
@@ -952,24 +1317,89 @@ class UConsoleHelperWindow(Gtk.Window):
         for key, label in self.power_labels.items():
             label.set_text(status.get(key, "-"))
         self.load_power_policy_controls()
+        self.update_header()
+
+    def refresh_mapper_status(self) -> None:
+        self.load_mapper_shortcuts()
+
+    def load_asr_config_controls(self) -> None:
+        values = env_config(MAPPER_ASR_CONFIG, default_asr_config())
+        for key, widget in self.asr_controls.items():
+            value = values.get(key, "")
+            if isinstance(widget, Gtk.Entry):
+                widget.set_text(value)
+            elif isinstance(widget, Gtk.ComboBoxText):
+                set_combo_text(widget, value)
+            elif isinstance(widget, Gtk.Switch):
+                widget.set_active(value.lower() in {"1", "yes", "true", "on", "enabled"})
+        self.sync_asr_tmux_context_state()
+        if hasattr(self, "asr_glossary_view"):
+            buffer = self.asr_glossary_view.get_buffer()
+            try:
+                glossary = MAPPER_GLOSSARY_FILE.read_text(encoding="utf-8")
+            except OSError:
+                glossary = ""
+            buffer.set_text(glossary)
+        self.asr_status_label.set_text("")
+
+    def save_asr_config(self) -> bool:
+        values = default_asr_config()
+        for key, widget in self.asr_controls.items():
+            if isinstance(widget, Gtk.Switch):
+                values[key] = "1" if widget.get_active() else "0"
+            else:
+                values[key] = widget_text(widget)
+        if values["VOICE_INPUT"] == "Default":
+            values["VOICE_INPUT"] = "default"
+        if values["WHISPER_CORRECTION_MODE"] == "off":
+            values["VOICE_TMUX_CONTEXT"] = "0"
+        if not values["WHISPER_URL"]:
+            self.show_error("ASR config error", "Endpoint is required.")
+            return False
+        try:
+            MAPPER_ASR_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+            MAPPER_ASR_CONFIG.write_text(asr_config_text(values), encoding="utf-8")
+            if hasattr(self, "asr_glossary_view"):
+                buffer = self.asr_glossary_view.get_buffer()
+                start, end = buffer.get_bounds()
+                MAPPER_GLOSSARY_FILE.write_text(buffer.get_text(start, end, True), encoding="utf-8")
+        except OSError as exc:
+            self.show_error("Save ASR failed", str(exc))
+            return False
+        self.asr_status_label.set_text("ASR config saved.")
+        return True
+
+    def sync_asr_tmux_context_state(self) -> None:
+        correction = widget_text(self.asr_controls.get("WHISPER_CORRECTION_MODE"))
+        tmux_context = self.asr_controls.get("VOICE_TMUX_CONTEXT")
+        if isinstance(tmux_context, Gtk.Switch):
+            disabled = correction == "off"
+            if disabled:
+                tmux_context.set_active(False)
+            tmux_context.set_sensitive(not disabled)
 
     def load_power_policy_controls(self) -> None:
         config = helper_service_config()
+        self.set_power_mode(config.get("POWERSAVER_MODE", "balanced"), persist=False)
         for key, widget in self.power_controls.items():
             value = config.get(key, "")
             if isinstance(widget, Gtk.Switch):
                 widget.set_active(value.lower() in {"1", "yes", "true", "on", "enabled"})
             elif isinstance(widget, Gtk.ComboBoxText):
+                if key.endswith("_UNKNOWN_POWER_ACTION"):
+                    value = unknown_action_display_value(value)
+                elif key.endswith("_SCREEN_TIMEOUT_SEC"):
+                    value = screen_timeout_display_value(value)
                 set_combo_text(widget, value)
             elif isinstance(widget, Gtk.Entry):
                 widget.set_text(value)
 
-    def save_power_policy(self) -> None:
+    def save_power_policy(self) -> bool:
         try:
             values = self.power_policy_values()
         except ValueError as exc:
             self.show_error("Power policy error", str(exc))
-            return
+            return False
         config_text = power_policy_config_text(values)
         command = ["pkexec", "tee", str(SERVICE_CONFIG)]
         if shutil.which("pkexec") is None:
@@ -983,39 +1413,84 @@ class UConsoleHelperWindow(Gtk.Window):
         )
         if result.returncode != 0:
             self.show_error("Save policy failed", combine_output(result) or "命令执行失败。")
+            return False
+        restart = self.run_systemctl(["restart", SYSTEM_SERVICE], "Restart service")
+        if restart.returncode != 0:
+            return False
+        self.refresh_power_status()
+        return True
+
+    def set_power_mode(self, mode: str, persist: bool = True) -> bool:
+        if mode not in {"eco", "balanced", "performance"}:
+            mode = "balanced"
+        self.selected_power_mode = mode
+        self.refresh_power_mode_cards()
+        return False
+
+    def refresh_power_mode_cards(self) -> None:
+        for mode, card in self.power_profile_cards.items():
+            context = card.get_style_context()
+            if mode == self.selected_power_mode:
+                context.add_class("power-profile-selected")
+            else:
+                context.remove_class("power-profile-selected")
+
+    def toggle_powersaver_enabled(self) -> None:
+        try:
+            values = self.power_policy_values(enabled_override=not powersaver_enabled())
+        except ValueError as exc:
+            self.show_error("Power policy error", str(exc))
+            return
+        config_text = power_policy_config_text(values)
+        command = ["pkexec", "tee", str(SERVICE_CONFIG)]
+        if shutil.which("pkexec") is None:
+            command = ["sudo", "tee", str(SERVICE_CONFIG)]
+        result = subprocess.run(command, input=config_text, text=True, capture_output=True, check=False)
+        if result.returncode != 0:
+            self.show_error("Save policy failed", combine_output(result) or "命令执行失败。")
             return
         restart = self.run_systemctl(["restart", SYSTEM_SERVICE], "Restart service")
         if restart.returncode != 0:
             return
         self.refresh_power_status()
 
-    def power_policy_values(self) -> dict[str, str]:
-        enabled = self.power_controls["POWERSAVER_ENABLED"]
-        battery = self.power_controls["POWERSAVER_BATTERY_CPU_FREQ"]
-        ac = self.power_controls["POWERSAVER_AC_CPU_FREQ"]
-        unknown = self.power_controls["POWERSAVER_UNKNOWN_POWER_ACTION"]
-        wwan = self.power_controls["POWERSAVER_WWAN_POLICY"]
-        poll = self.power_controls["POWERSAVER_POLL_INTERVAL_SEC"]
+    def power_policy_values(self, enabled_override: bool | None = None) -> dict[str, str]:
+        current_enabled = powersaver_enabled()
+        enabled = current_enabled if enabled_override is None else enabled_override
         values = {
-            "POWERSAVER_ENABLED": "1" if isinstance(enabled, Gtk.Switch) and enabled.get_active() else "0",
-            "POWERSAVER_BATTERY_CPU_FREQ": widget_text(battery),
-            "POWERSAVER_AC_CPU_FREQ": widget_text(ac),
-            "POWERSAVER_UNKNOWN_POWER_ACTION": widget_text(unknown),
-            "POWERSAVER_WWAN_POLICY": widget_text(wwan),
-            "POWERSAVER_POLL_INTERVAL_SEC": widget_text(poll),
+            "POWERSAVER_ENABLED": "1" if enabled else "0",
+            "POWERSAVER_MODE": self.selected_power_mode,
+            "POWERSAVER_POLL_INTERVAL_SEC": "5",
         }
-        validate_freq_pair(values["POWERSAVER_BATTERY_CPU_FREQ"], "Battery CPU MHz")
-        if values["POWERSAVER_AC_CPU_FREQ"] != "restore":
-            validate_freq_pair(values["POWERSAVER_AC_CPU_FREQ"], "AC CPU MHz")
-        if values["POWERSAVER_UNKNOWN_POWER_ACTION"] not in {"restore", "battery", "keep"}:
-            raise ValueError("Unknown Power must be restore, battery, or keep.")
-        if values["POWERSAVER_WWAN_POLICY"] not in {"keep", "off", "ondemand"}:
-            raise ValueError("WWAN Policy must be keep, off, or ondemand.")
-        try:
-            if float(values["POWERSAVER_POLL_INTERVAL_SEC"]) < 1:
-                raise ValueError
-        except ValueError as exc:
-            raise ValueError("Poll Seconds must be 1 or greater.") from exc
+        for profile in ("ECO", "BALANCED", "PERFORMANCE"):
+            battery_key = f"POWERSAVER_{profile}_BATTERY_CPU_FREQ"
+            ac_key = f"POWERSAVER_{profile}_AC_CPU_FREQ"
+            battery_screen_key = f"POWERSAVER_{profile}_BATTERY_SCREEN_TIMEOUT_SEC"
+            ac_screen_key = f"POWERSAVER_{profile}_AC_SCREEN_TIMEOUT_SEC"
+            unknown_key = f"POWERSAVER_{profile}_UNKNOWN_POWER_ACTION"
+            wwan_key = f"POWERSAVER_{profile}_WWAN_POLICY"
+            values[battery_key] = widget_text(self.power_controls[battery_key])
+            values[ac_key] = widget_text(self.power_controls[ac_key])
+            values[battery_screen_key] = screen_timeout_config_value(widget_text(self.power_controls[battery_screen_key]))
+            values[ac_screen_key] = screen_timeout_config_value(widget_text(self.power_controls[ac_screen_key]))
+            values[unknown_key] = unknown_action_config_value(widget_text(self.power_controls[unknown_key]))
+            values[wwan_key] = widget_text(self.power_controls[wwan_key])
+            validate_freq_pair(values[battery_key], f"{profile.title()} Battery MHz")
+            if values[ac_key] != "restore":
+                validate_freq_pair(values[ac_key], f"{profile.title()} AC MHz")
+            try:
+                if int(values[battery_screen_key]) < 0 or int(values[ac_screen_key]) < 0:
+                    raise ValueError
+            except ValueError as exc:
+                raise ValueError(f"{profile.title()} screen timeouts must be Default or seconds.") from exc
+            if values[unknown_key] not in {"restore", "battery", "keep"}:
+                raise ValueError(f"{profile.title()} Unknown must be AC, Battery, or Keep.")
+            if values[wwan_key] not in {"keep", "off", "ondemand"}:
+                raise ValueError(f"{profile.title()} WWAN must be keep, off, or ondemand.")
+        values["POWERSAVER_UNKNOWN_POWER_ACTION"] = values["POWERSAVER_BALANCED_UNKNOWN_POWER_ACTION"]
+        values["POWERSAVER_WWAN_POLICY"] = values["POWERSAVER_BALANCED_WWAN_POLICY"]
+        if values["POWERSAVER_MODE"] not in {"eco", "balanced", "performance"}:
+            raise ValueError("Mode must be eco, balanced, or performance.")
         config = helper_service_config()
         values["POWERSAVER_CPU_POLICY_PATH"] = config.get(
             "POWERSAVER_CPU_POLICY_PATH", "/sys/devices/system/cpu/cpufreq/policy0"
@@ -1033,6 +1508,21 @@ class UConsoleHelperWindow(Gtk.Window):
         if result.returncode != 0:
             self.show_error(f"{title} failed", combine_output(result) or "命令执行失败。")
         return result
+
+    def run_user_systemctl(self, args: list[str], title: str) -> subprocess.CompletedProcess[str]:
+        command = ["systemctl", "--user", *args]
+        result = subprocess.run(command, text=True, capture_output=True, check=False)
+        if result.returncode != 0:
+            self.show_error(f"{title} failed", combine_output(result) or "命令执行失败。")
+        return result
+
+    def toggle_user_service(self, service: str, title: str) -> None:
+        active = user_service_active(service)
+        args = ["disable", "--now", service] if active else ["enable", "--now", service]
+        result = self.run_user_systemctl(args, title)
+        if result.returncode == 0:
+            self.refresh_mapper_status()
+            self.update_header()
 
     def refresh_status(self) -> None:
         result = run_helper("status")
@@ -1275,6 +1765,15 @@ def scrolled_page(content: Gtk.Widget) -> Gtk.ScrolledWindow:
     return scroll
 
 
+def horizontal_table_scroll(content: Gtk.Widget) -> Gtk.ScrolledWindow:
+    scroll = Gtk.ScrolledWindow()
+    scroll.set_hexpand(True)
+    scroll.set_vexpand(False)
+    scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
+    scroll.add(content)
+    return scroll
+
+
 def underlined_button(text: str, key: str) -> Gtk.Button:
     label = Gtk.Label()
     label.set_use_markup(True)
@@ -1313,6 +1812,7 @@ def toggle_style_class(widget: Gtk.Widget, class_name: str, enabled: bool) -> No
 
 def combo_text_from_values(values: tuple[str, ...]) -> Gtk.ComboBoxText:
     combo = Gtk.ComboBoxText()
+    combo.connect("scroll-event", block_combo_scroll)
     for value in values:
         combo.append_text(value)
     if values:
@@ -1320,7 +1820,31 @@ def combo_text_from_values(values: tuple[str, ...]) -> Gtk.ComboBoxText:
     return combo
 
 
+def block_combo_scroll(combo: Gtk.ComboBoxText, event: Gdk.EventScroll) -> bool:
+    parent = combo.get_parent()
+    while parent is not None and not isinstance(parent, Gtk.ScrolledWindow):
+        parent = parent.get_parent()
+    if isinstance(parent, Gtk.ScrolledWindow):
+        adjustment = parent.get_vadjustment()
+        step = adjustment.get_step_increment() or 48
+        delta = 0.0
+        if event.direction == Gdk.ScrollDirection.DOWN:
+            delta = step
+        elif event.direction == Gdk.ScrollDirection.UP:
+            delta = -step
+        elif event.direction == Gdk.ScrollDirection.SMOOTH:
+            _ok, _dx, dy = event.get_scroll_deltas()
+            delta = dy * step
+        if delta:
+            lower = adjustment.get_lower()
+            upper = adjustment.get_upper() - adjustment.get_page_size()
+            adjustment.set_value(max(lower, min(upper, adjustment.get_value() + delta)))
+    return True
+
+
 def set_combo_text(combo: Gtk.ComboBoxText, value: str) -> None:
+    if value == "default":
+        value = "Default"
     model = combo.get_model()
     if model is not None:
         for index, row in enumerate(model):
@@ -1329,6 +1853,46 @@ def set_combo_text(combo: Gtk.ComboBoxText, value: str) -> None:
                 return
     if model is not None and len(model) > 0:
         combo.set_active(0)
+
+
+def unknown_action_display_value(value: str) -> str:
+    return {
+        "restore": "AC",
+        "battery": "Battery",
+        "keep": "Keep",
+    }.get(value, value)
+
+
+def unknown_action_config_value(value: str) -> str:
+    return {
+        "AC": "restore",
+        "Battery": "battery",
+        "Keep": "keep",
+    }.get(value, value)
+
+
+def screen_timeout_display_value(value: str) -> str:
+    return {
+        "0": "Default",
+        "30": "30s",
+        "60": "1min",
+        "120": "2min",
+        "300": "5min",
+        "600": "10min",
+        "900": "15min",
+    }.get(value, value)
+
+
+def screen_timeout_config_value(value: str) -> str:
+    return {
+        "Default": "0",
+        "30s": "30",
+        "1min": "60",
+        "2min": "120",
+        "5min": "300",
+        "10min": "600",
+        "15min": "900",
+    }.get(value, value)
 
 
 def widget_text(widget: Gtk.Widget) -> str:
@@ -1367,12 +1931,33 @@ def power_policy_config_text(values: dict[str, str]) -> str:
             "### POWERSAVER_ENABLED --- [1|0] --- Enable AC/battery CPU policy task",
             f"POWERSAVER_ENABLED={values['POWERSAVER_ENABLED']}",
             "",
-            "### POWERSAVER_BATTERY_CPU_FREQ --- [1500,1500~] <min,max> --- MHz on battery",
-            f"POWERSAVER_BATTERY_CPU_FREQ={values['POWERSAVER_BATTERY_CPU_FREQ']}",
+            "### POWERSAVER_MODE --- [eco|balanced|performance]",
+            f"POWERSAVER_MODE={values['POWERSAVER_MODE']}",
             "",
-            "### POWERSAVER_AC_CPU_FREQ --- [restore|1500,2400~] <min,max|restore> --- MHz on AC",
-            "### restore: put back the frequencies captured when uconsole-helper.service starts",
-            f"POWERSAVER_AC_CPU_FREQ={values['POWERSAVER_AC_CPU_FREQ']}",
+            "### Mode policy matrix --- CPU MHz while on battery / AC",
+            f"POWERSAVER_ECO_BATTERY_CPU_FREQ={values['POWERSAVER_ECO_BATTERY_CPU_FREQ']}",
+            f"POWERSAVER_ECO_AC_CPU_FREQ={values['POWERSAVER_ECO_AC_CPU_FREQ']}",
+            f"POWERSAVER_ECO_BATTERY_SCREEN_TIMEOUT_SEC={values['POWERSAVER_ECO_BATTERY_SCREEN_TIMEOUT_SEC']}",
+            f"POWERSAVER_ECO_AC_SCREEN_TIMEOUT_SEC={values['POWERSAVER_ECO_AC_SCREEN_TIMEOUT_SEC']}",
+            f"POWERSAVER_ECO_UNKNOWN_POWER_ACTION={values['POWERSAVER_ECO_UNKNOWN_POWER_ACTION']}",
+            f"POWERSAVER_ECO_WWAN_POLICY={values['POWERSAVER_ECO_WWAN_POLICY']}",
+            f"POWERSAVER_BALANCED_BATTERY_CPU_FREQ={values['POWERSAVER_BALANCED_BATTERY_CPU_FREQ']}",
+            f"POWERSAVER_BALANCED_AC_CPU_FREQ={values['POWERSAVER_BALANCED_AC_CPU_FREQ']}",
+            f"POWERSAVER_BALANCED_BATTERY_SCREEN_TIMEOUT_SEC={values['POWERSAVER_BALANCED_BATTERY_SCREEN_TIMEOUT_SEC']}",
+            f"POWERSAVER_BALANCED_AC_SCREEN_TIMEOUT_SEC={values['POWERSAVER_BALANCED_AC_SCREEN_TIMEOUT_SEC']}",
+            f"POWERSAVER_BALANCED_UNKNOWN_POWER_ACTION={values['POWERSAVER_BALANCED_UNKNOWN_POWER_ACTION']}",
+            f"POWERSAVER_BALANCED_WWAN_POLICY={values['POWERSAVER_BALANCED_WWAN_POLICY']}",
+            f"POWERSAVER_PERFORMANCE_BATTERY_CPU_FREQ={values['POWERSAVER_PERFORMANCE_BATTERY_CPU_FREQ']}",
+            f"POWERSAVER_PERFORMANCE_AC_CPU_FREQ={values['POWERSAVER_PERFORMANCE_AC_CPU_FREQ']}",
+            f"POWERSAVER_PERFORMANCE_BATTERY_SCREEN_TIMEOUT_SEC={values['POWERSAVER_PERFORMANCE_BATTERY_SCREEN_TIMEOUT_SEC']}",
+            f"POWERSAVER_PERFORMANCE_AC_SCREEN_TIMEOUT_SEC={values['POWERSAVER_PERFORMANCE_AC_SCREEN_TIMEOUT_SEC']}",
+            f"POWERSAVER_PERFORMANCE_UNKNOWN_POWER_ACTION={values['POWERSAVER_PERFORMANCE_UNKNOWN_POWER_ACTION']}",
+            f"POWERSAVER_PERFORMANCE_WWAN_POLICY={values['POWERSAVER_PERFORMANCE_WWAN_POLICY']}",
+            "",
+            "### Screen idle timeout seconds --- 0 disables helper-managed timeout",
+            "# Legacy global keys are kept for downgrade compatibility.",
+            f"POWERSAVER_BATTERY_SCREEN_TIMEOUT_SEC={values['POWERSAVER_BALANCED_BATTERY_SCREEN_TIMEOUT_SEC']}",
+            f"POWERSAVER_AC_SCREEN_TIMEOUT_SEC={values['POWERSAVER_BALANCED_AC_SCREEN_TIMEOUT_SEC']}",
             "",
             "### POWERSAVER_UNKNOWN_POWER_ACTION --- [restore|battery|keep]",
             f"POWERSAVER_UNKNOWN_POWER_ACTION={values['POWERSAVER_UNKNOWN_POWER_ACTION']}",
@@ -1401,7 +1986,7 @@ def copy_to_clipboard(text: str) -> None:
 
 def is_text_input_focus(window: Gtk.Window) -> bool:
     focus = window.get_focus()
-    return isinstance(focus, Gtk.Entry)
+    return isinstance(focus, (Gtk.Entry, Gtk.TextView))
 
 
 def section_header(title: str, subtitle: str) -> Gtk.Box:
@@ -2027,7 +2612,7 @@ def tailscale_summary(status: dict[str, object]) -> str:
 def tailscale_tab_markup() -> str:
     status = tailscale_status()
     color = tailscale_status_color(status)
-    return f'<span foreground="{color}">●</span> {underlined_markup("Tailscale", "T")}'
+    return f'<span foreground="{color}">●</span> {underlined_markup("TS", "T")}'
 
 
 def tailscale_status_color(status: dict[str, object]) -> str:
@@ -2049,7 +2634,17 @@ def tailscale_status_color(status: dict[str, object]) -> str:
 
 def power_tab_markup() -> str:
     color = power_service_status_color()
-    return f'<span foreground="{color}">●</span> {underlined_markup("Power", "P")}'
+    return f'<span foreground="{color}">●</span> {underlined_markup("Pwr", "P")}'
+
+
+def powersaver_enabled() -> bool:
+    enabled = helper_service_config().get("POWERSAVER_ENABLED", "1")
+    return enabled.lower() in {"1", "yes", "true", "on", "enabled"}
+
+
+def mapper_tab_markup() -> str:
+    color = user_service_status_color(MAPPER_USER_SERVICE)
+    return f'<span foreground="{color}">●</span> {underlined_markup("Map", "M")}'
 
 
 def power_service_status_color() -> str:
@@ -2076,6 +2671,42 @@ def power_service_status_color() -> str:
     return "#8a8f98"
 
 
+def user_service_status_color(service: str) -> str:
+    if shutil.which("systemctl") is None:
+        return "#8a8f98"
+    active = subprocess.run(
+        ["systemctl", "--user", "is-active", service],
+        text=True,
+        capture_output=True,
+        check=False,
+    ).stdout.strip()
+    enabled = subprocess.run(
+        ["systemctl", "--user", "is-enabled", service],
+        text=True,
+        capture_output=True,
+        check=False,
+    ).stdout.strip()
+    if active == "active":
+        return "#34c759"
+    if active == "failed":
+        return "#ff6b5f"
+    if enabled == "enabled":
+        return "#d68a24"
+    return "#8a8f98"
+
+
+def user_service_active(service: str) -> bool:
+    if shutil.which("systemctl") is None:
+        return False
+    result = subprocess.run(
+        ["systemctl", "--user", "is-active", service],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result.stdout.strip() == "active"
+
+
 def tailscale_admin_summary(status: dict[str, object]) -> str:
     backend = str(status.get("BackendState") or "Unknown")
     current_tailnet = status.get("CurrentTailnet")
@@ -2093,7 +2724,7 @@ def tailscale_admin_summary(status: dict[str, object]) -> str:
     if tailnet:
         parts.append(tailnet)
     if hostname:
-        parts.append(f"This device: {hostname}")
+        parts.append(hostname)
     return "  |  ".join(parts)
 
 
@@ -2113,7 +2744,7 @@ def tailscale_devices(status: dict[str, object]) -> list[dict[str, str]]:
 def tailscale_device_row(device: dict[str, object], is_self: bool) -> dict[str, str]:
     name = str(device.get("HostName") or device.get("DNSName") or "-")
     if is_self:
-        name = f"{name} (this device)"
+        name = f"{name} ⭐"
     os_name = str(device.get("OS") or "-")
     addresses = device.get("TailscaleIPs")
     ipv4, ipv6 = tailscale_ip_pair(addresses)
@@ -2178,8 +2809,10 @@ def dashboard_status(
 ) -> dict[str, dict[str, object]]:
     power = power_status()
     memory = memory_metrics()
-    storage = storage_metrics("/")
+    storage = storage_metrics()
     cpu = cpu_metrics()
+    power_percent = battery_capacity_percent()
+    power_meter = power_meter_label(power.get("power", "-"), power_percent)
     if cpu_percent is not None:
         cpu["percent"] = cpu_percent
         cpu["meter"] = f"CPU {cpu_percent}%"
@@ -2189,13 +2822,13 @@ def dashboard_status(
         "power": dashboard_item(
             "\n".join(
                 [
-                    f"STATE  {power.get('power', '-')}",
-                    f"CPU    {power.get('cpu', '-')}",
-                    f"WWAN   {power.get('wwan', '-')}",
+                    kv_line("TIME", power_time_estimate()),
+                    power_watt_line(power.get("power", "-")),
+                    kv_line("CPU", power.get("cpu", "-")),
                 ]
             ),
-            100 if power.get("power") == "AC" else 55,
-            str(power.get("power", "-")).upper(),
+            power_percent,
+            power_meter,
         ),
         "cpu": dashboard_item(dashboard_cpu_summary(cpu), int(cpu.get("percent", 0)), cpu.get("meter", "CPU")),
         "memory": dashboard_item(dashboard_memory_summary(memory), int(memory.get("percent", 0)), memory.get("meter", "RAM")),
@@ -2229,14 +2862,18 @@ def dashboard_item(
     }
 
 
+def kv_line(key: str, value: object, width: int = 5) -> str:
+    return f"{key:<{width}}  {value}"
+
+
 def dashboard_system_summary() -> str:
     hostname = socket.gethostname()
     kernel = platform.release()
     uptime = system_uptime_label()
     load = Path("/proc/loadavg").read_text(encoding="utf-8").split()[:3] if Path("/proc/loadavg").exists() else []
-    parts = [f"HOST   {hostname}", f"KERN   {kernel}", f"UP     {uptime}"]
+    parts = [kv_line("HOST", hostname), kv_line("KERN", kernel), kv_line("UP", uptime)]
     if load:
-        parts.append(f"LOAD   {' '.join(load)}")
+        parts.append(kv_line("LOAD", " ".join(load)))
     return "\n".join(parts)
 
 
@@ -2275,11 +2912,11 @@ def dashboard_cpu_summary(metrics: dict[str, object] | None = None) -> str:
     temp = cpu_temperature_label()
     lines = []
     if current:
-        lines.append(f"FREQ   {int(current) // 1000} MHz")
+        lines.append(kv_line("FREQ", f"{int(current) // 1000} MHz"))
     if governor:
-        lines.append(f"GOV    {governor}")
+        lines.append(kv_line("GOV", governor))
     if temp:
-        lines.append(f"TEMP   {temp}")
+        lines.append(kv_line("TEMP", temp))
     return "\n".join(lines)
 
 
@@ -2387,7 +3024,7 @@ def metric_line(label: str, used: int, total: int, unit: str) -> str:
     else:
         used_text = format_bytes(used)
         total_text = format_bytes(total)
-    return f"{label:<6} {percent:3d}% {used_text}/{total_text}"
+    return f"{compact_label(label):<12} {percent:3d}% {used_text:>9}/{total_text:<9}"
 
 
 def format_kib(kib: int) -> str:
@@ -2397,25 +3034,127 @@ def format_kib(kib: int) -> str:
 
 
 def dashboard_storage_summary() -> str:
+    mounts = storage_mounts()
     rows = []
-    for path in ("/", "/home"):
-        try:
-            usage = shutil.disk_usage(path)
-        except OSError:
-            continue
-        used = usage.total - usage.free
-        rows.append(metric_line(path, used, usage.total, unit="bytes"))
+    for item in mounts[:4]:
+        rows.append(metric_line(item["label"], int(item["used"]), int(item["total"]), unit="bytes"))
     return "\n".join(rows) if rows else "-"
 
 
-def storage_metrics(path: str) -> dict[str, object]:
-    try:
-        usage = shutil.disk_usage(path)
-    except OSError:
+def storage_metrics() -> dict[str, object]:
+    mounts = storage_mounts()
+    if not mounts:
         return {"percent": 0, "meter": "DISK"}
+    root = next((item for item in mounts if item["mount_point"] == "/"), mounts[0])
+    return {"percent": int(root["percent"]), "meter": f"/ {root['percent']}%"}
+
+
+def storage_mounts() -> list[dict[str, object]]:
+    mounts: dict[str, dict[str, object]] = {}
+    try:
+        lines = Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    for line in lines:
+        item = parse_mountinfo_line(line)
+        if item is None:
+            continue
+        source = str(item["source"])
+        mount_point = str(item["mount_point"])
+        candidate = storage_usage_item(source, mount_point)
+        if candidate is None:
+            continue
+        storage_key = mount_point if mount_point in {"/", "/home"} else source
+        current = mounts.get(storage_key)
+        if current is None or storage_mount_sort_key(candidate) < storage_mount_sort_key(current):
+            mounts[storage_key] = candidate
+    if "/home" not in mounts and Path("/home").is_dir():
+        home = storage_usage_item("/home", "/home")
+        if home is not None:
+            mounts["/home"] = home
+    return sorted(mounts.values(), key=storage_mount_sort_key)
+
+
+def storage_usage_item(source: str, mount_point: str) -> dict[str, object] | None:
+    try:
+        usage = shutil.disk_usage(mount_point)
+    except OSError:
+        return None
+    if usage.total <= 0:
+        return None
     used = usage.total - usage.free
-    percent = int(max(0, min(100, used * 100 / usage.total))) if usage.total else 0
-    return {"percent": percent, "meter": f"{path} {percent}%"}
+    percent = int(max(0, min(100, used * 100 / usage.total)))
+    return {
+        "source": source,
+        "mount_point": mount_point,
+        "label": storage_label(mount_point),
+        "used": used,
+        "total": usage.total,
+        "percent": percent,
+        "rank": storage_mount_rank(mount_point),
+    }
+
+
+def parse_mountinfo_line(line: str) -> dict[str, str] | None:
+    parts = line.split()
+    if " - " not in line:
+        return None
+    separator = parts.index("-")
+    if separator + 3 > len(parts):
+        return None
+    mount_point = mountinfo_unescape(parts[4])
+    if mount_point == "/boot/firmware":
+        return None
+    fs_type = parts[separator + 1]
+    source = parts[separator + 2]
+    if not real_storage_source(source, fs_type, mount_point):
+        return None
+    return {"mount_point": mount_point, "fs_type": fs_type, "source": source}
+
+
+def mountinfo_unescape(value: str) -> str:
+    return value.replace("\\040", " ").replace("\\011", "\t").replace("\\012", "\n").replace("\\134", "\\")
+
+
+def real_storage_source(source: str, fs_type: str, mount_point: str) -> bool:
+    if fs_type in {"tmpfs", "devtmpfs", "proc", "sysfs", "overlay", "cgroup", "cgroup2", "autofs", "devpts"}:
+        return False
+    if fs_type in {"cifs", "smb3", "nfs", "nfs4", "fuse.sshfs", "fuse.rclone"}:
+        return mount_point.startswith(("/mnt/", "/media/")) or mount_point in {"/mnt", "/media"}
+    return source == "/dev/root" or source.startswith(("/dev/mmcblk", "/dev/nvme", "/dev/sd", "/dev/dm-"))
+
+
+def storage_label(mount_point: str) -> str:
+    if mount_point in {"/", "/home", "/boot", "/boot/firmware"}:
+        return mount_point
+    for prefix in ("/media/", "/mnt/"):
+        if mount_point.startswith(prefix):
+            return mount_point
+    return mount_point
+
+
+def compact_label(label: str) -> str:
+    if label.startswith("/mnt/"):
+        return label.removeprefix("/mnt/")
+    if label.startswith("/media/"):
+        return label.removeprefix("/media/")
+    return label
+
+
+def storage_mount_rank(mount_point: str) -> int:
+    ranks = {"/": 0, "/home": 1, "/boot/firmware": 2, "/boot": 3}
+    if mount_point in ranks:
+        return ranks[mount_point]
+    if mount_point.startswith("/media/"):
+        return 4
+    if mount_point.startswith("/mnt/"):
+        return 5
+    return 10
+
+
+def storage_mount_sort_key(item: dict[str, object]) -> tuple[int, int, str]:
+    mount_point = str(item["mount_point"])
+    return int(item["rank"]), len(mount_point), mount_point
 
 
 def format_bytes(value: int) -> str:
@@ -2429,16 +3168,23 @@ def format_bytes(value: int) -> str:
 def dashboard_network_summary(rates: dict[str, float] | None = None) -> str:
     rates = rates or {"rx": 0.0, "tx": 0.0}
     devices = nmcli_device_status()
+    wifi_signals = wifi_signal_by_device()
     connected = [
         item
         for item in devices
         if clean_nm_state(item["state"]).startswith("connected") and dashboard_network_device_visible(item)
     ]
     route = preferred_route_interface() or "-"
-    lines = [f"DEF    {route}", f"CONN   {len(connected)}"]
+    lines = [kv_line("DEF", route), kv_line("CONN", len(connected))]
     for item in connected[:4]:
         connection = item["connection"] or "-"
-        lines.append(f"{item['device']:<6} {item['type']} / {connection}")
+        detail = f"{item['type']} / {connection}"
+        if item["type"] == "wifi":
+            signal = wifi_signals.get(item["device"], "")
+            bars = signal_bars(signal)
+            if bars is not None:
+                detail = f"{signal_bar_icon(bars)} {detail}"
+        lines.append(kv_line(item["device"][:5], detail))
     return "\n".join(lines)
 
 
@@ -2511,19 +3257,45 @@ def dashboard_cellular_summary() -> str:
     config = helper_service_config()
     policy = config.get("POWERSAVER_WWAN_POLICY", "ondemand")
     if wwan.lower() in {"disabled", "off", "已禁用"}:
-        return f"PWR    OFF\nWWAN   {wwan}\nPOL    {policy}"
+        return "\n".join([kv_line("PWR", "OFF"), kv_line("WWAN", wwan), kv_line("POL", policy)])
     modems = modem_signal_by_port()
     hidden_ports = hidden_duplicate_modem_ports()
     if not modems:
-        return f"WWAN   {wwan}\nPOL    {policy}\nMODEM  -"
+        return "\n".join([kv_line("WWAN", wwan), kv_line("POL", policy), kv_line("MODEM", "-")])
     lines = []
     visible_modems = [(port, info) for port, info in sorted(modems.items()) if port not in hidden_ports]
     for port, info in visible_modems[:3]:
-        signal = str(info.get("signal") or "-")
+        signal = compact_cellular_signal(str(info.get("signal") or "-"))
         connection = str(info.get("connection") or "-")
         connected = "connected" if info.get("connected") else "registered"
-        lines.append(f"{port:<7} {connected}\nNET    {connection}\nSIG    {signal}")
+        lines.append("\n".join([kv_line(port[:5], connected), kv_line("NET", connection), kv_line("SIG", signal)]))
     return "\n".join(lines) if lines else "-"
+
+
+def compact_cellular_signal(signal: str) -> str:
+    if signal == "-":
+        return signal
+    percent = re.search(r"(\d{1,3})%", signal)
+    rsrp = re.search(r"RSRP\s+(-?\d+(?:\.\d+)?)", signal, re.IGNORECASE)
+    rsrq = re.search(r"RSRQ\s+(-?\d+(?:\.\d+)?)", signal, re.IGNORECASE)
+    rssi = re.search(r"RSSI\s+(-?\d+(?:\.\d+)?)", signal, re.IGNORECASE)
+    parts = []
+    if rsrp:
+        parts.append(short_number(rsrp.group(1)))
+    if rsrq:
+        parts.append(short_number(rsrq.group(1)))
+    if not parts and rssi:
+        parts.append(short_number(rssi.group(1)))
+    if percent:
+        parts.append(f"{percent.group(1)}%")
+    compact = "/".join(parts) if parts else signal
+    bars = signal_bars(signal)
+    return f"{signal_bar_icon(bars)} {compact}" if bars is not None else compact
+
+
+def short_number(value: str) -> str:
+    number = float(value)
+    return str(int(number)) if number.is_integer() else f"{number:.1f}"
 
 
 def cellular_meter_percent() -> int:
@@ -2553,13 +3325,287 @@ def power_status() -> dict[str, str]:
     }
 
 
+def desktop_shortcut_rows() -> list[dict[str, str]]:
+    config = toml_file(MAPPER_DESKTOP_KEYBINDS_CONFIG)
+    rows: list[dict[str, str]] = []
+    for item in nested_binding_list(config, "rightshift"):
+        rows.append(
+            {
+                "scope": "rightshift",
+                "key": str(item.get("key", "")),
+                "action": str(item.get("command", "")),
+            }
+        )
+    for item in nested_binding_list(config, "labwc"):
+        action = str(item.get("command") or item.get("action") or "")
+        rows.append(
+            {
+                "scope": "labwc",
+                "key": str(item.get("key", "")),
+                "action": action,
+            }
+        )
+    return rows
+
+
+def mapper_binding_rows() -> list[dict[str, str]]:
+    config = toml_file(MAPPER_CONFIG)
+    rows: list[dict[str, str]] = []
+    for device in ("gamepad", "keyboard"):
+        for item in nested_binding_list(config, device):
+            rows.append(
+                {
+                    "device": device,
+                    "buttons": ", ".join(str(value) for value in item.get("buttons", [])),
+                    "action": binding_action_text(item),
+                }
+            )
+    mouse = config.get("mouse", {})
+    if isinstance(mouse, dict):
+        for item in mouse.get("remaps", []):
+            if isinstance(item, dict):
+                rows.append(
+                    {
+                        "device": "mouse",
+                        "buttons": str(item.get("from", "")),
+                        "action": f"emit {item.get('to', '')}",
+                    }
+                )
+    return rows
+
+
+def toml_file(path: Path) -> dict[str, object]:
+    if not path.exists():
+        return {}
+    try:
+        return tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+
+
+def nested_binding_list(config: dict[str, object], section: str) -> list[dict[str, object]]:
+    data = config.get(section, {})
+    if not isinstance(data, dict):
+        return []
+    bindings = data.get("bindings", [])
+    return [item for item in bindings if isinstance(item, dict)]
+
+
+def binding_action_text(item: dict[str, object]) -> str:
+    hold_ms = item.get("hold_ms")
+    prefix = f"hold {hold_ms} " if hold_ms else ""
+    for key in ("command", "text", "press_command", "release_command", "emit_key", "emit_rel"):
+        value = item.get(key)
+        if value:
+            if key == "text":
+                suffix = " enter" if item.get("press_enter") else ""
+                return f"{prefix}text {value}{suffix}"
+            if key == "press_command":
+                release = item.get("release_command")
+                return prefix + f"press {value}" + (f" / release {release}" if release else "")
+            if key == "command":
+                return prefix + f"command {value}"
+            return prefix + str(value)
+    return "-"
+
+
+def desktop_keybinds_text(rows: list[dict[str, str]]) -> str:
+    lines = [
+        "# Declarative desktop shortcut config.",
+        "# rightshift rows generate keyd bindings; labwc rows generate compositor bindings.",
+        "",
+    ]
+    for row in rows:
+        scope = row["scope"].strip().lower()
+        key = row["key"].strip()
+        action = row["action"].strip()
+        if not key or not action:
+            continue
+        if scope in {"rightshift", "right shift", "keyd"}:
+            lines.extend(
+                [
+                    "[[rightshift.bindings]]",
+                    f'key = "{toml_escape(key)}"',
+                    f'command = "{toml_escape(action)}"',
+                    "",
+                ]
+            )
+        elif scope == "labwc":
+            lines.extend(["[[labwc.bindings]]", f'key = "{toml_escape(key)}"'])
+            if action.startswith("~") or "/" in action or " " in action:
+                lines.append(f'command = "{toml_escape(action)}"')
+            else:
+                lines.append(f'action = "{toml_escape(action)}"')
+            lines.append("")
+    return "\n".join(lines)
+
+
+def toml_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def mapper_config_text(rows: list[dict[str, str]]) -> str:
+    grouped: dict[str, list[dict[str, str]]] = {"gamepad": [], "keyboard": [], "mouse": []}
+    for row in rows:
+        device = row["device"].strip().lower()
+        if device in grouped:
+            grouped[device].append(row)
+    lines = [
+        "[general]",
+        "rescan_seconds = 3.0",
+        'session_watch_processes = ["wf-panel-pi", "labwc"]',
+        "session_watch_settle_ms = 1500",
+        "",
+        "[gamepad]",
+        'device_name_patterns = ["ClockworkPI uConsole"]',
+        "debounce_ms = 250",
+        "",
+    ]
+    for row in grouped["gamepad"]:
+        lines.extend(binding_toml_block("gamepad", row))
+    lines.extend(
+        [
+            "[keyboard]",
+            "enabled = true",
+            "grab = false",
+            'device_name_patterns = ["ClockworkPI uConsole Keyboard", "keyd virtual keyboard"]',
+            "debounce_ms = 250",
+            "",
+        ]
+    )
+    for row in grouped["keyboard"]:
+        lines.extend(binding_toml_block("keyboard", row))
+    lines.extend(
+        [
+            "[lock]",
+            "enabled = false",
+            'key = "KEY_COFFEE"',
+            'lock_command = "sudo -n /usr/local/bin/uconsole-helper-mapper-display-control off"',
+            'unlock_command = "sudo -n /usr/local/bin/uconsole-helper-mapper-display-control on"',
+            'keyboard_backlight_script = "~/WorkSpace/uconsole-keyboard/tools/keyboard_state.sh"',
+            "",
+            "[power_button]",
+            "enabled = false",
+            'device_name_patterns = ["axp20x-pek"]',
+            "hold_ms = 700",
+            "",
+            "[mouse]",
+            "enabled = true",
+            "grab = true",
+            "device_name_patterns = []",
+            "",
+        ]
+    )
+    for row in grouped["mouse"]:
+        buttons = row["buttons"].strip()
+        action = row["action"].strip()
+        target = action.removeprefix("emit ").strip()
+        if buttons and target:
+            lines.extend(
+                [
+                    "[[mouse.remaps]]",
+                    f'from = "{toml_escape(buttons)}"',
+                    f'to = "{toml_escape(target)}"',
+                    "",
+                ]
+            )
+    return "\n".join(lines)
+
+
+def binding_toml_block(section: str, row: dict[str, str]) -> list[str]:
+    buttons = [part.strip() for part in row["buttons"].split(",") if part.strip()]
+    action = parse_mapper_action(row["action"])
+    if not buttons or not action:
+        return []
+    lines = [f"[[{section}.bindings]]", f"buttons = [{', '.join(toml_string(button) for button in buttons)}]"]
+    hold_ms = action.pop("hold_ms", "")
+    if hold_ms:
+        lines.append(f"hold_ms = {hold_ms}")
+    press_enter = action.pop("press_enter", "")
+    for key, value in action.items():
+        if key in {"emit_rel_value", "repeat_ms"}:
+            lines.append(f"{key} = {value}")
+        else:
+            lines.append(f"{key} = {toml_string(value)}")
+    if press_enter:
+        lines.append("press_enter = true")
+    lines.append("")
+    return lines
+
+
+def parse_mapper_action(value: str) -> dict[str, str]:
+    text = value.strip()
+    if not text or text == "-":
+        return {}
+    result: dict[str, str] = {}
+    if text.startswith("hold "):
+        parts = text.split(maxsplit=2)
+        if len(parts) == 3 and parts[1].isdigit():
+            result["hold_ms"] = parts[1]
+            text = parts[2].strip()
+    if text.startswith("command "):
+        result["command"] = text.removeprefix("command ").strip()
+        return result
+    if text.startswith("text "):
+        payload = text.removeprefix("text ").strip()
+        if payload.endswith(" enter"):
+            result["text"] = payload.removesuffix(" enter").strip()
+            result["press_enter"] = "true"
+            return result
+        result["text"] = payload
+        return result
+    if text.startswith("press ") and " / release " in text:
+        press, release = text.removeprefix("press ").split(" / release ", 1)
+        result["press_command"] = press.strip()
+        result["release_command"] = release.strip()
+        return result
+    if text.startswith("emit "):
+        result["emit_key"] = text.removeprefix("emit ").strip()
+        return result
+    if text.startswith("rel "):
+        parts = text.split()
+        if len(parts) >= 3:
+            result["emit_rel"] = parts[1]
+            result["emit_rel_value"] = parts[2]
+            return result
+    result["command"] = text
+    return result
+
+
+def toml_string(value: str) -> str:
+    return f'"{toml_escape(value)}"'
+
+
 def helper_service_config() -> dict[str, str]:
     defaults = {
         "POWERSAVER_ENABLED": "1",
+        "POWERSAVER_MODE": "balanced",
         "POWERSAVER_BATTERY_CPU_FREQ": "1500,1500",
         "POWERSAVER_AC_CPU_FREQ": "restore",
+        "POWERSAVER_ECO_BATTERY_CPU_FREQ": "1500,1500",
+        "POWERSAVER_ECO_AC_CPU_FREQ": "1500,1500",
+        "POWERSAVER_ECO_BATTERY_SCREEN_TIMEOUT_SEC": "0",
+        "POWERSAVER_ECO_AC_SCREEN_TIMEOUT_SEC": "0",
+        "POWERSAVER_ECO_UNKNOWN_POWER_ACTION": "restore",
+        "POWERSAVER_ECO_WWAN_POLICY": "ondemand",
+        "POWERSAVER_BALANCED_BATTERY_CPU_FREQ": "1500,1500",
+        "POWERSAVER_BALANCED_AC_CPU_FREQ": "restore",
+        "POWERSAVER_BALANCED_BATTERY_SCREEN_TIMEOUT_SEC": "0",
+        "POWERSAVER_BALANCED_AC_SCREEN_TIMEOUT_SEC": "0",
+        "POWERSAVER_BALANCED_UNKNOWN_POWER_ACTION": "restore",
+        "POWERSAVER_BALANCED_WWAN_POLICY": "ondemand",
+        "POWERSAVER_PERFORMANCE_BATTERY_CPU_FREQ": "1500,2400",
+        "POWERSAVER_PERFORMANCE_AC_CPU_FREQ": "restore",
+        "POWERSAVER_PERFORMANCE_BATTERY_SCREEN_TIMEOUT_SEC": "0",
+        "POWERSAVER_PERFORMANCE_AC_SCREEN_TIMEOUT_SEC": "0",
+        "POWERSAVER_PERFORMANCE_UNKNOWN_POWER_ACTION": "restore",
+        "POWERSAVER_PERFORMANCE_WWAN_POLICY": "ondemand",
         "POWERSAVER_UNKNOWN_POWER_ACTION": "restore",
         "POWERSAVER_WWAN_POLICY": "ondemand",
+        "POWERSAVER_POLL_INTERVAL_SEC": "5",
+        "POWERSAVER_SCREEN_TIMEOUT_SEC": "0",
+        "POWERSAVER_BATTERY_SCREEN_TIMEOUT_SEC": "0",
+        "POWERSAVER_AC_SCREEN_TIMEOUT_SEC": "0",
         "POWERSAVER_CPU_POLICY_PATH": "/sys/devices/system/cpu/cpufreq/policy0",
         "POWERSAVER_POWER_SUPPLY_DIR": "/sys/class/power_supply",
     }
@@ -2597,6 +3643,113 @@ def system_service_summary(service: str) -> str:
     return " / ".join(part for part in [active or "unknown", enabled or "unknown"] if part)
 
 
+def env_config(path: Path, defaults: dict[str, str]) -> dict[str, str]:
+    values = defaults.copy()
+    if not path.exists():
+        return values
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return values
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
+
+
+def default_asr_config() -> dict[str, str]:
+    return {
+        "WHISPER_URL": "http://127.0.0.1:3300/api/asr/transcriptions",
+        "WHISPER_AUTH_TOKEN": "",
+        "WHISPER_LANGUAGE": "zh",
+        "WHISPER_CORRECTION_MODE": "auto",
+        "VOICE_RECORDER": "auto",
+        "VOICE_INPUT": "default",
+        "VOICE_OUTPUT_MODE": "paste",
+        "VOICE_TMUX_OUTPUT_MODE": "type",
+        "VOICE_PASTE_BACKEND": "uinput",
+    }
+
+
+def asr_config_text(values: dict[str, str]) -> str:
+    lines = [
+        "WHISPER_URL={WHISPER_URL}",
+        "WHISPER_LANGUAGE={WHISPER_LANGUAGE}",
+        "WHISPER_AUTH_TOKEN={WHISPER_AUTH_TOKEN}",
+        "WHISPER_CORRECTION_MODE={WHISPER_CORRECTION_MODE}",
+        "WHISPER_NO_PROXY=1",
+        "WHISPER_TIMEOUT=60",
+        "VOICE_RECORDER={VOICE_RECORDER}",
+        "VOICE_INPUT={VOICE_INPUT}",
+        "VOICE_MIN_RECORD_MS=350",
+        "VOICE_MAX_RECORD_MS=60000",
+        "VOICE_SAMPLE_RATE=16000",
+        "VOICE_CHANNELS=1",
+        "VOICE_OUTPUT_MODE={VOICE_OUTPUT_MODE}",
+        "VOICE_TMUX_OUTPUT_MODE={VOICE_TMUX_OUTPUT_MODE}",
+        "VOICE_WECHAT_OUTPUT_MODE=paste",
+        "VOICE_PASTE_BACKEND={VOICE_PASTE_BACKEND}",
+        "VOICE_PASTE_SHORTCUT=ctrl_v",
+        "VOICE_WECHAT_PASTE_SHORTCUT=ctrl_v",
+        "VOICE_KEEP_AUDIO=0",
+        "VOICE_NOTIFY_USE_MARKUP=0",
+        "VOICE_NOTIFY_FONT_SIZE=22",
+        "VOICE_NOTIFY_PADDING_LINES=1",
+        "VOICE_TMUX_CONTEXT=1",
+        "",
+    ]
+    return "\n".join(line.format(**values) for line in lines)
+
+
+def audio_input_options() -> list[str]:
+    options = ["Default"]
+    options.extend(pactl_source_names())
+    options.extend(arecord_device_names())
+    result: list[str] = []
+    seen: set[str] = set()
+    for option in options:
+        if option and option not in seen:
+            result.append(option)
+            seen.add(option)
+    return result
+
+
+def pactl_source_names() -> list[str]:
+    if shutil.which("pactl") is None:
+        return []
+    result = subprocess.run(["pactl", "list", "short", "sources"], text=True, capture_output=True, check=False)
+    if result.returncode != 0:
+        return []
+    names: list[str] = []
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and not parts[1].endswith(".monitor"):
+            names.append(parts[1])
+    return names
+
+
+def arecord_device_names() -> list[str]:
+    if shutil.which("arecord") is None:
+        return []
+    result = subprocess.run(["arecord", "-L"], text=True, capture_output=True, check=False)
+    if result.returncode != 0:
+        return []
+    names: list[str] = []
+    for line in result.stdout.splitlines():
+        name = line.strip()
+        if (
+            name
+            and not line.startswith(" ")
+            and name not in {"null", "default"}
+            and (name.startswith(("hw:", "plughw:", "sysdefault:", "front:", "usbstream:")) or "CARD=" in name)
+        ):
+            names.append(name)
+    return names
+
+
 def current_power_state(config: dict[str, str]) -> str:
     power_dir = Path(config.get("POWERSAVER_POWER_SUPPLY_DIR", "/sys/class/power_supply"))
     if not power_dir.is_dir():
@@ -2628,6 +3781,168 @@ def current_power_state(config: dict[str, str]) -> str:
     if has_battery:
         return "Battery"
     return "Unknown"
+
+
+def power_time_estimate() -> str:
+    for battery in battery_supplies():
+        status = read_first_existing(battery / "status").lower()
+        capacity = read_number(
+            battery / "energy_now",
+            battery / "charge_now",
+        )
+        full = read_number(
+            battery / "energy_full",
+            battery / "charge_full",
+            battery / "energy_full_design",
+            battery / "charge_full_design",
+        )
+        rate = battery_power_rate(battery)
+        if rate is None or rate <= 0:
+            return "-"
+        if status == "discharging" and capacity is not None:
+            return f"LEFT {format_hours(capacity / rate)}"
+        if status in {"charging", "full"}:
+            if status == "full":
+                return "FULL"
+            if capacity is not None and full is not None and full > capacity:
+                return f"FULL {format_hours((full - capacity) / rate)}"
+            return "-"
+    return "-"
+
+
+def battery_supplies() -> list[Path]:
+    power_dir = Path("/sys/class/power_supply")
+    if not power_dir.is_dir():
+        return []
+    batteries: list[Path] = []
+    for path in sorted(power_dir.iterdir()):
+        if path.is_dir() and read_first_existing(path / "type") == "Battery" and power_supply_present(path):
+            batteries.append(path)
+    return batteries
+
+
+def read_number(*paths: Path) -> float | None:
+    for path in paths:
+        value = read_first_existing(path)
+        if not value:
+            continue
+        try:
+            return float(value)
+        except ValueError:
+            continue
+    return None
+
+
+def battery_power_rate(battery: Path) -> float | None:
+    power_now = read_number(battery / "power_now")
+    if power_now is not None and power_now > 0:
+        return power_now
+    current_now = read_number(battery / "current_now")
+    if current_now is None or current_now == 0:
+        return None
+    voltage_now = read_number(battery / "voltage_now")
+    if voltage_now is not None and voltage_now > 0:
+        return abs(current_now) * voltage_now / 1_000_000
+    return abs(current_now)
+
+
+def battery_power_label() -> str:
+    for battery in battery_supplies():
+        rate = battery_power_rate(battery)
+        if rate is not None and rate > 0:
+            return f"{rate / 1_000_000:.2f} W"
+    return "-"
+
+
+def ac_power_label() -> str:
+    for supply in mains_supplies():
+        rate = read_number(supply / "power_now")
+        if rate is not None and rate > 0:
+            return f"{rate / 1_000_000:.2f} W"
+        current = read_number(supply / "current_now", supply / "input_current_now")
+        voltage = read_number(supply / "voltage_now", supply / "input_voltage_now")
+        if current is not None and voltage is not None and current != 0 and voltage > 0:
+            return f"{abs(current) * voltage / 1_000_000_000_000:.2f} W"
+    return "-"
+
+
+def mains_supplies() -> list[Path]:
+    power_dir = Path("/sys/class/power_supply")
+    if not power_dir.is_dir():
+        return []
+    supplies: list[Path] = []
+    for path in sorted(power_dir.iterdir()):
+        supply_type = read_first_existing(path / "type")
+        if path.is_dir() and supply_type in {"Mains", "USB", "USB_C", "USB_PD", "USB_DCP", "USB_CDP"}:
+            if power_supply_online(path) is True:
+                supplies.append(path)
+    return supplies
+
+
+def battery_capacity_label() -> str:
+    capacity = battery_capacity_percent()
+    if capacity >= 0:
+        return f"{capacity}%"
+    return "-"
+
+
+def battery_capacity_percent() -> int:
+    for battery in battery_supplies():
+        capacity = read_number(battery / "capacity")
+        if capacity is not None:
+            return int(max(0, min(100, capacity)))
+    return -1
+
+
+def power_state_label(state: object) -> str:
+    label = str(state or "-")
+    capacity = battery_capacity_label()
+    if capacity != "-":
+        return f"{label} {capacity}"
+    return label
+
+
+def power_meter_label(state: object, percent: int) -> str:
+    label = str(state or "-").upper()
+    if percent >= 0:
+        return f"{label} {percent}%"
+    return label
+
+
+def power_watt_label(state: object) -> str:
+    if str(state).lower() == "ac":
+        ac_power = ac_power_label()
+        if ac_power != "-":
+            return ac_power
+    return battery_power_label()
+
+
+def power_watt_line(state: object) -> str:
+    if str(state).lower() == "ac":
+        ac_power = ac_power_label()
+        if ac_power != "-":
+            return kv_line("AC", ac_power)
+        if battery_status_label() == "charging":
+            return kv_line("CHG", battery_power_label())
+        return kv_line("AC", "-")
+    return kv_line("BAT", battery_power_label())
+
+
+def battery_status_label() -> str:
+    for battery in battery_supplies():
+        status = read_first_existing(battery / "status").lower()
+        if status:
+            return status
+    return ""
+
+
+def format_hours(hours: float) -> str:
+    if hours <= 0:
+        return "-"
+    minutes = int(hours * 60)
+    if minutes < 1:
+        return "<1m"
+    return f"{minutes // 60}h {minutes % 60:02d}m"
 
 
 def power_supply_present(path: Path) -> bool:
@@ -2681,11 +3996,29 @@ def current_wwan_summary() -> str:
 
 def powersaver_config_summary(config: dict[str, str]) -> str:
     enabled = config.get("POWERSAVER_ENABLED", "1")
-    battery = config.get("POWERSAVER_BATTERY_CPU_FREQ", "1500,1500")
-    ac = config.get("POWERSAVER_AC_CPU_FREQ", "restore")
-    wwan = config.get("POWERSAVER_WWAN_POLICY", "ondemand")
+    mode = config.get("POWERSAVER_MODE", "balanced")
+    profile = mode.upper()
+    battery = config.get(
+        f"POWERSAVER_{profile}_BATTERY_CPU_FREQ",
+        config.get("POWERSAVER_BATTERY_CPU_FREQ", "1500,1500"),
+    )
+    ac = config.get(f"POWERSAVER_{profile}_AC_CPU_FREQ", config.get("POWERSAVER_AC_CPU_FREQ", "restore"))
+    unknown = config.get(
+        f"POWERSAVER_{profile}_UNKNOWN_POWER_ACTION",
+        config.get("POWERSAVER_UNKNOWN_POWER_ACTION", "restore"),
+    )
+    wwan = config.get(f"POWERSAVER_{profile}_WWAN_POLICY", config.get("POWERSAVER_WWAN_POLICY", "ondemand"))
+    battery_screen = config.get(
+        f"POWERSAVER_{profile}_BATTERY_SCREEN_TIMEOUT_SEC",
+        config.get("POWERSAVER_BATTERY_SCREEN_TIMEOUT_SEC", config.get("POWERSAVER_SCREEN_TIMEOUT_SEC", "0")),
+    )
+    ac_screen = config.get(
+        f"POWERSAVER_{profile}_AC_SCREEN_TIMEOUT_SEC",
+        config.get("POWERSAVER_AC_SCREEN_TIMEOUT_SEC", config.get("POWERSAVER_SCREEN_TIMEOUT_SEC", "0")),
+    )
     state = "enabled" if enabled.lower() in {"1", "yes", "true", "on", "enabled"} else "disabled"
-    return f"{state}; battery {battery} MHz; AC {ac}; WWAN {wwan}"
+    screen_label = "off" if battery_screen == "0" and ac_screen == "0" else f"B {battery_screen}s / AC {ac_screen}s"
+    return f"{state}; {mode}; battery {battery} MHz; AC {ac}; unknown {unknown}; WWAN {wwan}; screen {screen_label}"
 
 
 def interface_addresses() -> dict[str, str]:

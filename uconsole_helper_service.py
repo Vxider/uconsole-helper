@@ -18,10 +18,10 @@ CONFIG_FILE = Path(os.environ.get("UCONSOLE_HELPER_CONFIG", "/etc/uconsole-helpe
 @dataclass(frozen=True)
 class PowerSaverConfig:
     enabled: bool
+    mode: str
     cpu_policy_path: Path
     power_supply_dir: Path
-    battery_cpu_freq: str
-    ac_cpu_freq: str
+    profiles: dict[str, dict[str, str]]
     unknown_power_action: str
     wwan_policy: str
     poll_interval_sec: float
@@ -47,20 +47,45 @@ def bool_config(value: str, default: bool = False) -> bool:
 
 
 def powersaver_config(values: dict[str, str]) -> PowerSaverConfig:
+    mode = values.get("POWERSAVER_MODE", "balanced")
+    if mode not in {"eco", "balanced", "performance"}:
+        raise ValueError("POWERSAVER_MODE must be eco, balanced, or performance")
     unknown_action = values.get("POWERSAVER_UNKNOWN_POWER_ACTION", "restore")
     if unknown_action not in {"restore", "battery", "keep"}:
         raise ValueError("POWERSAVER_UNKNOWN_POWER_ACTION must be restore, battery, or keep")
     wwan_policy = values.get("POWERSAVER_WWAN_POLICY", "ondemand")
     if wwan_policy not in {"keep", "off", "ondemand"}:
         raise ValueError("POWERSAVER_WWAN_POLICY must be keep, off, or ondemand")
+
+    profiles = {}
+    for profile in ("eco", "balanced", "performance"):
+        unknown_profile = values.get(
+            f"POWERSAVER_{profile.upper()}_UNKNOWN_POWER_ACTION",
+            values.get("POWERSAVER_UNKNOWN_POWER_ACTION", "restore"),
+        )
+        if unknown_profile not in {"restore", "battery", "keep"}:
+            raise ValueError(f"POWERSAVER_{profile.upper()}_UNKNOWN_POWER_ACTION must be restore, battery, or keep")
+        wwan_profile = values.get(
+            f"POWERSAVER_{profile.upper()}_WWAN_POLICY",
+            values.get("POWERSAVER_WWAN_POLICY", "ondemand"),
+        )
+        if wwan_profile not in {"keep", "off", "ondemand"}:
+            raise ValueError(f"POWERSAVER_{profile.upper()}_WWAN_POLICY must be keep, off, or ondemand")
+        profiles[profile] = {
+            "battery_cpu_freq": values.get(f"POWERSAVER_{profile.upper()}_BATTERY_CPU_FREQ", values.get("POWERSAVER_BATTERY_CPU_FREQ", "1500,1500")),
+            "ac_cpu_freq": values.get(f"POWERSAVER_{profile.upper()}_AC_CPU_FREQ", values.get("POWERSAVER_AC_CPU_FREQ", "restore")),
+            "unknown_power_action": unknown_profile,
+            "wwan_policy": wwan_profile,
+        }
+
     return PowerSaverConfig(
         enabled=bool_config(values.get("POWERSAVER_ENABLED", "1"), default=True),
+        mode=mode,
         cpu_policy_path=Path(
             values.get("POWERSAVER_CPU_POLICY_PATH", "/sys/devices/system/cpu/cpufreq/policy0")
         ),
         power_supply_dir=Path(values.get("POWERSAVER_POWER_SUPPLY_DIR", "/sys/class/power_supply")),
-        battery_cpu_freq=values.get("POWERSAVER_BATTERY_CPU_FREQ", "1500,1500"),
-        ac_cpu_freq=values.get("POWERSAVER_AC_CPU_FREQ", "restore"),
+        profiles=profiles,
         unknown_power_action=unknown_action,
         wwan_policy=wwan_policy,
         poll_interval_sec=float(values.get("POWERSAVER_POLL_INTERVAL_SEC", "5")),
@@ -101,12 +126,17 @@ class PowerSaverTask:
             raise FileNotFoundError(f"{self.config.cpu_policy_path} not found")
         self.default_freqs = self.read_current_freqs()
         print(
-            f"powersaver default cpu freq min={self.default_freqs[0]} max={self.default_freqs[1]}",
+            f"powersaver mode={self.config.mode}; default cpu freq min={self.default_freqs[0]} max={self.default_freqs[1]}",
             flush=True,
         )
-        print(f"powersaver battery cpu freq={self.config.battery_cpu_freq} MHz", flush=True)
         print(
-            f"powersaver wwan policy={self.config.wwan_policy}; current wwan={self.read_wwan_state()}",
+            f"powersaver battery cpu freq={self.active_profile()['battery_cpu_freq']} MHz; "
+            f"ac cpu freq={self.active_profile()['ac_cpu_freq']}",
+            flush=True,
+        )
+        print(
+            f"powersaver unknown action={self.active_profile()['unknown_power_action']}; "
+            f"wwan policy={self.active_profile()['wwan_policy']}; current wwan={self.read_wwan_state()}",
             flush=True,
         )
 
@@ -238,9 +268,10 @@ class PowerSaverTask:
             print(f"warning: failed to set WWAN radio {action}: {exc}", flush=True)
 
     def apply_wwan_policy(self, profile: str, last_wwan_target: str | None) -> str | None:
-        if self.config.wwan_policy == "keep":
+        wwan_policy = self.active_profile()["wwan_policy"]
+        if wwan_policy == "keep":
             return last_wwan_target
-        if self.config.wwan_policy == "off":
+        if wwan_policy == "off":
             target = "disabled"
         elif profile == "ac":
             target = "enabled"
@@ -251,22 +282,27 @@ class PowerSaverTask:
         if target == last_wwan_target:
             return last_wwan_target
         print(
-            f"powersaver wwan policy={self.config.wwan_policy}; profile={profile}; target={target}",
+            f"powersaver wwan policy={wwan_policy}; profile={profile}; target={target}",
             flush=True,
         )
         self.write_wwan_state(target)
         return target
 
+    def active_profile(self) -> dict[str, str]:
+        return self.config.profiles[self.config.mode]
+
     def resolve_profile(self, state: str, default_freqs: tuple[str, str]) -> tuple[str, tuple[str, str] | None]:
+        active = self.active_profile()
         if state == "battery":
-            return "battery", parse_freq_pair(self.config.battery_cpu_freq)
+            return "battery", parse_freq_pair(active["battery_cpu_freq"])
         if state == "ac":
-            freqs = default_freqs if self.config.ac_cpu_freq == "restore" else parse_freq_pair(self.config.ac_cpu_freq)
+            freqs = default_freqs if active["ac_cpu_freq"] == "restore" else parse_freq_pair(active["ac_cpu_freq"])
             return "ac", freqs
-        if self.config.unknown_power_action == "battery":
-            return "battery", parse_freq_pair(self.config.battery_cpu_freq)
-        if self.config.unknown_power_action == "restore":
-            freqs = default_freqs if self.config.ac_cpu_freq == "restore" else parse_freq_pair(self.config.ac_cpu_freq)
+        unknown_action = active["unknown_power_action"]
+        if unknown_action == "battery":
+            return "battery", parse_freq_pair(active["battery_cpu_freq"])
+        if unknown_action == "restore":
+            freqs = default_freqs if active["ac_cpu_freq"] == "restore" else parse_freq_pair(active["ac_cpu_freq"])
             return "ac", freqs
         return "keep", None
 

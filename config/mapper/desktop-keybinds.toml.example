@@ -1,0 +1,32 @@
+# Declarative desktop shortcut config.
+# RightShift launchers are handled directly by keyd through
+# /usr/local/bin/uconsole-launch-in-session, while compositor-native
+# shortcuts such as Shift+Enter stay in the labwc section.
+
+[[rightshift.bindings]]
+key = "c"
+command = "~/.local/bin/run-or-raise-chromium"
+
+[[rightshift.bindings]]
+key = "f"
+command = "~/.local/bin/run-or-raise-filemanager"
+
+[[rightshift.bindings]]
+key = "d"
+command = "~/.local/bin/run-or-raise-zdesktop"
+
+[[rightshift.bindings]]
+key = "v"
+command = "~/.local/bin/run-or-raise-vscode"
+
+[[labwc.bindings]]
+key = "S-Return"
+command = "~/.local/bin/shift-enter-newline"
+
+[[labwc.bindings]]
+key = "C-A-Return"
+action = "Maximize"
+
+[[labwc.bindings]]
+key = "C-A-h"
+action = "Iconify"
