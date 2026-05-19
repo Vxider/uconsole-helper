@@ -131,6 +131,9 @@ class UConsoleHelperWindow(Gtk.Window):
         self.power_controls: dict[str, Gtk.Widget] = {}
         self.power_profile_cards: dict[str, Gtk.Widget] = {}
         self.selected_power_mode = "balanced"
+        self.app_power_store = Gtk.ListStore(str, str, str, str, str)
+        self.app_power_previous: dict[int, dict[str, object]] = {}
+        self.app_power_previous_time = 0.0
         self.mapper_desktop_store = Gtk.ListStore(str, str, str)
         self.mapper_binding_store = Gtk.ListStore(str, str, str)
         self.asr_controls: dict[str, Gtk.Widget] = {}
@@ -160,7 +163,7 @@ class UConsoleHelperWindow(Gtk.Window):
         self.refresh_mapper_status()
         self.load_asr_config_controls()
         self.refresh_status()
-        GLib.timeout_add_seconds(2, self.auto_refresh_dashboard)
+        GLib.timeout_add_seconds(5, self.auto_refresh_visible_status)
 
     def _build_ui(self) -> None:
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
@@ -464,6 +467,22 @@ class UConsoleHelperWindow(Gtk.Window):
             status_grid.attach(value_label, column + 1, row, 1, 1)
             self.power_labels[key] = value_label
 
+        app_power_card = card_box()
+        page.pack_start(app_power_card, True, True, 0)
+        app_power_header = Gtk.Label(label="Power Ranking", xalign=0)
+        app_power_header.get_style_context().add_class("muted")
+        app_power_card.pack_start(app_power_header, False, False, 0)
+        app_power_tree = Gtk.TreeView(model=self.app_power_store)
+        app_power_tree.set_headers_visible(True)
+        for index, title in enumerate(["App", "PID", "CPU", "IO/s", "Score"]):
+            renderer = Gtk.CellRendererText()
+            column = Gtk.TreeViewColumn(title, renderer, text=index)
+            column.set_resizable(True)
+            app_power_tree.append_column(column)
+        app_power_tree.set_hexpand(True)
+        app_power_tree.set_vexpand(False)
+        app_power_card.pack_start(app_power_tree, False, False, 6)
+
         profiles_grid = Gtk.Grid(column_spacing=12, row_spacing=12)
         page.pack_start(profiles_grid, False, False, 0)
         for column, (profile, title) in enumerate((("ECO", "Eco"), ("BALANCED", "Balanced"), ("PERFORMANCE", "Performance"))):
@@ -600,12 +619,12 @@ class UConsoleHelperWindow(Gtk.Window):
         config_box.set_hexpand(True)
         config_card.pack_start(config_box, False, False, 0)
 
-        self.asr_controls["WHISPER_URL"] = Gtk.Entry()
-        config_box.pack_start(asr_control_row("Endpoint", self.asr_controls["WHISPER_URL"]), False, False, 0)
-        self.asr_controls["WHISPER_AUTH_TOKEN"] = Gtk.Entry()
-        if isinstance(self.asr_controls["WHISPER_AUTH_TOKEN"], Gtk.Entry):
-            self.asr_controls["WHISPER_AUTH_TOKEN"].set_visibility(False)
-        config_box.pack_start(asr_control_row("Token", self.asr_controls["WHISPER_AUTH_TOKEN"]), False, False, 0)
+        self.asr_controls["ASR_URL"] = Gtk.Entry()
+        config_box.pack_start(asr_control_row("Endpoint", self.asr_controls["ASR_URL"]), False, False, 0)
+        self.asr_controls["ASR_AUTH_TOKEN"] = Gtk.Entry()
+        if isinstance(self.asr_controls["ASR_AUTH_TOKEN"], Gtk.Entry):
+            self.asr_controls["ASR_AUTH_TOKEN"].set_visibility(False)
+        config_box.pack_start(asr_control_row("Token", self.asr_controls["ASR_AUTH_TOKEN"]), False, False, 0)
 
         options_flow = Gtk.FlowBox()
         options_flow.set_selection_mode(Gtk.SelectionMode.NONE)
@@ -616,11 +635,11 @@ class UConsoleHelperWindow(Gtk.Window):
         options_flow.set_homogeneous(True)
         config_box.pack_start(options_flow, False, False, 0)
 
-        self.asr_controls["WHISPER_LANGUAGE"] = combo_text_from_values(("zh", "en", "ja", "auto"))
-        self._attach_asr_flow_control(options_flow, "Language", self.asr_controls["WHISPER_LANGUAGE"])
-        self.asr_controls["WHISPER_CORRECTION_MODE"] = combo_text_from_values(("auto", "on", "off"))
-        self.asr_controls["WHISPER_CORRECTION_MODE"].connect("changed", lambda _combo: self.sync_asr_tmux_context_state())
-        self._attach_asr_flow_control(options_flow, "Correction", self.asr_controls["WHISPER_CORRECTION_MODE"])
+        self.asr_controls["ASR_LANGUAGE"] = combo_text_from_values(("zh", "en", "ja", "auto"))
+        self._attach_asr_flow_control(options_flow, "Language", self.asr_controls["ASR_LANGUAGE"])
+        self.asr_controls["ASR_CORRECTION_MODE"] = combo_text_from_values(("auto", "on", "off"))
+        self.asr_controls["ASR_CORRECTION_MODE"].connect("changed", lambda _combo: self.sync_asr_tmux_context_state())
+        self._attach_asr_flow_control(options_flow, "Correction", self.asr_controls["ASR_CORRECTION_MODE"])
         self.asr_controls["VOICE_RECORDER"] = combo_text_from_values(("auto", "pw-record", "ffmpeg", "arecord"))
         self._attach_asr_flow_control(options_flow, "Recorder", self.asr_controls["VOICE_RECORDER"])
         self.asr_controls["VOICE_INPUT"] = ellipsized_combo_text_from_values(tuple(audio_input_options()), width_chars=28)
@@ -633,6 +652,11 @@ class UConsoleHelperWindow(Gtk.Window):
             ("type", "paste", "type_enter", "clipboard", "fcitx_commit")
         )
         self._attach_asr_flow_control(options_flow, "Tmux Output", self.asr_controls["VOICE_TMUX_OUTPUT_MODE"])
+        pause_adjustment = Gtk.Adjustment(value=1600, lower=200, upper=10000, step_increment=100, page_increment=500, page_size=0)
+        pause_spin = Gtk.SpinButton(adjustment=pause_adjustment, climb_rate=100, digits=0)
+        pause_spin.set_numeric(True)
+        self.asr_controls["VOICE_PAUSE_SEGMENT_MS"] = pause_spin
+        self._attach_asr_flow_control(options_flow, "Pause (ms)", pause_spin)
         self.asr_controls["VOICE_PASTE_BACKEND"] = combo_text_from_values(("uinput", "auto", "wtype"))
         self._attach_asr_flow_control(options_flow, "Paste Backend", self.asr_controls["VOICE_PASTE_BACKEND"])
         tmux_context = Gtk.Switch()
