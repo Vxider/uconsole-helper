@@ -11,6 +11,7 @@ WLRCTL="${HOME}/.local/bin/wlrctl"
 SESSION_LAUNCHER="/usr/local/bin/uconsole-launch-in-session"
 STATE_DIR="${XDG_RUNTIME_DIR}/uconsole-helper-mapper"
 WATCH_TOKEN_FILE="${STATE_DIR}/uconsole-helper-focus-watch.token"
+AUTO_HIDE_ON_FOCUS_LOSS="${AUTO_HIDE_ON_FOCUS_LOSS:-yes}"
 WINDOW_SPECS=(
   "app_id:${APP_ID}"
   "title:${TITLE}"
@@ -117,6 +118,7 @@ watch_focus_loss() {
 start_focus_watcher() {
   local token
 
+  [[ "$AUTO_HIDE_ON_FOCUS_LOSS" == "yes" ]] || return 0
   [[ -x "$WLRCTL" ]] || return 0
 
   mkdir -p "$STATE_DIR"

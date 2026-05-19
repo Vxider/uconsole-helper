@@ -19,6 +19,10 @@ command = "~/.local/bin/run-or-raise-zdesktop"
 key = "v"
 command = "~/.local/bin/run-or-raise-vscode"
 
+[[rightshift.bindings]]
+key = "x"
+command = "~/.local/bin/run-or-raise-wechat"
+
 [[labwc.bindings]]
 key = "S-Return"
 command = "~/.local/bin/shift-enter-newline"

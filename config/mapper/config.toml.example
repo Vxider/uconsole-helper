@@ -9,7 +9,7 @@ debounce_ms = 250
 
 [[gamepad.bindings]]
 buttons = ["BTN_TRIGGER"]
-command = "~/.local/bin/toggle-codex-buddy"
+command = "~/.local/bin/toggle-uconsole-helper"
 
 [[gamepad.bindings]]
 buttons = ["BTN_TOP"]

@@ -13,7 +13,7 @@ STATE_DIR="${XDG_RUNTIME_DIR}/uconsole-helper-mapper"
 WATCH_TOKEN_FILE="${STATE_DIR}/quickterm-focus-watch.token"
 INVOKE_GUARD_FILE="/tmp/quickterm-toggle-${UID}.last"
 MIN_TOGGLE_INTERVAL_MS="${MIN_TOGGLE_INTERVAL_MS:-900}"
-AUTO_HIDE_ON_FOCUS_LOSS="${AUTO_HIDE_ON_FOCUS_LOSS:-no}"
+AUTO_HIDE_ON_FOCUS_LOSS="${AUTO_HIDE_ON_FOCUS_LOSS:-yes}"
 WINDOW_SPECS=(
   "app_id:lxterminal"
   "app_id:${APP_CLASS}"
