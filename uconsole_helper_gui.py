@@ -41,6 +41,7 @@ MAPPER_DESKTOP_KEYBINDS_CONFIG = Path.home() / ".config/uconsole-helper-mapper/d
 MAPPER_ASR_CONFIG = Path.home() / ".config/uconsole-helper-mapper/voice.env"
 MAPPER_GLOSSARY_FILE = Path.home() / ".config/uconsole-helper-mapper/voice-glossary.txt"
 SCREEN_TIMEOUT_OPTIONS = ("Default", "30s", "1min", "2min", "5min", "10min", "15min")
+DHCP_LEASE_TIME_OPTIONS = ("1h", "2h", "4h", "8h", "12h", "24h", "48h")
 
 
 DEFAULTS = {
@@ -100,9 +101,15 @@ class UConsoleHelperWindow(Gtk.Window):
         self.interface_combo.set_row_separator_func(interface_row_is_separator)
         self.message_label = Gtk.Label(label="", xalign=0)
         self.entries = {key: Gtk.Entry() for key in DEFAULTS}
+        self.pool_prefix_labels: dict[str, Gtk.Label] = {}
+        self.pool_suffix_entries: dict[str, Gtk.Entry] = {}
+        self.lease_time_combo = combo_text_from_values(DHCP_LEASE_TIME_OPTIONS)
         self.dhcp_defaults = dhcp_defaults()
         for key, entry in self.entries.items():
             entry.set_text(self.dhcp_defaults[key])
+        set_combo_text(self.lease_time_combo, self.dhcp_defaults["lease_time"])
+        self.entries["server_ip"].connect("changed", lambda _entry: self.update_pool_address_controls())
+        self.entries["netmask"].connect("changed", lambda _entry: self.update_pool_address_controls())
 
         self.scan_interface_store = Gtk.ListStore(str, str, bool, str, bool, str)
         self.scan_interface_combo = Gtk.ComboBox.new_with_model(self.scan_interface_store)
@@ -318,11 +325,12 @@ class UConsoleHelperWindow(Gtk.Window):
 
         self._attach_entry(grid, "本机地址", "server_ip", 0, 1)
         self._attach_entry(grid, "子网掩码", "netmask", 2, 1)
-        self._attach_entry(grid, "地址池起始", "pool_start", 0, 2)
-        self._attach_entry(grid, "地址池结束", "pool_end", 2, 2)
-        self._attach_entry(grid, "租约时间", "lease_time", 0, 3)
+        self._attach_pool_address(grid, "地址池起始", "pool_start", 0, 2)
+        self._attach_pool_address(grid, "地址池结束", "pool_end", 2, 2)
+        self._attach_combo(grid, "租约时间", self.lease_time_combo, 0, 3)
         self._attach_entry(grid, "网关(可选)", "gateway", 2, 3)
         self._attach_entry(grid, "DNS(可选)", "dns", 0, 4)
+        self.update_pool_address_controls(self.dhcp_defaults)
 
         return page
 
@@ -430,14 +438,17 @@ class UConsoleHelperWindow(Gtk.Window):
             ("cpu", "CPU"),
             ("wwan", "WWAN"),
         ]
-        for row, (key, title) in enumerate(rows):
+        status_columns = 3
+        for index, (key, title) in enumerate(rows):
+            column = (index % status_columns) * 2
+            row = index // status_columns
             title_label = Gtk.Label(label=title, xalign=0)
             title_label.get_style_context().add_class("muted")
             value_label = Gtk.Label(label="-", xalign=0)
             value_label.set_selectable(True)
             value_label.set_hexpand(True)
-            status_grid.attach(title_label, 0, row, 1, 1)
-            status_grid.attach(value_label, 1, row, 1, 1)
+            status_grid.attach(title_label, column, row, 1, 1)
+            status_grid.attach(value_label, column + 1, row, 1, 1)
             self.power_labels[key] = value_label
 
         profiles_grid = Gtk.Grid(column_spacing=12, row_spacing=12)
@@ -544,38 +555,49 @@ class UConsoleHelperWindow(Gtk.Window):
 
         config_card = card_box()
         page.pack_start(config_card, False, False, 0)
-        grid = Gtk.Grid(column_spacing=14, row_spacing=10)
-        config_card.pack_start(grid, False, False, 0)
+        config_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        config_box.set_hexpand(True)
+        config_card.pack_start(config_box, False, False, 0)
 
         self.asr_controls["WHISPER_URL"] = Gtk.Entry()
-        self._attach_asr_control(grid, "Endpoint", self.asr_controls["WHISPER_URL"], 0)
+        config_box.pack_start(asr_control_row("Endpoint", self.asr_controls["WHISPER_URL"]), False, False, 0)
         self.asr_controls["WHISPER_AUTH_TOKEN"] = Gtk.Entry()
         if isinstance(self.asr_controls["WHISPER_AUTH_TOKEN"], Gtk.Entry):
             self.asr_controls["WHISPER_AUTH_TOKEN"].set_visibility(False)
-        self._attach_asr_control(grid, "Token", self.asr_controls["WHISPER_AUTH_TOKEN"], 1)
+        config_box.pack_start(asr_control_row("Token", self.asr_controls["WHISPER_AUTH_TOKEN"]), False, False, 0)
+
+        options_flow = Gtk.FlowBox()
+        options_flow.set_selection_mode(Gtk.SelectionMode.NONE)
+        options_flow.set_min_children_per_line(1)
+        options_flow.set_max_children_per_line(2)
+        options_flow.set_column_spacing(14)
+        options_flow.set_row_spacing(10)
+        options_flow.set_homogeneous(True)
+        config_box.pack_start(options_flow, False, False, 0)
+
         self.asr_controls["WHISPER_LANGUAGE"] = combo_text_from_values(("zh", "en", "ja", "auto"))
-        self._attach_asr_control(grid, "Language", self.asr_controls["WHISPER_LANGUAGE"], 2)
+        self._attach_asr_flow_control(options_flow, "Language", self.asr_controls["WHISPER_LANGUAGE"])
         self.asr_controls["WHISPER_CORRECTION_MODE"] = combo_text_from_values(("auto", "on", "off"))
         self.asr_controls["WHISPER_CORRECTION_MODE"].connect("changed", lambda _combo: self.sync_asr_tmux_context_state())
-        self._attach_asr_control(grid, "Correction", self.asr_controls["WHISPER_CORRECTION_MODE"], 3)
+        self._attach_asr_flow_control(options_flow, "Correction", self.asr_controls["WHISPER_CORRECTION_MODE"])
         self.asr_controls["VOICE_RECORDER"] = combo_text_from_values(("auto", "pw-record", "ffmpeg", "arecord"))
-        self._attach_asr_control(grid, "Recorder", self.asr_controls["VOICE_RECORDER"], 4)
-        self.asr_controls["VOICE_INPUT"] = combo_text_from_values(tuple(audio_input_options()))
-        self._attach_asr_control(grid, "Input", self.asr_controls["VOICE_INPUT"], 5)
+        self._attach_asr_flow_control(options_flow, "Recorder", self.asr_controls["VOICE_RECORDER"])
+        self.asr_controls["VOICE_INPUT"] = ellipsized_combo_text_from_values(tuple(audio_input_options()), width_chars=28)
+        self._attach_asr_flow_control(options_flow, "Input", self.asr_controls["VOICE_INPUT"])
         self.asr_controls["VOICE_OUTPUT_MODE"] = combo_text_from_values(
             ("paste", "type", "type_enter", "clipboard", "fcitx_commit")
         )
-        self._attach_asr_control(grid, "Output", self.asr_controls["VOICE_OUTPUT_MODE"], 6)
+        self._attach_asr_flow_control(options_flow, "Output", self.asr_controls["VOICE_OUTPUT_MODE"])
         self.asr_controls["VOICE_TMUX_OUTPUT_MODE"] = combo_text_from_values(
             ("type", "paste", "type_enter", "clipboard", "fcitx_commit")
         )
-        self._attach_asr_control(grid, "Tmux Output", self.asr_controls["VOICE_TMUX_OUTPUT_MODE"], 7)
+        self._attach_asr_flow_control(options_flow, "Tmux Output", self.asr_controls["VOICE_TMUX_OUTPUT_MODE"])
         self.asr_controls["VOICE_PASTE_BACKEND"] = combo_text_from_values(("uinput", "auto", "wtype"))
-        self._attach_asr_control(grid, "Paste Backend", self.asr_controls["VOICE_PASTE_BACKEND"], 8)
+        self._attach_asr_flow_control(options_flow, "Paste Backend", self.asr_controls["VOICE_PASTE_BACKEND"])
         tmux_context = Gtk.Switch()
         tmux_context.set_halign(Gtk.Align.START)
         self.asr_controls["VOICE_TMUX_CONTEXT"] = tmux_context
-        self._attach_asr_control(grid, "Tmux Context", tmux_context, 9)
+        self._attach_asr_flow_control(options_flow, "Tmux Context", tmux_context)
 
         glossary_card = card_box()
         page.pack_start(glossary_card, True, True, 0)
@@ -600,12 +622,10 @@ class UConsoleHelperWindow(Gtk.Window):
         grid.attach(label, 0, row, 1, 1)
         grid.attach(widget, 1, row, 1, 1)
 
-    def _attach_asr_control(self, grid: Gtk.Grid, title: str, widget: Gtk.Widget, row: int) -> None:
-        label = Gtk.Label(label=title, xalign=0)
-        label.get_style_context().add_class("muted")
-        widget.set_hexpand(True)
-        grid.attach(label, 0, row, 1, 1)
-        grid.attach(widget, 1, row, 1, 1)
+    def _attach_asr_flow_control(self, flow: Gtk.FlowBox, title: str, widget: Gtk.Widget) -> None:
+        row = asr_control_row(title, widget)
+        row.set_size_request(260, -1)
+        flow.add(row)
 
     def editable_tree(self, store: Gtk.ListStore, columns: list[tuple[str, int]]) -> Gtk.TreeView:
         tree = Gtk.TreeView(model=store)
@@ -1152,6 +1172,9 @@ class UConsoleHelperWindow(Gtk.Window):
         if key_lower == "v" and self.stack.get_visible_child_name() in {"power", "mapper", "asr"}:
             self.run_context_action()
             return True
+        if key_lower == "c" and self.stack.get_visible_child_name() == "tailscale":
+            self.run_secondary_header_action()
+            return True
         if key in {"Return", "KP_Enter"}:
             self.run_context_action()
             return True
@@ -1175,6 +1198,82 @@ class UConsoleHelperWindow(Gtk.Window):
         entry = self.entries[key]
         entry.set_hexpand(True)
         grid.attach(entry, col + 1, row, 1, 1)
+
+    def _attach_combo(self, grid: Gtk.Grid, label: str, combo: Gtk.ComboBoxText, col: int, row: int) -> None:
+        self._attach_label(grid, label, col, row)
+        combo.set_hexpand(True)
+        grid.attach(combo, col + 1, row, 1, 1)
+
+    def _attach_pool_address(self, grid: Gtk.Grid, label: str, key: str, col: int, row: int) -> None:
+        self._attach_label(grid, label, col, row)
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        box.set_hexpand(True)
+        prefix = Gtk.Label(label="", xalign=0)
+        prefix.set_selectable(True)
+        entry = Gtk.Entry()
+        entry.set_width_chars(8)
+        entry.set_max_width_chars(15)
+        box.pack_start(prefix, True, True, 0)
+        box.pack_start(entry, False, False, 0)
+        grid.attach(box, col + 1, row, 1, 1)
+        self.pool_prefix_labels[key] = prefix
+        self.pool_suffix_entries[key] = entry
+
+    def current_dhcp_form_values(self) -> dict[str, str]:
+        values = {key: entry.get_text().strip() for key, entry in self.entries.items()}
+        values["lease_time"] = self.lease_time_combo.get_active_text() or DEFAULTS["lease_time"]
+        for key in ("pool_start", "pool_end"):
+            values[key] = self.pool_address_text_or_default(key)
+        return values
+
+    def set_dhcp_config_values(self, values: dict[str, str]) -> None:
+        for key, entry in self.entries.items():
+            if key in {"pool_start", "pool_end", "lease_time"}:
+                continue
+            entry.set_text(values.get(key, DEFAULTS[key]))
+        set_combo_text(self.lease_time_combo, values.get("lease_time", DEFAULTS["lease_time"]))
+        self.update_pool_address_controls(values)
+
+    def update_pool_address_controls(self, values: dict[str, str] | None = None) -> None:
+        source = values or {
+            "server_ip": self.entries["server_ip"].get_text().strip(),
+            "netmask": self.entries["netmask"].get_text().strip(),
+            "pool_start": self.pool_address_text_or_default("pool_start"),
+            "pool_end": self.pool_address_text_or_default("pool_end"),
+        }
+        try:
+            server_ip = ipaddress.IPv4Address(source["server_ip"])
+            network = ipaddress.IPv4Network(f"{server_ip}/{source['netmask']}", strict=False)
+            pool_bounds = dhcp_pool_bounds(network)
+            if pool_bounds is None:
+                raise ValueError
+        except (KeyError, ValueError, ipaddress.AddressValueError, ipaddress.NetmaskValueError):
+            for key in ("pool_start", "pool_end"):
+                self.pool_prefix_labels[key].set_text("请先设置有效本机地址和子网掩码")
+                self.pool_suffix_entries[key].set_text("")
+            return
+
+        prefix, first_suffix, last_suffix = pool_edit_parts(network)
+        first_pool_ip, last_pool_ip = pool_bounds
+        for key in ("pool_start", "pool_end"):
+            fallback = pool_bounds[0] if key == "pool_start" else pool_bounds[1]
+            address = pool_address_from_value(source.get(key, ""), first_pool_ip, last_pool_ip, fallback)
+            self.pool_prefix_labels[key].set_text(prefix)
+            self.pool_suffix_entries[key].set_placeholder_text(f"{first_suffix}-{last_suffix}")
+            self.pool_suffix_entries[key].set_text(address_suffix(address, prefix))
+
+    def pool_address_text(self, key: str) -> str:
+        server_ip = ipaddress.IPv4Address(self.entries["server_ip"].get_text().strip())
+        network = ipaddress.IPv4Network(f"{server_ip}/{self.entries['netmask'].get_text().strip()}", strict=False)
+        prefix, _first_suffix, _last_suffix = pool_edit_parts(network)
+        suffix = self.pool_suffix_entries[key].get_text().strip()
+        return prefix + suffix
+
+    def pool_address_text_or_default(self, key: str) -> str:
+        try:
+            return self.pool_address_text(key)
+        except ValueError:
+            return self.dhcp_defaults.get(key, DEFAULTS[key])
 
     def refresh_interfaces(self) -> None:
         self.refresh_dhcp_defaults()
@@ -1203,12 +1302,11 @@ class UConsoleHelperWindow(Gtk.Window):
 
     def refresh_dhcp_defaults(self) -> None:
         current_defaults = self.dhcp_defaults
-        current_values = {key: entry.get_text().strip() for key, entry in self.entries.items()}
+        current_values = self.current_dhcp_form_values()
         if any(current_values.get(key, "") != current_defaults.get(key, "") for key in DEFAULTS):
             return
         self.dhcp_defaults = dhcp_defaults()
-        for key, entry in self.entries.items():
-            entry.set_text(self.dhcp_defaults[key])
+        self.set_dhcp_config_values(self.dhcp_defaults)
 
     def refresh_interface_status(self) -> None:
         self.interface_status_store.clear()
@@ -1352,6 +1450,8 @@ class UConsoleHelperWindow(Gtk.Window):
                 widget.set_text(value)
             elif isinstance(widget, Gtk.ComboBoxText):
                 set_combo_text(widget, value)
+            elif isinstance(widget, Gtk.ComboBox):
+                set_combo_model_text(widget, value)
             elif isinstance(widget, Gtk.Switch):
                 widget.set_active(value.lower() in {"1", "yes", "true", "on", "enabled"})
         self.sync_asr_tmux_context_state()
@@ -1621,7 +1721,7 @@ class UConsoleHelperWindow(Gtk.Window):
         if interface not in list_interfaces():
             raise ValueError("选择的网口不存在。")
 
-        config = {key: entry.get_text().strip() for key, entry in self.entries.items()}
+        config = self.current_dhcp_form_values()
         for key in ("server_ip", "netmask", "pool_start", "pool_end", "lease_time"):
             if not config[key]:
                 raise ValueError(f"{key} 不能为空。")
@@ -1630,8 +1730,12 @@ class UConsoleHelperWindow(Gtk.Window):
         pool_start = ipaddress.IPv4Address(config["pool_start"])
         pool_end = ipaddress.IPv4Address(config["pool_end"])
         network = ipaddress.IPv4Network(f"{server_ip}/{config['netmask']}", strict=False)
+        pool_bounds = dhcp_pool_bounds(network)
+        if pool_bounds is None:
+            raise ValueError("DHCP 地址池需要至少 2 个可用主机地址。")
+        first_pool_ip, last_pool_ip = pool_bounds
 
-        if pool_start not in network or pool_end not in network:
+        if pool_start < first_pool_ip or pool_start > last_pool_ip or pool_end < first_pool_ip or pool_end > last_pool_ip:
             raise ValueError("地址池必须在本机地址所在子网内。")
         if pool_start > pool_end:
             raise ValueError("地址池起始地址不能大于结束地址。")
@@ -1779,6 +1883,18 @@ def dashboard_card(title: str) -> Gtk.Box:
     return box
 
 
+def asr_control_row(title: str, widget: Gtk.Widget) -> Gtk.Box:
+    box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+    box.set_hexpand(True)
+    label = Gtk.Label(label=title, xalign=0)
+    label.get_style_context().add_class("muted")
+    label.set_width_chars(13)
+    widget.set_hexpand(True)
+    box.pack_start(label, False, False, 0)
+    box.pack_start(widget, True, True, 0)
+    return box
+
+
 def scrolled_page(content: Gtk.Widget) -> Gtk.ScrolledWindow:
     scroll = Gtk.ScrolledWindow()
     scroll.set_hexpand(True)
@@ -1843,7 +1959,36 @@ def combo_text_from_values(values: tuple[str, ...]) -> Gtk.ComboBoxText:
     return combo
 
 
-def block_combo_scroll(combo: Gtk.ComboBoxText, event: Gdk.EventScroll) -> bool:
+def ellipsized_combo_text_from_values(values: tuple[str, ...], width_chars: int) -> Gtk.ComboBox:
+    store = Gtk.ListStore(str)
+    for value in values:
+        store.append([value])
+    combo = Gtk.ComboBox.new_with_model(store)
+    combo.connect("scroll-event", block_combo_scroll)
+    renderer = Gtk.CellRendererText()
+    renderer.set_property("ellipsize", Pango.EllipsizeMode.END)
+    renderer.set_property("width-chars", width_chars)
+    renderer.set_property("max-width-chars", width_chars)
+    combo.pack_start(renderer, True)
+    combo.add_attribute(renderer, "text", 0)
+    combo.set_size_request(width_chars * 8, -1)
+    combo.connect("changed", update_combo_model_tooltip)
+    if len(store) > 0:
+        combo.set_active(0)
+        update_combo_model_tooltip(combo)
+    return combo
+
+
+def update_combo_model_tooltip(combo: Gtk.ComboBox) -> None:
+    active = combo.get_active_iter()
+    model = combo.get_model()
+    if active is not None and model is not None:
+        combo.set_tooltip_text(str(model[active][0]))
+    else:
+        combo.set_tooltip_text(None)
+
+
+def block_combo_scroll(combo: Gtk.ComboBox, event: Gdk.EventScroll) -> bool:
     parent = combo.get_parent()
     while parent is not None and not isinstance(parent, Gtk.ScrolledWindow):
         parent = parent.get_parent()
@@ -1876,6 +2021,68 @@ def set_combo_text(combo: Gtk.ComboBoxText, value: str) -> None:
                 return
     if model is not None and len(model) > 0:
         combo.set_active(0)
+
+
+def set_combo_model_text(combo: Gtk.ComboBox, value: str) -> None:
+    if value == "default":
+        value = "Default"
+    model = combo.get_model()
+    if model is not None:
+        for index, row in enumerate(model):
+            if row[0] == value:
+                combo.set_active(index)
+                return
+    if model is not None and len(model) > 0:
+        combo.set_active(0)
+
+
+def dhcp_pool_bounds(network: ipaddress.IPv4Network) -> tuple[ipaddress.IPv4Address, ipaddress.IPv4Address] | None:
+    first = int(network.network_address) + 1
+    last = int(network.broadcast_address) - 1
+    if first > last:
+        return None
+    return ipaddress.IPv4Address(first), ipaddress.IPv4Address(last)
+
+
+def pool_edit_parts(network: ipaddress.IPv4Network) -> tuple[str, str, str]:
+    bounds = dhcp_pool_bounds(network)
+    if bounds is None:
+        raise ValueError("DHCP 地址池需要至少 2 个可用主机地址。")
+    first, last = bounds
+    first_text = str(first)
+    last_text = str(last)
+    prefix_length = common_prefix_length(first_text, last_text)
+    prefix = first_text[:prefix_length]
+    return prefix, first_text[prefix_length:], last_text[prefix_length:]
+
+
+def common_prefix_length(left: str, right: str) -> int:
+    length = 0
+    for left_char, right_char in zip(left, right):
+        if left_char != right_char:
+            break
+        length += 1
+    return length
+
+
+def pool_address_from_value(
+    value: str,
+    first_pool_ip: ipaddress.IPv4Address,
+    last_pool_ip: ipaddress.IPv4Address,
+    fallback: ipaddress.IPv4Address,
+) -> ipaddress.IPv4Address:
+    try:
+        address = ipaddress.IPv4Address(value)
+    except ipaddress.AddressValueError:
+        return fallback
+    if address < first_pool_ip or address > last_pool_ip:
+        return fallback
+    return address
+
+
+def address_suffix(address: ipaddress.IPv4Address, prefix: str) -> str:
+    text = str(address)
+    return text[len(prefix) :] if text.startswith(prefix) else text
 
 
 def unknown_action_display_value(value: str) -> str:
@@ -1928,6 +2135,11 @@ def widget_text(widget: Gtk.Widget) -> str:
         child = widget.get_child()
         if isinstance(child, Gtk.Entry):
             return child.get_text().strip()
+    if isinstance(widget, Gtk.ComboBox):
+        active = widget.get_active_iter()
+        model = widget.get_model()
+        if active is not None and model is not None:
+            return str(model[active][0]).strip()
     return ""
 
 
