@@ -2549,9 +2549,6 @@ def signal_bar_icon(bars: int) -> str:
 def signal_bars(signal: str) -> int | None:
     if not signal or signal == "-":
         return None
-    percent_match = re.search(r"\b(\d{1,3})%", signal)
-    if percent_match:
-        return bars_from_quality(int(percent_match.group(1)))
     rsrp_match = re.search(r"\bRSRP\s+(-?\d+(?:\.\d+)?)", signal, re.IGNORECASE)
     if rsrp_match:
         quality = int((float(rsrp_match.group(1)) + 120) * 100 / 40)
@@ -2560,6 +2557,9 @@ def signal_bars(signal: str) -> int | None:
     if rssi_match:
         quality = int((float(rssi_match.group(1)) + 113) * 100 / 62)
         return bars_from_quality(quality)
+    percent_match = re.search(r"\b(\d{1,3})%", signal)
+    if percent_match:
+        return bars_from_quality(int(percent_match.group(1)))
     return None
 
 
@@ -3300,14 +3300,10 @@ def storage_mounts() -> list[dict[str, object]]:
         candidate = storage_usage_item(source, mount_point)
         if candidate is None:
             continue
-        storage_key = mount_point if mount_point in {"/", "/home"} else source
+        storage_key = mount_point if mount_point == "/" else source
         current = mounts.get(storage_key)
         if current is None or storage_mount_sort_key(candidate) < storage_mount_sort_key(current):
             mounts[storage_key] = candidate
-    if "/home" not in mounts and Path("/home").is_dir():
-        home = storage_usage_item("/home", "/home")
-        if home is not None:
-            mounts["/home"] = home
     return sorted(mounts.values(), key=storage_mount_sort_key)
 
 
@@ -3361,7 +3357,7 @@ def real_storage_source(source: str, fs_type: str, mount_point: str) -> bool:
 
 
 def storage_label(mount_point: str) -> str:
-    if mount_point in {"/", "/home", "/boot", "/boot/firmware"}:
+    if mount_point in {"/", "/boot", "/boot/firmware"}:
         return mount_point
     for prefix in ("/media/", "/mnt/"):
         if mount_point.startswith(prefix):
