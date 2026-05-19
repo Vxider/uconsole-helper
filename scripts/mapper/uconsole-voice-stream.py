@@ -210,6 +210,7 @@ class SegmentingTranscriptionSession:
         self.raw_text = ""
         self.corrected_text = ""
         self.last_request_id = self.request_id
+        self.pending_segment = bytearray()
         signal.signal(signal.SIGTERM, self._signal_stop)
         signal.signal(signal.SIGINT, self._signal_stop)
 
@@ -399,18 +400,21 @@ class SegmentingTranscriptionSession:
         return segment_ms >= self.min_segment_ms and silence_ms >= self.pause_ms, False, noise_floor
 
     def process_segment(self, segment: bytearray, *, force: bool = False) -> None:
-        if not segment:
+        if segment:
+            self.pending_segment.extend(segment)
+            segment.clear()
+        if not self.pending_segment:
             return
-        pcm = bytes(segment)
+        pcm = bytes(self.pending_segment)
         if force or len(pcm) >= int(self.sample_rate * self.channels * 2 * self.min_segment_ms / 1000):
             try:
                 self.transcribe_segment(pcm, final_segment=force)
             except Exception as exc:
                 if not force:
-                    append_log(f"skip auto segment transcription: {type(exc).__name__}: {exc}")
+                    append_log(f"buffer auto segment transcription retry: {type(exc).__name__}: {exc}")
                     return
                 raise
-        segment.clear()
+            self.pending_segment.clear()
 
     def run(self) -> int:
         if not os.environ.get("ASR_AUTH_TOKEN", "").strip():
