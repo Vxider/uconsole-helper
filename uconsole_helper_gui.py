@@ -40,6 +40,7 @@ MAPPER_CONFIG = Path.home() / ".config/uconsole-helper-mapper/config.toml"
 MAPPER_DESKTOP_KEYBINDS_CONFIG = Path.home() / ".config/uconsole-helper-mapper/desktop-keybinds.toml"
 MAPPER_ASR_CONFIG = Path.home() / ".config/uconsole-helper-mapper/voice.env"
 MAPPER_GLOSSARY_FILE = Path.home() / ".config/uconsole-helper-mapper/voice-glossary.txt"
+BATTERY_CALIBRATE_PATH = Path("/sys/class/power_supply/axp20x-battery/calibrate")
 SCREEN_TIMEOUT_OPTIONS = ("Default", "30s", "1min", "2min", "5min", "10min", "15min")
 DHCP_LEASE_TIME_OPTIONS = ("1h", "2h", "4h", "8h", "12h", "24h", "48h")
 
@@ -135,6 +136,12 @@ class UConsoleHelperWindow(Gtk.Window):
         self.asr_controls: dict[str, Gtk.Widget] = {}
         self.asr_status_label = Gtk.Label(label="", xalign=0)
         self.asr_status_label.get_style_context().add_class("muted")
+        self.utils_battery_label = Gtk.Label(label="-", xalign=0)
+        self.utils_battery_label.set_selectable(True)
+        self.utils_calibrate_button = Gtk.Button(label="Battery Calibrate")
+        self.utils_calibrate_button.connect("clicked", lambda _button: self.calibrate_battery())
+        self.utils_status_label = Gtk.Label(label="", xalign=0)
+        self.utils_status_label.get_style_context().add_class("muted")
         self.dashboard_labels: dict[str, Gtk.Label] = {}
         self.dashboard_bars: dict[str, Gtk.ProgressBar] = {}
         self.dashboard_secondary_bars: dict[str, Gtk.ProgressBar] = {}
@@ -169,6 +176,7 @@ class UConsoleHelperWindow(Gtk.Window):
         self.stack.add_titled(scrolled_page(self._build_interface_page()), "interface", "Interface")
         self.stack.add_titled(scrolled_page(self._build_tailscale_page()), "tailscale", "Tailscale")
         self.stack.add_titled(scrolled_page(self._build_power_page()), "power", "Power")
+        self.stack.add_titled(scrolled_page(self._build_utils_page()), "utils", "Utils")
         self.stack.add_titled(scrolled_page(self._build_mapper_page()), "mapper", "Mapper")
         self.stack.add_titled(scrolled_page(self._build_asr_page()), "asr", "ASR")
         self.stack.connect("notify::visible-child-name", lambda *_args: self.update_header())
@@ -218,6 +226,11 @@ class UConsoleHelperWindow(Gtk.Window):
         self.power_tab.connect("clicked", lambda _button: self.set_tab("power"))
         self.power_tab.get_style_context().add_class("tab-button")
         tabs.pack_start(self.power_tab, False, False, 0)
+
+        self.utils_tab = underlined_button("Utils", "U")
+        self.utils_tab.connect("clicked", lambda _button: self.set_tab("utils"))
+        self.utils_tab.get_style_context().add_class("tab-button")
+        tabs.pack_start(self.utils_tab, False, False, 0)
 
         self.mapper_tab_label = Gtk.Label()
         self.mapper_tab_label.set_use_markup(True)
@@ -492,6 +505,34 @@ class UConsoleHelperWindow(Gtk.Window):
 
         self.load_power_policy_controls()
 
+        return page
+
+    def _build_utils_page(self) -> Gtk.Widget:
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        page.get_style_context().add_class("page")
+
+        card = card_box()
+        page.pack_start(card, False, False, 0)
+
+        header = Gtk.Label(label="Battery Calibration", xalign=0)
+        header.get_style_context().add_class("muted")
+        card.pack_start(header, False, False, 0)
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        row.set_margin_top(8)
+        card.pack_start(row, False, False, 0)
+
+        battery_title = Gtk.Label(label="Battery", xalign=0)
+        battery_title.get_style_context().add_class("muted")
+        row.pack_start(battery_title, False, False, 0)
+        self.utils_battery_label.set_hexpand(True)
+        row.pack_start(self.utils_battery_label, True, True, 0)
+
+        self.utils_calibrate_button.get_style_context().add_class("suggested-action")
+        row.pack_start(self.utils_calibrate_button, False, False, 0)
+
+        page.pack_start(self.utils_status_label, False, False, 0)
+        self.refresh_utils_status()
         return page
 
     def _build_mapper_page(self) -> Gtk.Widget:
@@ -942,6 +983,7 @@ class UConsoleHelperWindow(Gtk.Window):
         toggle_style_class(self.interface_tab, "tab-active", page == "interface")
         toggle_style_class(self.tailscale_tab, "tab-active", page == "tailscale")
         toggle_style_class(self.power_tab, "tab-active", page == "power")
+        toggle_style_class(self.utils_tab, "tab-active", page == "utils")
         toggle_style_class(self.mapper_tab, "tab-active", page == "mapper")
         toggle_style_class(self.asr_tab, "tab-active", page == "asr")
         self.tailscale_reconnect_button.set_visible(page in {"dhcp", "tailscale", "power", "mapper"})
@@ -1080,6 +1122,8 @@ class UConsoleHelperWindow(Gtk.Window):
             self.refresh_tailscale_status()
         elif page == "power":
             self.refresh_power_status()
+        elif page == "utils":
+            self.refresh_utils_status()
         elif page == "mapper":
             self.refresh_mapper_status()
         elif page == "asr":
@@ -1129,9 +1173,12 @@ class UConsoleHelperWindow(Gtk.Window):
             self.set_tab("power")
             return True
         if ctrl and key == "7":
-            self.set_tab("mapper")
+            self.set_tab("utils")
             return True
         if ctrl and key == "8":
+            self.set_tab("mapper")
+            return True
+        if ctrl and key == "9":
             self.set_tab("asr")
             return True
         if alt and key in {"Left", "Right"}:
@@ -1157,6 +1204,9 @@ class UConsoleHelperWindow(Gtk.Window):
         if key_lower == "p":
             self.set_tab("power")
             return True
+        if key_lower == "u":
+            self.set_tab("utils")
+            return True
         if key_lower == "m":
             self.set_tab("mapper")
             return True
@@ -1181,7 +1231,7 @@ class UConsoleHelperWindow(Gtk.Window):
         return False
 
     def switch_tab(self, direction: int) -> None:
-        pages = ["dashboard", "dhcp", "lanscan", "interface", "tailscale", "power", "mapper", "asr"]
+        pages = ["dashboard", "dhcp", "lanscan", "interface", "tailscale", "power", "utils", "mapper", "asr"]
         current = self.stack.get_visible_child_name()
         try:
             index = pages.index(current)
@@ -1438,6 +1488,33 @@ class UConsoleHelperWindow(Gtk.Window):
             label.set_text(status.get(key, "-"))
         self.load_power_policy_controls()
         self.update_header()
+
+    def refresh_utils_status(self) -> None:
+        capacity = battery_capacity_percent()
+        if capacity >= 0:
+            self.utils_battery_label.set_text(f"{capacity}%")
+        else:
+            self.utils_battery_label.set_text("Unknown")
+        self.utils_calibrate_button.set_sensitive(capacity == 100)
+        if capacity == 100:
+            self.utils_calibrate_button.set_tooltip_text("电量为 100%，可以执行电量校准。")
+        else:
+            self.utils_calibrate_button.set_tooltip_text("只有电池电量为 100% 时才能执行电量校准。")
+
+    def calibrate_battery(self) -> None:
+        capacity = battery_capacity_percent()
+        self.refresh_utils_status()
+        if capacity != 100:
+            self.show_error("Battery calibrate blocked", "只有电池电量为 100% 时才能执行电量校准。")
+            return
+        command = ["sudo", "tee", str(BATTERY_CALIBRATE_PATH)]
+        result = subprocess.run(command, input="1\n", text=True, capture_output=True, check=False)
+        if result.returncode != 0:
+            self.utils_status_label.set_text("Battery calibration failed.")
+            self.show_error("Battery calibrate failed", combine_output(result) or "命令执行失败。")
+            return
+        self.utils_status_label.set_text("Battery calibration command executed.")
+        self.refresh_utils_status()
 
     def refresh_mapper_status(self) -> None:
         self.load_mapper_shortcuts()
