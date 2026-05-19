@@ -153,6 +153,23 @@ ensure_config_key() {
   fi
 }
 
+disable_legacy_labwc_idle() {
+  local autostart="${HOME}/.config/labwc/autostart"
+  if [[ -f "${autostart}" ]] && grep -Eq "^[[:space:]]*swayidle .*wlopm --off .*wlopm --on" "${autostart}"; then
+    cp -n "${autostart}" "${autostart}.bak-uconsole-helper-idle" 2>/dev/null || true
+    perl -0pi -e 's/^(?!#)([ \t]*swayidle\b[^\n]*wlopm --off[^\n]*wlopm --on[^\n]*&?[ \t]*)$/# disabled by uconsole-helper-idle.service: $1/mg' "${autostart}"
+    echo "Disabled legacy labwc swayidle/wlopm autostart:"
+    echo "  ${autostart}"
+  fi
+  if command -v pgrep >/dev/null 2>&1; then
+    while IFS= read -r pid; do
+      if [[ -n "${pid}" ]]; then
+        kill "${pid}" >/dev/null 2>&1 || true
+      fi
+    done < <(pgrep -f "swayidle .*wlopm --off .*wlopm --on" || true)
+  fi
+}
+
 install_mapper() {
   local mapper_app_dir="${HOME}/.local/share/uconsole-helper-mapper"
   local idle_app_dir="${HOME}/.local/share/uconsole-helper-idle"
@@ -226,17 +243,19 @@ install_mapper() {
   install -m 0755 "${APP_DIR}/scripts/mapper/generate_desktop_keybinds.py" "${mapper_app_dir}/generate_desktop_keybinds.py"
   install -m 0755 "${APP_DIR}/scripts/mapper/sync_labwc_keybinds.py" "${mapper_app_dir}/sync_labwc_keybinds.py"
   install -m 0755 "${APP_DIR}/scripts/mapper/sync_keyd_default_conf.py" "${mapper_app_dir}/sync_keyd_default_conf.py"
-  install -m 0755 "${APP_DIR}/scripts/mapper/toggle-codex-buddy.sh" "${bin_dir}/toggle-codex-buddy"
+  install -m 0755 "${APP_DIR}/scripts/mapper/toggle-uconsole-helper.sh" "${bin_dir}/toggle-uconsole-helper"
   install -m 0755 "${APP_DIR}/scripts/mapper/toggle-lxterminal.sh" "${bin_dir}/toggle-lxterminal"
   install -m 0755 "${APP_DIR}/scripts/mapper/run-or-raise-chromium.sh" "${bin_dir}/run-or-raise-chromium"
   install -m 0755 "${APP_DIR}/scripts/mapper/run-or-raise-filemanager.sh" "${bin_dir}/run-or-raise-filemanager"
   install -m 0755 "${APP_DIR}/scripts/mapper/run-or-raise-vscode.sh" "${bin_dir}/run-or-raise-vscode"
+  install -m 0755 "${APP_DIR}/scripts/mapper/run-or-raise-wechat.sh" "${bin_dir}/run-or-raise-wechat"
   install -m 0755 "${APP_DIR}/scripts/mapper/run-or-raise-zdesktop.sh" "${bin_dir}/run-or-raise-zdesktop"
   install -m 0755 "${APP_DIR}/scripts/mapper/show-desktop.sh" "${bin_dir}/uconsole-show-desktop"
   install -m 0755 "${APP_DIR}/scripts/mapper/esc-switch-ime-english.sh" "${bin_dir}/esc-switch-ime-english"
   install -m 0755 "${APP_DIR}/scripts/mapper/shift-enter-newline.sh" "${bin_dir}/shift-enter-newline"
   install -m 0755 "${APP_DIR}/scripts/mapper/uconsole-paste.sh" "${bin_dir}/uconsole-paste"
   install -m 0755 "${APP_DIR}/scripts/mapper/uconsole-voice-ptt.sh" "${bin_dir}/uconsole-voice-ptt"
+  install -m 0755 "${APP_DIR}/scripts/mapper/uconsole-voice-stream.py" "${bin_dir}/uconsole-voice-stream"
   install -m 0644 "${APP_DIR}/scripts/mapper/fcitx-uconsole-voice-commit.lua" "${fcitx_lua_dir}/uconsole_voice_commit.lua"
   install -m 0644 "${APP_DIR}/services/user/uconsole-helper-mapper.service" "${systemd_dir}/uconsole-helper-mapper.service"
   install -m 0644 "${APP_DIR}/services/user/uconsole-helper-idle.service" "${systemd_dir}/uconsole-helper-idle.service"
@@ -269,6 +288,7 @@ install_mapper() {
 
   "${python_bin}" "${mapper_app_dir}/generate_desktop_keybinds.py" --config "${config_dir}/desktop-keybinds.toml"
   "${python_bin}" "${mapper_app_dir}/sync_labwc_keybinds.py"
+  disable_legacy_labwc_idle
   if command -v labwc >/dev/null 2>&1; then
     labwc --reconfigure >/dev/null 2>&1 || true
   fi

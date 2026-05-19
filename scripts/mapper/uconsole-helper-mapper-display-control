@@ -31,10 +31,10 @@ def write_text(path: Path, value: str) -> None:
 def set_display(on: bool) -> None:
     drm_status = find_drm_panel_status()
     if on:
-        write_text(FRAMEBUFFER_BLANK, "0")
-        write_text(BACKLIGHT_POWER, "0")
         if drm_status is not None:
             write_text(drm_status, "detect")
+        write_text(FRAMEBUFFER_BLANK, "0")
+        write_text(BACKLIGHT_POWER, "0")
     else:
         if drm_status is not None:
             write_text(drm_status, "off")

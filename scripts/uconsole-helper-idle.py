@@ -17,6 +17,28 @@ DISPLAY_CONTROL = "/usr/local/bin/uconsole-helper-mapper-display-control"
 POLL_SECONDS = 2
 
 
+def run_display_control(action: str) -> subprocess.CompletedProcess[str] | None:
+    try:
+        return subprocess.run(
+            ["sudo", "-n", DISPLAY_CONTROL, action],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"warning: display-control {action} failed: {exc}", flush=True)
+        return None
+
+
+def display_is_off() -> bool:
+    result = run_display_control("status")
+    if result is None or result.returncode != 0:
+        return False
+    return result.stdout.strip() == "off"
+
+
 def load_config(path: Path = CONFIG_FILE) -> dict[str, str]:
     values: dict[str, str] = {}
     if not path.exists():
@@ -150,8 +172,11 @@ def main() -> int:
         state = power_state(Path(values.get("POWERSAVER_POWER_SUPPLY_DIR", str(POWER_SUPPLY_DIR))))
         timeout_sec = timeout_for_state(values, state)
         if timeout_sec != active_timeout or (process is not None and process.poll() is not None):
+            was_display_off = display_is_off()
             stop_process(process)
             process = start_swayidle(timeout_sec)
+            if was_display_off:
+                run_display_control("off")
             active_timeout = timeout_sec
         time.sleep(POLL_SECONDS)
 
