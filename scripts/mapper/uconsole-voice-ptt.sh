@@ -21,24 +21,21 @@ Configuration is read from:
   ~/.config/uconsole-helper-mapper/voice.env
 
 Supported variables:
-  WHISPER_URL            required, whisper endpoint
-  WHISPER_LANGUAGE       optional multipart field
-  WHISPER_AUTH_TOKEN     required for FlashAI ASR, bearer token with asr:transcribe and asr:learn
-  WHISPER_FINALIZE_URL   optional finalize endpoint; defaults from WHISPER_URL
-  WHISPER_PROMPT         optional short ASR prompt hint
-  WHISPER_PROMPT_FIELD   multipart field for ASR prompt, default: prompt
-  WHISPER_PROMPT_GLOSSARY_FIELD
+  ASR_URL            required, ASR endpoint
+  ASR_LANGUAGE       optional multipart field
+  ASR_AUTH_TOKEN     required for FlashAI ASR, bearer token with asr:transcribe and asr:learn
+  ASR_FINALIZE_URL   optional finalize endpoint; defaults from ASR_URL
+  ASR_PROMPT         optional short ASR prompt hint
+  ASR_PROMPT_FIELD   multipart field for ASR prompt, default: prompt
+  ASR_PROMPT_GLOSSARY_FIELD
                          multipart field for prompt glossary JSON, default: promptGlossary
   VOICE_GLOSSARY_FILE    glossary file path, one term per line; default:
                          ~/.config/uconsole-helper-mapper/voice-glossary.txt
-  WHISPER_CONTEXT_FIELD  multipart field for tmux context, default: contextText
-  WHISPER_CORRECTION_MODE
+  ASR_CONTEXT_FIELD  multipart field for tmux context, default: contextText
+  ASR_CORRECTION_MODE
                          off | on | auto, default: auto
-  WHISPER_ENABLE_CORRECTION
-                         legacy compatibility only; 1 maps to correctionMode=on, 0 maps to off
-  WHISPER_TEXT_JQ        jq expression, default: .data.text // .text // .result.text // empty
-  WHISPER_NO_PROXY       1 disables proxy for whisper requests, default: 1
-  WHISPER_TIMEOUT        ASR request timeout in seconds, default: 60; 0 disables
+  ASR_NO_PROXY       1 disables proxy for ASR requests, default: 1
+  ASR_TIMEOUT        ASR request timeout in seconds, default: 60; 0 disables
   VOICE_OUTPUT_MODE      type | type_enter | clipboard | paste | fcitx_commit, default: type
   VOICE_TMUX_OUTPUT_MODE output mode used when a tmux/terminal window is focused, default: type
   VOICE_WECHAT_OUTPUT_MODE
@@ -60,6 +57,18 @@ Supported variables:
   VOICE_CHANNELS         default: 1
   VOICE_STATE_DIR        default: ${XDG_STATE_HOME:-~/.local/state}/uconsole-helper-mapper
   VOICE_KEEP_AUDIO       1 keeps recorded audio after stop, default: 0
+  VOICE_STREAM_PREVIEW   1 shows a WeChat-style recognition preview popup, default: 1
+  VOICE_NOTIFY_WHILE_PREVIEW
+                        1 keeps the system recording notification even when preview is enabled, default: 0
+  VOICE_STREAM_SEND_INTERVAL_MS
+                        local recorder read interval, default: 250
+  VOICE_PAUSE_SEGMENT_MS
+                        silence duration before automatic final-ASR upload, default: 1600
+  VOICE_MIN_SEGMENT_MS   minimum auto-upload segment duration, default: 1000
+  VOICE_AUTO_SEGMENT_RMS_THRESHOLD
+                        initial local speech RMS threshold, default: 0.006
+  VOICE_AUTO_SEGMENT_NOISE_MARGIN
+                        local speech threshold margin over noise floor, default: 0.004
   VOICE_NOTIFY_USE_MARKUP
                          1 enables Pango markup for notifications, default: 0
   VOICE_NOTIFY_FONT_SIZE notification font size when markup is enabled, default: 22
@@ -275,7 +284,7 @@ fcitx_commit_text() {
 run_whisper_curl() {
   local -a args=("$@")
 
-  if [[ "${WHISPER_NO_PROXY}" == "1" ]]; then
+  if [[ "${ASR_NO_PROXY}" == "1" ]]; then
     env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
       -u http_proxy -u https_proxy -u all_proxy \
       curl --noproxy '*' "${args[@]}"
@@ -300,13 +309,13 @@ normalize_learn_text() {
 derive_asr_finalize_url() {
   local request_id=$1
   [[ -n "${request_id}" ]] || return 1
-  if [[ -n "${WHISPER_FINALIZE_URL}" ]]; then
-    printf '%s\n' "${WHISPER_FINALIZE_URL//\{requestId\}/${request_id}}"
+  if [[ -n "${ASR_FINALIZE_URL}" ]]; then
+    printf '%s\n' "${ASR_FINALIZE_URL//\{requestId\}/${request_id}}"
     return 0
   fi
-  case "${WHISPER_URL}" in
+  case "${ASR_URL}" in
     */api/asr/transcriptions)
-      printf '%s\n' "${WHISPER_URL%/api/asr/transcriptions}/api/asr/transcription-events/${request_id}/finalize"
+      printf '%s\n' "${ASR_URL%/api/asr/transcriptions}/api/asr/transcription-events/${request_id}/finalize"
       ;;
     *)
       return 1
@@ -363,6 +372,29 @@ choose_recorder() {
   esac
 
   echo "no supported recorder found; install pw-record, ffmpeg, or arecord" >&2
+  return 1
+}
+
+resolve_stream_client() {
+  local script_dir
+  script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+  local candidate
+  for candidate in \
+    "${script_dir}/uconsole-voice-stream" \
+    "${script_dir}/uconsole-voice-stream.py" \
+    "${HOME}/.local/bin/uconsole-voice-stream" \
+    "${HOME}/.local/bin/uconsole-voice-stream.py"
+  do
+    if [[ -x "${candidate}" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+  if command -v uconsole-voice-stream >/dev/null 2>&1; then
+    command -v uconsole-voice-stream
+    return 0
+  fi
+  echo "uconsole-voice-stream is required" >&2
   return 1
 }
 
@@ -491,8 +523,8 @@ capture_tmux_window_context() {
 }
 
 build_whisper_prompt() {
-  [[ -n "${WHISPER_PROMPT}" ]] || return 1
-  printf '%s\n' "${WHISPER_PROMPT}"
+  [[ -n "${ASR_PROMPT}" ]] || return 1
+  printf '%s\n' "${ASR_PROMPT}"
 }
 
 build_prompt_glossary_json() {
@@ -600,56 +632,63 @@ start_recording() {
     rm -f "${STATE_FILE}"
   fi
 
-  local recorder
-  recorder=$(choose_recorder)
-  local audio_file
-  audio_file=$(mktemp "${VOICE_STATE_DIR}/voice-XXXXXX.wav")
+  if [[ -z "${ASR_URL}" ]]; then
+    echo "ASR_URL is required" >&2
+    show_status "uconsole voice" "未配置 ASR Endpoint" "0" "1200"
+    exit 1
+  fi
+  if [[ -z "${ASR_AUTH_TOKEN}" ]]; then
+    echo "ASR_AUTH_TOKEN is required for FlashAI ASR" >&2
+    show_status "uconsole voice" "未配置 ASR Token" "0" "1200"
+    exit 1
+  fi
+  local context_text prompt_glossary_json
+  context_text=$(build_whisper_context || true)
+  prompt_glossary_json=$(build_prompt_glossary_json || true)
 
-  case "${recorder}" in
-    pw-record)
-      local -a pw_record_args=(
-        --rate "${VOICE_SAMPLE_RATE}"
-        --channels "${VOICE_CHANNELS}"
-      )
-      if [[ "${VOICE_INPUT}" != "default" ]]; then
-        pw_record_args+=(--target "${VOICE_INPUT}")
-      fi
-      setsid pw-record \
-        "${pw_record_args[@]}" \
-        "${audio_file}" >/dev/null 2>&1 &
-      ;;
-    ffmpeg)
-      setsid ffmpeg \
-        -hide_banner \
-        -loglevel error \
-        -y \
-        -f pulse \
-        -i "${VOICE_INPUT}" \
-        -ac "${VOICE_CHANNELS}" \
-        -ar "${VOICE_SAMPLE_RATE}" \
-        "${audio_file}" >/dev/null 2>&1 &
-      ;;
-    arecord)
-      local -a arecord_args=(
-        -q
-        -f S16_LE
-        -r "${VOICE_SAMPLE_RATE}"
-        -c "${VOICE_CHANNELS}"
-      )
-      if [[ "${VOICE_INPUT}" != "default" ]]; then
-        arecord_args+=(-D "${VOICE_INPUT}")
-      fi
-      setsid arecord \
-        "${arecord_args[@]}" \
-        "${audio_file}" >/dev/null 2>&1 &
-      ;;
-  esac
+  local stream_client stream_result_file stream_stop_file stream_log_file
+  stream_client=$(resolve_stream_client)
+  stream_result_file=$(mktemp "${VOICE_STATE_DIR}/voice-stream-XXXXXX.json")
+  stream_stop_file=$(mktemp "${VOICE_STATE_DIR}/voice-stream-stop-XXXXXX.flag")
+  rm -f "${stream_stop_file}" "${stream_result_file}"
+  stream_log_file="${VOICE_STATE_DIR}/voice-ptt.log"
+
+  STREAM_RESULT_FILE="${stream_result_file}" \
+    STREAM_STOP_FILE="${stream_stop_file}" \
+    VOICE_STREAM_LOG_FILE="${stream_log_file}" \
+    ASR_URL="${ASR_URL}" \
+    ASR_LANGUAGE="${ASR_LANGUAGE}" \
+    ASR_AUTH_TOKEN="${ASR_AUTH_TOKEN}" \
+    ASR_TIMEOUT="${ASR_TIMEOUT}" \
+    ASR_PROMPT="${ASR_PROMPT}" \
+    ASR_PROMPT_FIELD="${ASR_PROMPT_FIELD}" \
+    ASR_PROMPT_GLOSSARY="${prompt_glossary_json}" \
+    ASR_PROMPT_GLOSSARY_FIELD="${ASR_PROMPT_GLOSSARY_FIELD}" \
+    ASR_CONTEXT_TEXT="${context_text}" \
+    ASR_CONTEXT_FIELD="${ASR_CONTEXT_FIELD}" \
+    ASR_CORRECTION_MODE="${ASR_CORRECTION_MODE}" \
+    VOICE_RECORDER="${VOICE_RECORDER}" \
+    VOICE_INPUT="${VOICE_INPUT}" \
+    VOICE_SAMPLE_RATE="${VOICE_SAMPLE_RATE}" \
+    VOICE_CHANNELS="${VOICE_CHANNELS}" \
+    VOICE_STATE_DIR="${VOICE_STATE_DIR}" \
+    VOICE_KEEP_AUDIO="${VOICE_KEEP_AUDIO}" \
+    VOICE_NOTIFY_ID="${VOICE_NOTIFY_ID}" \
+    VOICE_STREAM_PREVIEW="${VOICE_STREAM_PREVIEW}" \
+    VOICE_STREAM_SEND_INTERVAL_MS="${VOICE_STREAM_SEND_INTERVAL_MS}" \
+    VOICE_PAUSE_SEGMENT_MS="${VOICE_PAUSE_SEGMENT_MS}" \
+    VOICE_MIN_SEGMENT_MS="${VOICE_MIN_SEGMENT_MS}" \
+    VOICE_AUTO_SEGMENT_RMS_THRESHOLD="${VOICE_AUTO_SEGMENT_RMS_THRESHOLD}" \
+    VOICE_AUTO_SEGMENT_NOISE_MARGIN="${VOICE_AUTO_SEGMENT_NOISE_MARGIN}" \
+    setsid "${stream_client}" >/dev/null 2>&1 &
 
   local recorder_pid=$!
   cat >"${STATE_FILE}" <<EOF
 RECORDER_PID=${recorder_pid}
-AUDIO_FILE=$(printf '%q' "${audio_file}")
-RECORDER_NAME=${recorder}
+STREAM_PID=${recorder_pid}
+STREAM_RESULT_FILE=$(printf '%q' "${stream_result_file}")
+STREAM_STOP_FILE=$(printf '%q' "${stream_stop_file}")
+RECORDER_NAME=stream
 STARTED_AT_MS=$(date +%s%3N)
 EOF
 
@@ -675,6 +714,39 @@ EOF
   fi
 
   show_recording_status
+}
+
+record_stream_asr_event() {
+  local request_id=$1
+  local text=$2
+  local correction_mode=$3
+  [[ -n "${request_id}" && -n "${text}" ]] || return 0
+  [[ -n "${ASR_URL}" ]] || return 0
+  [[ -n "${ASR_AUTH_TOKEN}" ]] || return 0
+
+  local event_url
+  case "${ASR_URL}" in
+    */api/asr/transcriptions)
+      event_url="${ASR_URL%/api/asr/transcriptions}/api/asr/transcription-events"
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+
+  run_whisper_curl \
+    -fsS \
+    --max-time "${ASR_TIMEOUT}" \
+    -X POST \
+    -H "Authorization: Bearer ${ASR_AUTH_TOKEN}" \
+    -H "Content-Type: application/json" \
+    --data "$(jq -n \
+      --arg requestId "${request_id}" \
+      --arg rawText "${text}" \
+      --arg insertedText "${text}" \
+      --arg correctionMode "${correction_mode:-off}" \
+      '{requestId:$requestId, rawText:$rawText, insertedText:$insertedText, correctedText:"", correctionMode:$correctionMode, correctionApplied:false}')" \
+    "${event_url}" >/dev/null 2>&1 || true
 }
 
 inject_text() {
@@ -750,7 +822,7 @@ stop_recording() {
     kill "${WATCHDOG_PID}" >/dev/null 2>&1 || true
   fi
 
-  if [[ -z "${RECORDER_PID:-}" || -z "${AUDIO_FILE:-}" ]]; then
+  if [[ -z "${RECORDER_PID:-}" ]]; then
     echo "state file is incomplete" >&2
     exit 1
   fi
@@ -762,11 +834,17 @@ stop_recording() {
     duration_ms=$((stopped_at_ms - STARTED_AT_MS))
   fi
 
+  if [[ -n "${STREAM_STOP_FILE:-}" ]]; then
+    : >"${STREAM_STOP_FILE}" || true
+  fi
   if kill -0 "${RECORDER_PID}" >/dev/null 2>&1; then
-    kill -INT "${RECORDER_PID}" >/dev/null 2>&1 || true
-    if ! wait_for_exit "${RECORDER_PID}" 30; then
-      kill -TERM "${RECORDER_PID}" >/dev/null 2>&1 || true
+    if ! wait_for_exit "${RECORDER_PID}" 120; then
+      kill -INT "${RECORDER_PID}" >/dev/null 2>&1 || true
       wait_for_exit "${RECORDER_PID}" 20 || true
+    fi
+    if kill -0 "${RECORDER_PID}" >/dev/null 2>&1; then
+      kill -TERM "${RECORDER_PID}" >/dev/null 2>&1 || true
+      wait_for_exit "${RECORDER_PID}" 10 || true
     fi
   fi
 
@@ -778,112 +856,52 @@ stop_recording() {
     if [[ "${suppress_asr_status}" != "1" ]]; then
       show_status "uconsole voice" "录音太短，已取消" "0" "800"
     fi
-    [[ "${VOICE_KEEP_AUDIO}" == "1" ]] || rm -f "${AUDIO_FILE}"
+    rm -f "${STREAM_RESULT_FILE:-}" "${STREAM_STOP_FILE:-}"
     exit 0
   fi
 
-  if [[ ! -s "${AUDIO_FILE}" ]]; then
-    echo "recorded audio is empty" >&2
+  if [[ ! -s "${STREAM_RESULT_FILE:-}" ]]; then
+    echo "ASR result is empty" >&2
     if [[ "${suppress_asr_status}" != "1" ]]; then
-      show_status "uconsole voice" "录音失败" "0" "1000"
+      show_status "uconsole voice" "语音识别失败" "0" "1000"
     fi
-    [[ "${VOICE_KEEP_AUDIO}" == "1" ]] || rm -f "${AUDIO_FILE}"
+    rm -f "${STREAM_RESULT_FILE:-}" "${STREAM_STOP_FILE:-}"
     exit 1
   fi
 
-  if [[ -z "${WHISPER_URL}" ]]; then
-    echo "WHISPER_URL is required" >&2
-    if [[ "${suppress_asr_status}" != "1" ]]; then
-      show_status "uconsole voice" "未配置 WHISPER_URL" "0" "1200"
-    fi
-    exit 1
-  fi
-
-  if [[ -z "${WHISPER_AUTH_TOKEN}" ]]; then
-    echo "WHISPER_AUTH_TOKEN is required for FlashAI ASR" >&2
-    if [[ "${suppress_asr_status}" != "1" ]]; then
-      show_status "uconsole voice" "未配置 ASR Token" "0" "1200"
-    fi
-    exit 1
-  fi
-
-  command -v curl >/dev/null 2>&1 || {
-    echo "curl is required" >&2
-    exit 1
-  }
   command -v jq >/dev/null 2>&1 || {
     echo "jq is required" >&2
     exit 1
   }
 
-  local response_file
-  response_file=$(mktemp "${VOICE_STATE_DIR}/whisper-XXXXXX.json")
-
-  local prompt_text=
-  local prompt_glossary_json=
   local context_text=
-  local correction_mode=
+  local correction_mode=${ASR_CORRECTION_MODE}
   local before_pane_text=
   before_pane_text=$(capture_tmux_pane_text_for_learn "$(current_tmux_target_json 2>/dev/null | jq -r '.paneId // empty' 2>/dev/null || true)" || true)
-  local -a curl_args=(
-    -fsS
-    --max-time "${WHISPER_TIMEOUT}"
-    -X POST
-    "${WHISPER_URL}"
-    -F "file=@${AUDIO_FILE}"
-  )
-  curl_args+=(-H "Authorization: Bearer ${WHISPER_AUTH_TOKEN}")
-  if [[ -n "${WHISPER_LANGUAGE}" ]]; then
-    curl_args+=(-F "language=${WHISPER_LANGUAGE}")
-  fi
-  prompt_text=$(build_whisper_prompt || true)
-  if [[ -n "${prompt_text}" ]]; then
-    curl_args+=(--form-string "${WHISPER_PROMPT_FIELD}=${prompt_text}")
-  fi
-  prompt_glossary_json=$(build_prompt_glossary_json || true)
-  if [[ -n "${prompt_glossary_json}" ]]; then
-    curl_args+=(--form-string "${WHISPER_PROMPT_GLOSSARY_FIELD}=${prompt_glossary_json}")
-  fi
   context_text=$(build_whisper_context || true)
-  if [[ -n "${context_text}" ]]; then
-    curl_args+=(--form-string "${WHISPER_CONTEXT_FIELD}=${context_text}")
-  fi
-  correction_mode=${WHISPER_CORRECTION_MODE}
-  if [[ -n "${correction_mode}" ]]; then
-    curl_args+=(-F "correctionMode=${correction_mode}")
-  elif [[ "${WHISPER_ENABLE_CORRECTION}" == "1" ]]; then
-    curl_args+=(-F "enableCorrection=true")
-  fi
-  if [[ "${suppress_asr_status}" != "1" ]]; then
-    show_status "uconsole voice" "识别中..." "65" "0"
-  fi
-  local curl_status=0
-  run_whisper_curl "${curl_args[@]}" >"${response_file}" || curl_status=$?
-  if (( curl_status != 0 )); then
+
+  local stream_status stream_error
+  stream_status=$(jq -r '.status // empty' "${STREAM_RESULT_FILE}")
+  stream_error=$(jq -r '.error // empty' "${STREAM_RESULT_FILE}")
+  if [[ "${stream_status}" == "error" ]]; then
     if [[ "${suppress_asr_status}" != "1" ]]; then
-      if (( curl_status == 28 )); then
-        show_status "uconsole voice" "识别超时" "0" "1200"
-      else
-        show_status "uconsole voice" "Whisper 请求失败" "0" "1200"
-      fi
+      show_status "uconsole voice" "${stream_error:-语音识别失败}" "0" "1200"
     fi
-    rm -f "${response_file}"
-    [[ "${VOICE_KEEP_AUDIO}" == "1" ]] || rm -f "${AUDIO_FILE}"
+    rm -f "${STREAM_RESULT_FILE:-}" "${STREAM_STOP_FILE:-}"
     exit 1
   fi
 
   local text request_id raw_text corrected_text
-  text=$(jq -r "${WHISPER_TEXT_JQ}" "${response_file}" | normalize_transcript)
-  request_id=$(jq -r '.data.requestId // .requestId // empty' "${response_file}" | normalize_transcript)
-  raw_text=$(jq -r '.data.rawText // .rawText // empty' "${response_file}" | normalize_transcript)
-  corrected_text=$(jq -r '.data.correctedText // .correctedText // empty' "${response_file}" | normalize_transcript)
-  rm -f "${response_file}"
+  text=$(jq -r '.text // empty' "${STREAM_RESULT_FILE}" | normalize_transcript)
+  request_id=$(jq -r '.requestId // empty' "${STREAM_RESULT_FILE}" | normalize_transcript)
+  raw_text=$(jq -r '.rawText // .text // empty' "${STREAM_RESULT_FILE}" | normalize_transcript)
+  corrected_text=$(jq -r '.correctedText // empty' "${STREAM_RESULT_FILE}" | normalize_transcript)
 
   if [[ -z "${text}" ]]; then
     if [[ "${suppress_asr_status}" != "1" ]]; then
       show_status "uconsole voice" "未识别到文本" "0" "1000"
     fi
-    [[ "${VOICE_KEEP_AUDIO}" == "1" ]] || rm -f "${AUDIO_FILE}"
+    rm -f "${STREAM_RESULT_FILE:-}" "${STREAM_STOP_FILE:-}"
     exit 1
   fi
 
@@ -891,13 +909,14 @@ stop_recording() {
     if [[ "${suppress_asr_status}" != "1" ]]; then
       show_status "uconsole voice" "文本注入失败" "0" "1200"
     fi
-    [[ "${VOICE_KEEP_AUDIO}" == "1" ]] || rm -f "${AUDIO_FILE}"
+    rm -f "${STREAM_RESULT_FILE:-}" "${STREAM_STOP_FILE:-}"
     exit 1
   fi
 
   local after_pane_text=
   after_pane_text=$(capture_tmux_pane_text_for_learn "$(current_tmux_target_json 2>/dev/null | jq -r '.paneId // empty' 2>/dev/null || true)" || true)
   if [[ -n "${request_id}" ]]; then
+    record_stream_asr_event "${request_id}" "${text}" "${correction_mode}"
     save_last_asr_state "${request_id}" "${text}" "${raw_text}" "${corrected_text}" "${before_pane_text}" "${after_pane_text}"
   else
     log_ptt "skip save_last_asr_state: ASR response missing requestId insertedChars=${#text}"
@@ -906,7 +925,7 @@ stop_recording() {
   if [[ "${suppress_asr_status}" != "1" ]]; then
     close_status
   fi
-  [[ "${VOICE_KEEP_AUDIO}" == "1" ]] || rm -f "${AUDIO_FILE}"
+  rm -f "${STREAM_RESULT_FILE:-}" "${STREAM_STOP_FILE:-}"
 }
 
 open_asr_correction_editor() {
@@ -979,7 +998,7 @@ learn_last_asr() {
   fi
   command -v jq >/dev/null 2>&1 || { echo "jq is required" >&2; exit 1; }
   command -v curl >/dev/null 2>&1 || { echo "curl is required" >&2; exit 1; }
-  if [[ -z "${WHISPER_AUTH_TOKEN}" ]]; then
+  if [[ -z "${ASR_AUTH_TOKEN}" ]]; then
     show_status "uconsole voice" "未配置 ASR Token" "0" "1200"
     exit 1
   fi
@@ -1036,9 +1055,9 @@ PYCHECK
   fi
   run_whisper_curl \
     -fsS \
-    --max-time "${WHISPER_TIMEOUT}" \
+    --max-time "${ASR_TIMEOUT}" \
     -X POST \
-    -H "Authorization: Bearer ${WHISPER_AUTH_TOKEN}" \
+    -H "Authorization: Bearer ${ASR_AUTH_TOKEN}" \
     -H "Content-Type: application/json" \
     --data "$(jq -n --arg finalText "${final_text}" '{finalText: $finalText}')" \
     "${finalize_url}" >/dev/null
@@ -1066,6 +1085,9 @@ cancel_recording() {
   source "${STATE_FILE}"
   rm -f "${STATE_FILE}"
 
+  if [[ -n "${STREAM_STOP_FILE:-}" ]]; then
+    : >"${STREAM_STOP_FILE}" || true
+  fi
   if [[ -n "${RECORDER_PID:-}" ]] && kill -0 "${RECORDER_PID}" >/dev/null 2>&1; then
     kill -INT "${RECORDER_PID}" >/dev/null 2>&1 || true
     if ! wait_for_exit "${RECORDER_PID}" 20; then
@@ -1074,9 +1096,7 @@ cancel_recording() {
     fi
   fi
 
-  if [[ -n "${AUDIO_FILE:-}" && "${VOICE_KEEP_AUDIO}" != "1" ]]; then
-    rm -f "${AUDIO_FILE}"
-  fi
+  rm -f "${STREAM_RESULT_FILE:-}" "${STREAM_STOP_FILE:-}"
   show_status "uconsole voice" "${message}" "0" "800"
 }
 
@@ -1111,6 +1131,10 @@ VOICE_PASTE_DELAY=${VOICE_PASTE_DELAY:-0.08}
 VOICE_FCITX_COMMIT_FILE=${VOICE_FCITX_COMMIT_FILE:-"${VOICE_STATE_DIR}/fcitx-voice-commit.txt"}
 VOICE_FCITX_COMMIT_TRIGGER=${VOICE_FCITX_COMMIT_TRIGGER:-";uv"}
 VOICE_KEEP_AUDIO=${VOICE_KEEP_AUDIO:-0}
+VOICE_PAUSE_SEGMENT_MS=${VOICE_PAUSE_SEGMENT_MS:-1600}
+VOICE_MIN_SEGMENT_MS=${VOICE_MIN_SEGMENT_MS:-1000}
+VOICE_AUTO_SEGMENT_RMS_THRESHOLD=${VOICE_AUTO_SEGMENT_RMS_THRESHOLD:-0.006}
+VOICE_AUTO_SEGMENT_NOISE_MARGIN=${VOICE_AUTO_SEGMENT_NOISE_MARGIN:-0.004}
 VOICE_NOTIFY_ID=${VOICE_NOTIFY_ID:-991199}
 VOICE_NOTIFY_USE_MARKUP=${VOICE_NOTIFY_USE_MARKUP:-0}
 VOICE_NOTIFY_FONT_SIZE=${VOICE_NOTIFY_FONT_SIZE:-22}
@@ -1120,28 +1144,23 @@ VOICE_TMUX_CONTEXT=${VOICE_TMUX_CONTEXT:-1}
 VOICE_TMUX_CONTEXT_LINES=${VOICE_TMUX_CONTEXT_LINES:-30}
 VOICE_TMUX_CONTEXT_MAX_CHARS=${VOICE_TMUX_CONTEXT_MAX_CHARS:-1200}
 WLRCTL=${WLRCTL:-"${HOME}/.local/bin/wlrctl"}
-WHISPER_URL=${WHISPER_URL:-}
-WHISPER_LANGUAGE=${WHISPER_LANGUAGE:-}
-WHISPER_AUTH_TOKEN=${WHISPER_AUTH_TOKEN:-}
-WHISPER_PROMPT=${WHISPER_PROMPT:-}
-WHISPER_PROMPT_FIELD=${WHISPER_PROMPT_FIELD:-prompt}
-WHISPER_PROMPT_GLOSSARY_FIELD=${WHISPER_PROMPT_GLOSSARY_FIELD:-promptGlossary}
-WHISPER_CONTEXT_FIELD=${WHISPER_CONTEXT_FIELD:-contextText}
-WHISPER_FINALIZE_URL=${WHISPER_FINALIZE_URL:-}
-WHISPER_ENABLE_CORRECTION=${WHISPER_ENABLE_CORRECTION:-}
-WHISPER_CORRECTION_MODE=${WHISPER_CORRECTION_MODE:-}
-if [[ -z "${WHISPER_CORRECTION_MODE}" ]]; then
-  if [[ "${WHISPER_ENABLE_CORRECTION}" == "1" ]]; then
-    WHISPER_CORRECTION_MODE=on
-  elif [[ "${WHISPER_ENABLE_CORRECTION}" == "0" ]]; then
-    WHISPER_CORRECTION_MODE=off
-  else
-    WHISPER_CORRECTION_MODE=auto
-  fi
+ASR_URL=${ASR_URL:-}
+ASR_LANGUAGE=${ASR_LANGUAGE:-}
+ASR_AUTH_TOKEN=${ASR_AUTH_TOKEN:-}
+ASR_PROMPT=${ASR_PROMPT:-}
+ASR_PROMPT_FIELD=${ASR_PROMPT_FIELD:-prompt}
+ASR_PROMPT_GLOSSARY_FIELD=${ASR_PROMPT_GLOSSARY_FIELD:-promptGlossary}
+ASR_CONTEXT_FIELD=${ASR_CONTEXT_FIELD:-contextText}
+ASR_FINALIZE_URL=${ASR_FINALIZE_URL:-}
+ASR_CORRECTION_MODE=${ASR_CORRECTION_MODE:-}
+if [[ -z "${ASR_CORRECTION_MODE}" ]]; then
+  ASR_CORRECTION_MODE=auto
 fi
-WHISPER_TEXT_JQ=${WHISPER_TEXT_JQ:-'.data.text // .text // .result.text // empty'}
-WHISPER_NO_PROXY=${WHISPER_NO_PROXY:-1}
-WHISPER_TIMEOUT=${WHISPER_TIMEOUT:-60}
+ASR_NO_PROXY=${ASR_NO_PROXY:-1}
+ASR_TIMEOUT=${ASR_TIMEOUT:-60}
+VOICE_STREAM_PREVIEW=${VOICE_STREAM_PREVIEW:-1}
+VOICE_NOTIFY_WHILE_PREVIEW=${VOICE_NOTIFY_WHILE_PREVIEW:-0}
+VOICE_STREAM_SEND_INTERVAL_MS=${VOICE_STREAM_SEND_INTERVAL_MS:-250}
 VOICE_LEARN_MAX_AGE_SECONDS=${VOICE_LEARN_MAX_AGE_SECONDS:-600}
 VOICE_LEARN_MAX_EDIT_RATIO=${VOICE_LEARN_MAX_EDIT_RATIO:-0.38}
 VOICE_LEARN_CAPTURE_LINES=${VOICE_LEARN_CAPTURE_LINES:-120}

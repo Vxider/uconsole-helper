@@ -248,8 +248,8 @@ The ASR tab edits the voice push-to-talk configuration used by
 ```
 
 The tab covers the frequently changed ASR settings: endpoint, token, language,
-correction mode, recorder, input device, output mode, tmux output mode, paste
-backend, and glossary terms.
+correction mode, recorder, input device, output mode, tmux output mode, pause
+threshold, paste backend, and glossary terms.
 
 ## Debug Interface Detection
 
