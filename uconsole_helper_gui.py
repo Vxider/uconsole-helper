@@ -992,7 +992,14 @@ class UConsoleHelperWindow(Gtk.Window):
         )
 
     def set_tab(self, name: str) -> None:
+        current = self.stack.get_visible_child_name()
+        if current == name:
+            return
+        entering_power = name == "power"
+        if entering_power:
+            self.reset_app_power_ranking()
         self.stack.set_visible_child_name(name)
+        self.refresh_page(name)
 
     def update_header(self) -> None:
         page = self.stack.get_visible_child_name() or "dashboard"
@@ -1134,8 +1141,10 @@ class UConsoleHelperWindow(Gtk.Window):
             self.start_lan_scan()
 
     def run_refresh_action(self) -> None:
-        page = self.stack.get_visible_child_name()
-        refreshed = True
+        if self.refresh_page(self.stack.get_visible_child_name()):
+            self.flash_header_button(self.header_refresh_button, "Refreshed", "R")
+
+    def refresh_page(self, page: str | None) -> bool:
         if page == "dashboard":
             self.refresh_dashboard()
         elif page in {"dhcp", "lanscan"}:
@@ -1153,9 +1162,8 @@ class UConsoleHelperWindow(Gtk.Window):
         elif page == "asr":
             self.load_asr_config_controls()
         else:
-            refreshed = False
-        if refreshed:
-            self.flash_header_button(self.header_refresh_button, "Refreshed", "R")
+            return False
+        return True
 
     def flash_header_button(self, button: Gtk.Button, text: str, key: str) -> None:
         context = button.get_style_context()
@@ -1501,17 +1509,52 @@ class UConsoleHelperWindow(Gtk.Window):
             else:
                 label.set_text(str(item or "-"))
 
-    def auto_refresh_dashboard(self) -> bool:
-        if self.stack.get_visible_child_name() == "dashboard":
-            self.refresh_dashboard()
+    def auto_refresh_visible_status(self) -> bool:
+        self.refresh_page(self.stack.get_visible_child_name())
         return True
 
     def refresh_power_status(self) -> None:
         status = power_status()
         for key, label in self.power_labels.items():
             label.set_text(status.get(key, "-"))
+        self.refresh_app_power_ranking()
         self.load_power_policy_controls()
         self.update_header()
+
+    def refresh_app_power_ranking(self) -> None:
+        now = time.monotonic()
+        current = process_power_samples()
+        if not self.app_power_previous or self.app_power_previous_time <= 0:
+            self.app_power_previous = current
+            self.app_power_previous_time = now
+            self.app_power_store.clear()
+            self.app_power_store.append(["Collecting sample...", "-", "-", "-", "-"])
+            return
+
+        elapsed = max(0.1, now - self.app_power_previous_time)
+        rows = app_power_rows(self.app_power_previous, current, elapsed)
+        self.app_power_previous = current
+        self.app_power_previous_time = now
+        self.app_power_store.clear()
+        if not rows:
+            self.app_power_store.append(["No active apps", "-", "-", "-", "-"])
+            return
+        for row in rows[:5]:
+            self.app_power_store.append(
+                [
+                    str(row["name"]),
+                    str(row["pid"]),
+                    f"{row['cpu']:.1f}%",
+                    format_bytes_per_second(row["io_rate"]),
+                    f"{row['score']:.0f}",
+                ]
+            )
+
+    def reset_app_power_ranking(self) -> None:
+        self.app_power_previous = {}
+        self.app_power_previous_time = 0.0
+        self.app_power_store.clear()
+        self.app_power_store.append(["Collecting sample...", "-", "-", "-", "-"])
 
     def refresh_utils_status(self) -> None:
         capacity = battery_capacity_percent()
@@ -1553,6 +1596,11 @@ class UConsoleHelperWindow(Gtk.Window):
                 set_combo_text(widget, value)
             elif isinstance(widget, Gtk.ComboBox):
                 set_combo_model_text(widget, value)
+            elif isinstance(widget, Gtk.SpinButton):
+                try:
+                    widget.set_value(float(value))
+                except ValueError:
+                    pass
             elif isinstance(widget, Gtk.Switch):
                 widget.set_active(value.lower() in {"1", "yes", "true", "on", "enabled"})
         self.sync_asr_tmux_context_state()
@@ -1574,9 +1622,9 @@ class UConsoleHelperWindow(Gtk.Window):
                 values[key] = widget_text(widget)
         if values["VOICE_INPUT"] == "Default":
             values["VOICE_INPUT"] = "default"
-        if values["WHISPER_CORRECTION_MODE"] == "off":
+        if values["ASR_CORRECTION_MODE"] == "off":
             values["VOICE_TMUX_CONTEXT"] = "0"
-        if not values["WHISPER_URL"]:
+        if not values["ASR_URL"]:
             self.show_error("ASR config error", "Endpoint is required.")
             return False
         try:
@@ -1593,7 +1641,7 @@ class UConsoleHelperWindow(Gtk.Window):
         return True
 
     def sync_asr_tmux_context_state(self) -> None:
-        correction = widget_text(self.asr_controls.get("WHISPER_CORRECTION_MODE"))
+        correction = widget_text(self.asr_controls.get("ASR_CORRECTION_MODE"))
         tmux_context = self.asr_controls.get("VOICE_TMUX_CONTEXT")
         if isinstance(tmux_context, Gtk.Switch):
             disabled = correction == "off"
@@ -2236,6 +2284,8 @@ def widget_text(widget: Gtk.Widget) -> str:
         child = widget.get_child()
         if isinstance(child, Gtk.Entry):
             return child.get_text().strip()
+    if isinstance(widget, Gtk.SpinButton):
+        return str(int(widget.get_value())) if widget.get_digits() == 0 else str(widget.get_value())
     if isinstance(widget, Gtk.ComboBox):
         active = widget.get_active_iter()
         model = widget.get_model()
@@ -3300,6 +3350,115 @@ def cpu_usage_percent(previous: tuple[int, int] | None, current: tuple[int, int]
     return int(max(0, min(100, busy * 100 / total_delta)))
 
 
+def process_power_samples() -> dict[int, dict[str, object]]:
+    samples: dict[int, dict[str, object]] = {}
+    ticks = os.sysconf("SC_CLK_TCK")
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        pid = int(proc.name)
+        parsed = parse_proc_stat(read_first_existing(proc / "stat"))
+        if parsed is None:
+            continue
+        name, utime, stime = parsed
+        samples[pid] = {
+            "name": process_display_name(proc, name),
+            "cpu_seconds": (utime + stime) / ticks,
+            "io_bytes": process_io_bytes(proc / "io"),
+        }
+    return samples
+
+
+def parse_proc_stat(stat: str) -> tuple[str, int, int] | None:
+    if not stat:
+        return None
+    left = stat.find("(")
+    right = stat.rfind(")")
+    if left == -1 or right == -1 or right <= left:
+        return None
+    name = stat[left + 1 : right].strip() or "-"
+    parts = stat[right + 2 :].split()
+    try:
+        return name, int(parts[11]), int(parts[12])
+    except (IndexError, ValueError):
+        return None
+
+
+def process_display_name(proc: Path, fallback: str) -> str:
+    name = read_first_existing(proc / "comm").strip() or fallback
+    return name[:40]
+
+
+def process_io_bytes(path: Path) -> int:
+    total = 0
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return 0
+    for line in lines:
+        key, _separator, value = line.partition(":")
+        if key not in {"read_bytes", "write_bytes"}:
+            continue
+        try:
+            total += int(value.strip())
+        except ValueError:
+            continue
+    return total
+
+
+def app_power_rows(
+    previous: dict[int, dict[str, object]],
+    current: dict[int, dict[str, object]],
+    elapsed: float,
+) -> list[dict[str, object]]:
+    grouped: dict[str, dict[str, object]] = {}
+    for pid, sample in current.items():
+        old = previous.get(pid)
+        if old is None:
+            continue
+        cpu_delta = max(0.0, float(sample["cpu_seconds"]) - float(old["cpu_seconds"]))
+        io_delta = max(0, int(sample["io_bytes"]) - int(old["io_bytes"]))
+        cpu_percent = cpu_delta / elapsed * 100
+        io_rate = io_delta / elapsed
+        score = cpu_percent + min(50.0, io_rate / 1_000_000)
+        if score < 0.1:
+            continue
+        name = str(sample["name"])
+        item = grouped.setdefault(name, {"name": name, "pids": [], "cpu": 0.0, "io_rate": 0.0, "score": 0.0})
+        item["pids"].append(pid)
+        item["cpu"] = float(item["cpu"]) + cpu_percent
+        item["io_rate"] = float(item["io_rate"]) + io_rate
+        item["score"] = float(item["score"]) + score
+
+    rows: list[dict[str, object]] = []
+    for item in grouped.values():
+        pids = sorted(item["pids"])
+        pid_label = str(pids[0]) if len(pids) == 1 else f"{pids[0]} +{len(pids) - 1}"
+        rows.append(
+            {
+                "name": item["name"],
+                "pid": pid_label,
+                "cpu": float(item["cpu"]),
+                "io_rate": float(item["io_rate"]),
+                "score": float(item["score"]),
+            }
+        )
+    rows.sort(key=lambda row: float(row["score"]), reverse=True)
+    return rows
+
+
+def format_bytes_per_second(value: float) -> str:
+    units = ("B/s", "KB/s", "MB/s", "GB/s")
+    amount = float(value)
+    for unit in units:
+        if amount < 1024 or unit == units[-1]:
+            if unit == "B/s":
+                return f"{amount:.0f} {unit}"
+            return f"{amount:.1f} {unit}"
+        amount /= 1024
+    return f"{amount:.1f} GB/s"
+
+
 def read_first_existing(*paths: Path) -> str:
     for path in paths:
         try:
@@ -4005,26 +4164,27 @@ def env_config(path: Path, defaults: dict[str, str]) -> dict[str, str]:
 
 def default_asr_config() -> dict[str, str]:
     return {
-        "WHISPER_URL": "http://127.0.0.1:3300/api/asr/transcriptions",
-        "WHISPER_AUTH_TOKEN": "",
-        "WHISPER_LANGUAGE": "zh",
-        "WHISPER_CORRECTION_MODE": "auto",
+        "ASR_URL": "http://127.0.0.1:3300/api/asr/transcriptions",
+        "ASR_AUTH_TOKEN": "",
+        "ASR_LANGUAGE": "zh",
+        "ASR_CORRECTION_MODE": "auto",
         "VOICE_RECORDER": "auto",
         "VOICE_INPUT": "default",
         "VOICE_OUTPUT_MODE": "paste",
         "VOICE_TMUX_OUTPUT_MODE": "type",
+        "VOICE_PAUSE_SEGMENT_MS": "1600",
         "VOICE_PASTE_BACKEND": "uinput",
     }
 
 
 def asr_config_text(values: dict[str, str]) -> str:
     lines = [
-        "WHISPER_URL={WHISPER_URL}",
-        "WHISPER_LANGUAGE={WHISPER_LANGUAGE}",
-        "WHISPER_AUTH_TOKEN={WHISPER_AUTH_TOKEN}",
-        "WHISPER_CORRECTION_MODE={WHISPER_CORRECTION_MODE}",
-        "WHISPER_NO_PROXY=1",
-        "WHISPER_TIMEOUT=60",
+        "ASR_URL={ASR_URL}",
+        "ASR_LANGUAGE={ASR_LANGUAGE}",
+        "ASR_AUTH_TOKEN={ASR_AUTH_TOKEN}",
+        "ASR_CORRECTION_MODE={ASR_CORRECTION_MODE}",
+        "ASR_NO_PROXY=1",
+        "ASR_TIMEOUT=60",
         "VOICE_RECORDER={VOICE_RECORDER}",
         "VOICE_INPUT={VOICE_INPUT}",
         "VOICE_MIN_RECORD_MS=350",
@@ -4033,6 +4193,7 @@ def asr_config_text(values: dict[str, str]) -> str:
         "VOICE_CHANNELS=1",
         "VOICE_OUTPUT_MODE={VOICE_OUTPUT_MODE}",
         "VOICE_TMUX_OUTPUT_MODE={VOICE_TMUX_OUTPUT_MODE}",
+        "VOICE_PAUSE_SEGMENT_MS={VOICE_PAUSE_SEGMENT_MS}",
         "VOICE_WECHAT_OUTPUT_MODE=paste",
         "VOICE_PASTE_BACKEND={VOICE_PASTE_BACKEND}",
         "VOICE_PASTE_SHORTCUT=ctrl_v",
@@ -4129,27 +4290,36 @@ def current_power_state(config: dict[str, str]) -> str:
 def power_time_estimate() -> str:
     for battery in battery_supplies():
         status = read_first_existing(battery / "status").lower()
-        capacity = read_number(
-            battery / "energy_now",
-            battery / "charge_now",
-        )
-        full = read_number(
-            battery / "energy_full",
-            battery / "charge_full",
-            battery / "energy_full_design",
-            battery / "charge_full_design",
-        )
-        rate = battery_power_rate(battery)
-        if rate is None or rate <= 0:
+        energy_now = read_number(battery / "energy_now")
+        energy_full = read_number(battery / "energy_full", battery / "energy_full_design")
+        if energy_now is not None and energy_full is not None and energy_full > 0:
+            rate = battery_power_rate(battery)
+            if rate is None or rate <= 0:
+                return "-"
+            if status == "discharging":
+                return f"LEFT {format_hours(energy_now / rate)}"
+            if status in {"charging", "full"}:
+                if status == "full":
+                    return "FULL"
+                if energy_full > energy_now:
+                    return f"FULL {format_hours((energy_full - energy_now) / rate)}"
+                return "-"
             return "-"
-        if status == "discharging" and capacity is not None:
-            return f"LEFT {format_hours(capacity / rate)}"
-        if status in {"charging", "full"}:
-            if status == "full":
-                return "FULL"
-            if capacity is not None and full is not None and full > capacity:
-                return f"FULL {format_hours((full - capacity) / rate)}"
-            return "-"
+
+        charge_now = read_number(battery / "charge_now")
+        charge_full = read_number(battery / "charge_full", battery / "charge_full_design")
+        current_now = read_number(battery / "current_now")
+        if charge_now is not None and charge_full is not None and current_now is not None and current_now != 0:
+            current_now = abs(current_now)
+            if status == "discharging":
+                return f"LEFT {format_hours(charge_now / current_now)}"
+            if status in {"charging", "full"}:
+                if status == "full":
+                    return "FULL"
+                if charge_full > charge_now:
+                    return f"FULL {format_hours((charge_full - charge_now) / current_now)}"
+                return "-"
+        return "-"
     return "-"
 
 
