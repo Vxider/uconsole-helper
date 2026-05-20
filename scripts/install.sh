@@ -170,6 +170,66 @@ disable_legacy_labwc_idle() {
   fi
 }
 
+merge_default_rightshift_bindings() {
+  local config_file="$1"
+  local defaults_file="$2"
+
+  if python3 - "$config_file" "$defaults_file" <<'PY'
+import sys
+import tomllib
+from pathlib import Path
+
+path = Path(sys.argv[1])
+defaults_path = Path(sys.argv[2])
+
+try:
+    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    defaults = tomllib.loads(defaults_path.read_text(encoding="utf-8"))
+except (OSError, tomllib.TOMLDecodeError) as exc:
+    print(exc, file=sys.stderr)
+    sys.exit(2)
+
+existing_keys = {
+    str(item.get("key", "")).lower()
+    for item in data.get("rightshift", {}).get("bindings", [])
+    if item.get("key")
+}
+
+missing = []
+for item in defaults.get("rightshift", {}).get("bindings", []):
+    key = str(item.get("key", "")).strip()
+    command = str(item.get("command", "")).strip()
+    if key and command and key.lower() not in existing_keys:
+        missing.append((key, command))
+        existing_keys.add(key.lower())
+
+if not missing:
+    sys.exit(0)
+
+with path.open("a", encoding="utf-8") as handle:
+    for key, command in missing:
+        handle.write(
+            "\n"
+            "[[rightshift.bindings]]\n"
+            f'key = "{key}"\n'
+            f'command = "{command}"\n'
+        )
+        print(f"RightShift+{key.upper()} -> {command}")
+sys.exit(1)
+PY
+  then
+    return 0
+  else
+    local status=$?
+    if [[ "${status}" -eq 1 ]]; then
+      echo "Added missing default RightShift bindings to ${config_file}"
+      return 0
+    fi
+    echo "warning: unable to update ${config_file}; keeping existing RightShift bindings" >&2
+    return 0
+  fi
+}
+
 install_mapper() {
   local mapper_app_dir="${HOME}/.local/share/uconsole-helper-mapper"
   local idle_app_dir="${HOME}/.local/share/uconsole-helper-idle"
@@ -247,6 +307,7 @@ install_mapper() {
   install -m 0755 "${APP_DIR}/scripts/mapper/toggle-lxterminal.sh" "${bin_dir}/toggle-lxterminal"
   install -m 0755 "${APP_DIR}/scripts/mapper/run-or-raise-chromium.sh" "${bin_dir}/run-or-raise-chromium"
   install -m 0755 "${APP_DIR}/scripts/mapper/run-or-raise-filemanager.sh" "${bin_dir}/run-or-raise-filemanager"
+  install -m 0755 "${APP_DIR}/scripts/mapper/run-or-raise-flashai.sh" "${bin_dir}/run-or-raise-flashai"
   install -m 0755 "${APP_DIR}/scripts/mapper/run-or-raise-vscode.sh" "${bin_dir}/run-or-raise-vscode"
   install -m 0755 "${APP_DIR}/scripts/mapper/run-or-raise-wechat.sh" "${bin_dir}/run-or-raise-wechat"
   install -m 0755 "${APP_DIR}/scripts/mapper/run-or-raise-zdesktop.sh" "${bin_dir}/run-or-raise-zdesktop"
@@ -278,6 +339,8 @@ install_mapper() {
   fi
   if [[ ! -f "${config_dir}/desktop-keybinds.toml" ]]; then
     install -m 0644 "${APP_DIR}/config/mapper/desktop-keybinds.toml.example" "${config_dir}/desktop-keybinds.toml"
+  else
+    merge_default_rightshift_bindings "${config_dir}/desktop-keybinds.toml" "${APP_DIR}/config/mapper/desktop-keybinds.toml.example"
   fi
   if [[ ! -f "${config_dir}/voice.env" ]]; then
     install -m 0644 "${APP_DIR}/config/mapper/voice.env.example" "${config_dir}/voice.env"
