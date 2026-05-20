@@ -158,6 +158,8 @@ def stop_process(process: subprocess.Popen[str] | None) -> None:
 def main() -> int:
     process: subprocess.Popen[str] | None = None
     active_timeout: int | None = None
+    active_power_state: str | None = None
+    last_display_off: bool | None = None
     stopping = False
 
     def request_stop(_signum: int, _frame: object) -> None:
@@ -171,13 +173,19 @@ def main() -> int:
         values = load_config()
         state = power_state(Path(values.get("POWERSAVER_POWER_SUPPLY_DIR", str(POWER_SUPPLY_DIR))))
         timeout_sec = timeout_for_state(values, state)
+        was_display_off = display_is_off()
+        power_state_changed = active_power_state is not None and state != active_power_state
+        restore_display_off = was_display_off or (power_state_changed and last_display_off is True)
         if timeout_sec != active_timeout or (process is not None and process.poll() is not None):
-            was_display_off = display_is_off()
             stop_process(process)
             process = start_swayidle(timeout_sec)
-            if was_display_off:
+            if restore_display_off:
                 run_display_control("off")
             active_timeout = timeout_sec
+        elif restore_display_off and not was_display_off:
+            run_display_control("off")
+        active_power_state = state
+        last_display_off = display_is_off()
         time.sleep(POLL_SECONDS)
 
     stop_process(process)

@@ -341,6 +341,53 @@ wait_for_exit() {
   return 0
 }
 
+terminate_process_group() {
+  local pid=$1
+  local signal_name=${2:-TERM}
+
+  [[ -n "${pid}" ]] || return 0
+  kill -"${signal_name}" -- "-${pid}" >/dev/null 2>&1 || true
+  kill -"${signal_name}" "${pid}" >/dev/null 2>&1 || true
+}
+
+stop_existing_recording_session() {
+  [[ -f "${STATE_FILE}" ]] || return 0
+
+  local RECORDER_PID=
+  local STREAM_PID=
+  local STREAM_STOP_FILE=
+  local STREAM_RESULT_FILE=
+  local WATCHDOG_PID=
+
+  # shellcheck disable=SC1090
+  source "${STATE_FILE}"
+  rm -f "${STATE_FILE}"
+
+  if [[ -n "${WATCHDOG_PID:-}" && "${WATCHDOG_PID}" != "$$" ]]; then
+    kill "${WATCHDOG_PID}" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${STREAM_STOP_FILE:-}" ]]; then
+    : >"${STREAM_STOP_FILE}" || true
+  fi
+
+  local pid=${STREAM_PID:-${RECORDER_PID:-}}
+  if [[ -n "${pid}" ]] && kill -0 "${pid}" >/dev/null 2>&1; then
+    log_ptt "stopping existing voice session pid=${pid}"
+    terminate_process_group "${pid}" INT
+    wait_for_exit "${pid}" 20 || true
+  fi
+  if [[ -n "${pid}" ]] && kill -0 "${pid}" >/dev/null 2>&1; then
+    terminate_process_group "${pid}" TERM
+    wait_for_exit "${pid}" 10 || true
+  fi
+  if [[ -n "${pid}" ]] && kill -0 "${pid}" >/dev/null 2>&1; then
+    terminate_process_group "${pid}" KILL
+    wait_for_exit "${pid}" 10 || true
+  fi
+
+  rm -f "${STREAM_RESULT_FILE:-}" "${STREAM_STOP_FILE:-}"
+}
+
 choose_recorder() {
   case "${VOICE_RECORDER}" in
     auto)
@@ -623,14 +670,7 @@ save_last_asr_state() {
 
 start_recording() {
   mkdir -p "${VOICE_STATE_DIR}"
-  if [[ -f "${STATE_FILE}" ]]; then
-    # shellcheck disable=SC1090
-    source "${STATE_FILE}"
-    if [[ -n "${RECORDER_PID:-}" ]] && kill -0 "${RECORDER_PID}" >/dev/null 2>&1; then
-      exit 0
-    fi
-    rm -f "${STATE_FILE}"
-  fi
+  stop_existing_recording_session
 
   if [[ -z "${ASR_URL}" ]]; then
     echo "ASR_URL is required" >&2
@@ -676,6 +716,7 @@ start_recording() {
     VOICE_NOTIFY_ID="${VOICE_NOTIFY_ID}" \
     VOICE_STREAM_PREVIEW="${VOICE_STREAM_PREVIEW}" \
     VOICE_STREAM_SEND_INTERVAL_MS="${VOICE_STREAM_SEND_INTERVAL_MS}" \
+    VOICE_MAX_RECORD_MS="${VOICE_MAX_RECORD_MS}" \
     VOICE_PAUSE_SEGMENT_MS="${VOICE_PAUSE_SEGMENT_MS}" \
     VOICE_MIN_SEGMENT_MS="${VOICE_MIN_SEGMENT_MS}" \
     VOICE_AUTO_SEGMENT_RMS_THRESHOLD="${VOICE_AUTO_SEGMENT_RMS_THRESHOLD}" \
@@ -839,11 +880,15 @@ stop_recording() {
   fi
   if kill -0 "${RECORDER_PID}" >/dev/null 2>&1; then
     if ! wait_for_exit "${RECORDER_PID}" 120; then
-      kill -INT "${RECORDER_PID}" >/dev/null 2>&1 || true
+      terminate_process_group "${RECORDER_PID}" INT
       wait_for_exit "${RECORDER_PID}" 20 || true
     fi
     if kill -0 "${RECORDER_PID}" >/dev/null 2>&1; then
-      kill -TERM "${RECORDER_PID}" >/dev/null 2>&1 || true
+      terminate_process_group "${RECORDER_PID}" TERM
+      wait_for_exit "${RECORDER_PID}" 10 || true
+    fi
+    if kill -0 "${RECORDER_PID}" >/dev/null 2>&1; then
+      terminate_process_group "${RECORDER_PID}" KILL
       wait_for_exit "${RECORDER_PID}" 10 || true
     fi
   fi
@@ -1089,9 +1134,13 @@ cancel_recording() {
     : >"${STREAM_STOP_FILE}" || true
   fi
   if [[ -n "${RECORDER_PID:-}" ]] && kill -0 "${RECORDER_PID}" >/dev/null 2>&1; then
-    kill -INT "${RECORDER_PID}" >/dev/null 2>&1 || true
+    terminate_process_group "${RECORDER_PID}" INT
     if ! wait_for_exit "${RECORDER_PID}" 20; then
-      kill -TERM "${RECORDER_PID}" >/dev/null 2>&1 || true
+      terminate_process_group "${RECORDER_PID}" TERM
+      wait_for_exit "${RECORDER_PID}" 10 || true
+    fi
+    if kill -0 "${RECORDER_PID}" >/dev/null 2>&1; then
+      terminate_process_group "${RECORDER_PID}" KILL
       wait_for_exit "${RECORDER_PID}" 10 || true
     fi
   fi

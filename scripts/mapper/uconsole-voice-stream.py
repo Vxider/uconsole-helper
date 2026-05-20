@@ -198,6 +198,7 @@ class SegmentingTranscriptionSession:
         self.sample_rate = env_int("VOICE_SAMPLE_RATE", 16000)
         self.channels = env_int("VOICE_CHANNELS", 1)
         self.chunk_ms = env_int("VOICE_STREAM_SEND_INTERVAL_MS", 200)
+        self.max_record_ms = env_int("VOICE_MAX_RECORD_MS", 60000)
         self.pause_ms = env_int("VOICE_PAUSE_SEGMENT_MS", 1600)
         self.min_segment_ms = env_int("VOICE_MIN_SEGMENT_MS", 1000)
         self.rms_threshold = env_float("VOICE_AUTO_SEGMENT_RMS_THRESHOLD", 0.006)
@@ -434,7 +435,11 @@ class SegmentingTranscriptionSession:
             f"pauseMs={self.pause_ms} rmsThreshold={self.rms_threshold}"
         )
         try:
+            deadline = time.monotonic() + (self.max_record_ms / 1000) if self.max_record_ms > 0 else None
             while not self.stop_requested and not self.stop_file.exists():
+                if deadline is not None and time.monotonic() >= deadline:
+                    append_log(f"segmenting ASR max record reached requestId={self.request_id} maxMs={self.max_record_ms}")
+                    break
                 assert recorder.stdout is not None
                 data = recorder.stdout.read(frame_bytes)
                 if not data:
