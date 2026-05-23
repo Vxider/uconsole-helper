@@ -19,9 +19,8 @@ local network, and keeping uConsole-specific helper daemons in one place.
 - DHCP Server tab for serving addresses on a selected wired interface.
 - Dashboard tab with htop/btop-style cards for system, power, CPU, memory,
   storage, network, and cellular summaries.
-- LAN Scan tab for scanning hosts in the selected interface's IPv4 subnet.
-- Interface tab with NetworkManager-style device status, addresses, Wi-Fi signal,
-  cellular signal, and Tailscale interface state.
+- LAN tab with NetworkManager-style device status plus host scanning for the
+  selected interface's IPv4 subnet.
 - Tailscale tab with a device list, online state, Tailscale IPv4 address, and a
   right-click copy menu for IPv4, IPv6, and DNS name.
 - Power tab for monitoring and controlling the `uconsole-helper.service`
@@ -112,10 +111,10 @@ Tabs:
 
 - `D`: DHCP Server
 - `B`: Dashboard
-- `L`: LAN Scan
-- `I`: Interface
+- `L`: LAN
 - `T`: Tailscale
 - `P`: Power
+- `C`: MCU
 - `M`: Mapper
 - `A`: ASR
 - `Ctrl+1` through `Ctrl+8`: switch tabs directly
@@ -161,9 +160,9 @@ Notes:
 - Stopping the DHCP server does not restore the interface's previous address
   configuration.
 
-## LAN Scan
+## LAN
 
-1. Select the interface to scan.
+1. Select the interface row to scan.
 2. Click `Scan`.
 
 The default scan interface is selected from the highest-priority IPv4 default
@@ -173,9 +172,7 @@ network scans.
 Hostnames are resolved from local hosts files, DHCP leases, reverse DNS, mDNS,
 and NetBIOS when available. Devices that do not expose a hostname will show `-`.
 
-## Interface
-
-The Interface tab shows device status similar to `nmcli dev status`, plus
+The interface table shows device status similar to `nmcli dev status`, plus
 addresses and signal details:
 
 - Wi-Fi signal is shown as a percentage with a four-bar indicator.
@@ -248,8 +245,22 @@ The ASR tab edits the voice push-to-talk configuration used by
 ```
 
 The tab covers the frequently changed ASR settings: endpoint, token, language,
-correction mode, recorder, input device, output mode, tmux output mode, pause
-threshold, paste backend, and glossary terms.
+correction mode, recorder, input device, output mode, tmux output mode, paste
+backend, and glossary terms.
+
+## MCU Firmware
+
+The MCU tab expects the XIAO nRF52840 Sense Plus firmware to print compact JSON
+events over USB Serial. The bundled firmware reports IMU posture, microphone
+peak level, and VEML7700 ambient light readings as `light.lux` when the sensor
+is present at I2C address `0x10`. A matching PlatformIO project lives in:
+
+```text
+firmware/xiao-mcu-telemetry
+```
+
+Build it with `pio run`, enter UF2 bootloader mode from the MCU page, then run
+`firmware/xiao-mcu-telemetry/scripts/flash-uf2.sh`.
 
 ## Debug Interface Detection
 

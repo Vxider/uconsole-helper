@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """GTK desktop GUI for running a local DHCP server on one interface."""
 
 from __future__ import annotations
@@ -8,7 +8,11 @@ import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 
+import array
+import fcntl
 import ipaddress
+import json as json_module
+import math
 import json
 import os
 import platform
@@ -20,6 +24,8 @@ import subprocess
 import sys
 import threading
 import time
+import select
+import termios
 import tomllib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -41,8 +47,62 @@ MAPPER_DESKTOP_KEYBINDS_CONFIG = Path.home() / ".config/uconsole-helper-mapper/d
 MAPPER_ASR_CONFIG = Path.home() / ".config/uconsole-helper-mapper/voice.env"
 MAPPER_GLOSSARY_FILE = Path.home() / ".config/uconsole-helper-mapper/voice-glossary.txt"
 BATTERY_CALIBRATE_PATH = Path("/sys/class/power_supply/axp20x-battery/calibrate")
+DISPLAY_BACKLIGHT_BRIGHTNESS_PATH = Path("/sys/class/backlight/backlight@0/brightness")
+DISPLAY_BACKLIGHT_MAX_PATH = Path("/sys/class/backlight/backlight@0/max_brightness")
 SCREEN_TIMEOUT_OPTIONS = ("Default", "30s", "1min", "2min", "5min", "10min", "15min")
+AUTO_SCREEN_TIMEOUT_OPTIONS = ("5s", "10s", "15s", "30s", "1min", "2min", "5min", "10min", "15min", "30min", "Never")
 DHCP_LEASE_TIME_OPTIONS = ("1h", "2h", "4h", "8h", "12h", "24h", "48h")
+APP_POWER_MIN_CPU_PERCENT = 1.0
+APP_POWER_MIN_IO_BYTES_PER_SEC = 256 * 1024
+APP_POWER_MIN_SCORE = 10.0
+XIAO_USB_VENDOR = "2886"
+XIAO_USB_PRODUCT_IDS = {"0065", "8044", "8065"}
+XIAO_BOOTLOADER_PRODUCT_IDS = {"0065"}
+XIAO_BOOTLOADER_HINTS = ("uf2", "bootloader", "mass storage")
+XIAO_SERIAL_BAUD = 115200
+XIAO_STILL_G_FORCE = 0.08
+XIAO_PICKUP_G_FORCE = 0.12
+XIAO_MOVE_G_FORCE = 0.18
+XIAO_LONG_STILL_SECONDS = 30.0
+XIAO_STILL_WINDOW_SECONDS = 2.5
+XIAO_PUTDOWN_WINDOW_SECONDS = 3.8
+XIAO_SAMPLE_MAX_AGE_SECONDS = 45.0
+XIAO_STATUS_REQUEST_SECONDS = 5.0
+XIAO_STATUS_STALE_SECONDS = 35.0
+MCU_LIGHT_SMOOTHING_ALPHA = 0.35
+MCU_EVENT_LABELS = ("拿起", "放下", "支架")
+MCU_FIRMWARE_EVENT_LABELS = {
+    "ready": "",
+    "requested": "",
+    "heartbeat": "",
+    "motion_started": "拿起",
+    "state_changed": "状态变化",
+    "pose_changed": "姿态变化",
+    "pose_calibrated": "",
+    "freefall": "姿态变化",
+    "impact": "姿态变化",
+}
+MCU_POSE_LABELS = {
+    "face_up": "正面朝上",
+    "face_down": "正面朝下",
+    "left_edge": "左侧立起",
+    "right_edge": "右侧立起",
+    "top_edge": "顶边立起",
+    "bottom_edge": "底边立起",
+    "stand": "支架模式",
+    "tilted": "倾斜",
+}
+MCU_LIGHT_LEVELS = (
+    ("night", "夜间", 2.0, 1),
+    ("dim", "昏暗", 5.0, 2),
+    ("low_indoor", "低亮室内", 9.0, 3),
+    ("indoor", "室内", 30.0, 4),
+    ("bright_indoor", "明亮室内", 120.0, 5),
+    ("desk_light", "台灯/近光", 220.0, 6),
+    ("shade", "户外阴影", 420.0, 7),
+    ("bright_shade", "明亮户外", 900.0, 8),
+    ("sunlight", "强光", None, 9),
+)
 
 
 DEFAULTS = {
@@ -80,6 +140,135 @@ class InterfaceInfo:
         return f"{self.name} (不支持)"
 
 
+@dataclass(frozen=True)
+class McuTelemetrySample:
+    timestamp: float
+    ax: float
+    ay: float
+    az: float
+    temperature: float | None = None
+    light_lux: float | None = None
+    light_raw: int | None = None
+    light_ready: bool = False
+    source: str = "serial"
+    firmware_state: str = ""
+    firmware_event: str = ""
+    firmware_motion: str = ""
+    firmware_pose: str = ""
+    firmware_delta: float | None = None
+    mic_peak: int | None = None
+    mic_recent_peak: bool = False
+    mic_ready: bool = False
+    mic_enabled: bool = False
+    mic_assist: bool | None = None
+    gx: float | None = None
+    gy: float | None = None
+    gz: float | None = None
+
+
+@dataclass(frozen=True)
+class McuDeviceInfo:
+    present: bool
+    mode: str
+    tty: str
+    product: str
+    manufacturer: str
+    serial: str
+    usb_path: str
+    notes: str = ""
+
+
+@dataclass(frozen=True)
+class McuStateSnapshot:
+    device: McuDeviceInfo
+    state: str
+    event: str
+    motion: str
+    still_for: float
+    g_force: float
+    tilt_deg: float
+    sample_rate_hz: float
+    pose: str
+    light_lux: float | None
+    smoothed_light_lux: float | None
+    suggested_backlight: int | None
+    light_raw: int | None
+    light_ready: bool
+    last_update: float
+    raw_line: str
+    last_error: str
+    mic_ready: bool = False
+    mic_enabled: bool = False
+    mic_assist: bool | None = None
+    mic_peak: int | None = None
+    mic_recent_peak: bool = False
+    recent_rows: tuple[tuple[str, str, str, str], ...] = ()
+
+
+@dataclass
+class McuTelemetryState:
+    samples: list[McuTelemetrySample]
+    prev_sample: McuTelemetrySample | None
+    stable_since: float | None
+    serial_session: "McuSerialSession | None"
+    last_delta_g: float
+    last_state: str
+    last_event: str
+    last_motion: str
+    last_error: str
+    last_status_requested_at: float
+    smoothed_light_lux: float | None
+    suggested_backlight: int | None
+
+    def __init__(self) -> None:
+        self.samples = []
+        self.prev_sample = None
+        self.stable_since = None
+        self.serial_session = None
+        self.last_delta_g = 0.0
+        self.last_state = "等待数据"
+        self.last_event = "等待样本"
+        self.last_motion = "-"
+        self.last_error = ""
+        self.last_status_requested_at = 0.0
+        self.smoothed_light_lux = None
+        self.suggested_backlight = None
+
+
+@dataclass
+class McuSerialSession:
+    tty_name: str
+    fd: int
+    buffer: str = ""
+
+    def close(self) -> None:
+        if self.fd >= 0:
+            try:
+                os.close(self.fd)
+            finally:
+                self.fd = -1
+
+    def read_line(self, timeout: float = 0.0) -> str | None:
+        if self.fd < 0:
+            return None
+        try:
+            ready, _, _ = select.select([self.fd], [], [], timeout)
+            if not ready:
+                return None
+            chunk = os.read(self.fd, 4096)
+        except OSError:
+            self.close()
+            return None
+        if not chunk:
+            return None
+        self.buffer += chunk.decode("utf-8", errors="ignore")
+        for sep in ("\n", "\r"):
+            if sep in self.buffer:
+                line, self.buffer = self.buffer.split(sep, 1)
+                return line.strip()
+        return None
+
+
 class UConsoleHelperWindow(Gtk.Window):
     def __init__(self) -> None:
         super().__init__(title="uConsole Helper")
@@ -88,18 +277,29 @@ class UConsoleHelperWindow(Gtk.Window):
         self.connect("key-press-event", self.on_key_press)
         self.scan_running = False
         self.scan_cancel = threading.Event()
+        self.dashboard_refresh_running = False
         self.dhcp_running = False
         self.tailscale_reconnecting = False
+        self.mcu_refresh_running = False
+        self.mcu_monitor_stop = threading.Event()
+        self.mcu_latest_snapshot: McuStateSnapshot | None = None
+        self.mcu_last_rendered: McuStateSnapshot | None = None
+        self.mcu_event_store = Gtk.ListStore(str, str, str, str)
+        self.mcu_event_labels: dict[str, Gtk.Label] = {}
+        self.mcu_status_labels: dict[str, Gtk.Label] = {}
+        self.mcu_summary_label = Gtk.Label(label="", xalign=0)
+        self.mcu_summary_label.get_style_context().add_class("muted")
+        self.mcu_action_label = Gtk.Label(label="", xalign=0)
+        self.mcu_action_label.get_style_context().add_class("muted")
+        self.mcu_hint_label = Gtk.Label(label="", xalign=0)
+        self.mcu_hint_label.get_style_context().add_class("muted")
+        self.mcu_pose_calibrate_button = Gtk.Button(label="Calibrate Pose")
+        self.mcu_pose_calibrate_button.connect("clicked", lambda _button: self.calibrate_mcu_pose())
+        self.mcu_mic_assist_switch = Gtk.Switch()
+        self.mcu_mic_assist_switch.set_active(True)
+        self.mcu_mic_assist_switch.connect("notify::active", self.on_mcu_mic_assist_changed)
+        self.mcu_mic_assist_updating = False
 
-        self.interface_store = Gtk.ListStore(str, str, bool, str, bool, str)
-        self.interface_combo = Gtk.ComboBox.new_with_model(self.interface_store)
-        renderer = Gtk.CellRendererText()
-        self.interface_combo.pack_start(renderer, True)
-        self.interface_combo.add_attribute(renderer, "text", 0)
-        self.interface_combo.add_attribute(renderer, "sensitive", 2)
-        self.interface_combo.add_attribute(renderer, "foreground", 3)
-        self.interface_combo.add_attribute(renderer, "foreground-set", 4)
-        self.interface_combo.set_row_separator_func(interface_row_is_separator)
         self.message_label = Gtk.Label(label="", xalign=0)
         self.entries = {key: Gtk.Entry() for key in DEFAULTS}
         self.pool_prefix_labels: dict[str, Gtk.Label] = {}
@@ -112,23 +312,17 @@ class UConsoleHelperWindow(Gtk.Window):
         self.entries["server_ip"].connect("changed", lambda _entry: self.update_pool_address_controls())
         self.entries["netmask"].connect("changed", lambda _entry: self.update_pool_address_controls())
 
-        self.scan_interface_store = Gtk.ListStore(str, str, bool, str, bool, str)
-        self.scan_interface_combo = Gtk.ComboBox.new_with_model(self.scan_interface_store)
-        scan_renderer = Gtk.CellRendererText()
-        self.scan_interface_combo.pack_start(scan_renderer, True)
-        self.scan_interface_combo.add_attribute(scan_renderer, "text", 0)
-        self.scan_interface_combo.add_attribute(scan_renderer, "sensitive", 2)
-        self.scan_interface_combo.add_attribute(scan_renderer, "foreground", 3)
-        self.scan_interface_combo.add_attribute(scan_renderer, "foreground-set", 4)
-        self.scan_interface_combo.set_row_separator_func(interface_row_is_separator)
-        self.scan_message_label = Gtk.Label(label="选择网口后扫描同网段在线设备。", xalign=0)
+        self.scan_message_label = Gtk.Label(label="在上方 Interface 表格中选择网口后扫描同网段在线设备。", xalign=0)
         self.scan_store = Gtk.ListStore(str, str, str, str)
         self.interface_status_store = Gtk.ListStore(str, str, str, str, str, str, str)
+        self.interface_tree: Gtk.TreeView | None = None
+        self.interface_pin_tree: Gtk.TreeView | None = None
         self.tailscale_store = Gtk.ListStore(str, str, str, str, str, str, str, str, str, str)
         self.tailscale_summary_label = Gtk.Label(label="", xalign=0)
         self.tailscale_summary_label.get_style_context().add_class("muted")
         self.power_labels: dict[str, Gtk.Label] = {}
         self.power_controls: dict[str, Gtk.Widget] = {}
+        self.power_control_rows: dict[str, tuple[Gtk.Widget, Gtk.Widget]] = {}
         self.power_profile_cards: dict[str, Gtk.Widget] = {}
         self.selected_power_mode = "balanced"
         self.app_power_store = Gtk.ListStore(str, str, str, str, str)
@@ -140,11 +334,18 @@ class UConsoleHelperWindow(Gtk.Window):
         self.asr_status_label = Gtk.Label(label="", xalign=0)
         self.asr_status_label.get_style_context().add_class("muted")
         self.utils_battery_label = Gtk.Label(label="-", xalign=0)
-        self.utils_battery_label.set_selectable(True)
         self.utils_calibrate_button = Gtk.Button(label="Battery Calibrate")
         self.utils_calibrate_button.connect("clicked", lambda _button: self.calibrate_battery())
+        self.utils_reset_xiao_usb_button = Gtk.Button(label="Reset USB2.0 HUB")
+        self.utils_reset_xiao_usb_button.connect("clicked", lambda _button: self.reset_xiao_usb_hub())
+        self.utils_usb_reset_running = False
+        self.utils_usb_store = Gtk.ListStore(str, str, str, str, str)
         self.utils_status_label = Gtk.Label(label="", xalign=0)
         self.utils_status_label.get_style_context().add_class("muted")
+        self.inline_panel_box: Gtk.Box | None = None
+        self.inline_panel_title: Gtk.Label | None = None
+        self.inline_panel_body: Gtk.Box | None = None
+        self.inline_panel_close_button: Gtk.Button | None = None
         self.dashboard_labels: dict[str, Gtk.Label] = {}
         self.dashboard_bars: dict[str, Gtk.ProgressBar] = {}
         self.dashboard_secondary_bars: dict[str, Gtk.ProgressBar] = {}
@@ -153,17 +354,23 @@ class UConsoleHelperWindow(Gtk.Window):
         self.dashboard_grid: Gtk.Grid | None = None
         self.dashboard_cards: list[Gtk.Widget] = []
         self.dashboard_columns = 3
+        self.mcu_page_ready = False
+        self.gui_refresh_active = True
+        self.current_page_name = "dashboard"
 
         self._build_ui()
         self.refresh_dashboard()
-        self.refresh_interfaces()
+        self.refresh_dhcp_defaults()
         self.refresh_interface_status()
         self.refresh_tailscale_status()
         self.refresh_power_status()
+        self.refresh_mcu_status()
         self.refresh_mapper_status()
         self.load_asr_config_controls()
         self.refresh_status()
         GLib.timeout_add_seconds(5, self.auto_refresh_visible_status)
+        self.mcu_monitor_thread = threading.Thread(target=self._mcu_monitor_worker, daemon=True)
+        self.mcu_monitor_thread.start()
 
     def _build_ui(self) -> None:
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
@@ -174,15 +381,17 @@ class UConsoleHelperWindow(Gtk.Window):
         self.stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
         self.stack.set_transition_duration(140)
         self.stack.add_titled(self._build_dashboard_page(), "dashboard", "Dashboard")
-        self.stack.add_titled(scrolled_page(self._build_dhcp_page()), "dhcp", "DHCP")
-        self.stack.add_titled(scrolled_page(self._build_lanscan_page()), "lanscan", "LAN SCAN")
-        self.stack.add_titled(scrolled_page(self._build_interface_page()), "interface", "Interface")
+        self.stack.add_titled(scrolled_page(self._build_lan_page()), "lan", "LAN")
         self.stack.add_titled(scrolled_page(self._build_tailscale_page()), "tailscale", "Tailscale")
         self.stack.add_titled(scrolled_page(self._build_power_page()), "power", "Power")
+        self.stack.add_titled(scrolled_page(self._build_mcu_page()), "mcu", "MCU")
         self.stack.add_titled(scrolled_page(self._build_utils_page()), "utils", "Utils")
         self.stack.add_titled(scrolled_page(self._build_mapper_page()), "mapper", "Mapper")
         self.stack.add_titled(scrolled_page(self._build_asr_page()), "asr", "ASR")
-        self.stack.connect("notify::visible-child-name", lambda *_args: self.update_header())
+        self.stack.connect("notify::visible-child-name", self.on_visible_page_changed)
+        self.connect("window-state-event", self.on_window_state_event)
+        self.connect("focus-in-event", self.on_focus_visibility_event)
+        self.connect("focus-out-event", self.on_focus_visibility_event)
 
         header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         header.get_style_context().add_class("topbar")
@@ -196,23 +405,10 @@ class UConsoleHelperWindow(Gtk.Window):
         self.dashboard_tab.get_style_context().add_class("tab-button")
         tabs.pack_start(self.dashboard_tab, False, False, 0)
 
-        self.dhcp_tab_label = Gtk.Label()
-        self.dhcp_tab_label.set_use_markup(True)
-        self.dhcp_tab = Gtk.Button()
-        self.dhcp_tab.add(self.dhcp_tab_label)
-        self.dhcp_tab.connect("clicked", lambda _button: self.set_tab("dhcp"))
-        self.dhcp_tab.get_style_context().add_class("tab-button")
-        tabs.pack_start(self.dhcp_tab, False, False, 0)
-
-        self.lanscan_tab = underlined_button("LAN Scan", "L")
-        self.lanscan_tab.connect("clicked", lambda _button: self.set_tab("lanscan"))
-        self.lanscan_tab.get_style_context().add_class("tab-button")
-        tabs.pack_start(self.lanscan_tab, False, False, 0)
-
-        self.interface_tab = underlined_button("IF", "I")
-        self.interface_tab.connect("clicked", lambda _button: self.set_tab("interface"))
-        self.interface_tab.get_style_context().add_class("tab-button")
-        tabs.pack_start(self.interface_tab, False, False, 0)
+        self.lan_tab = underlined_button("LAN", "L")
+        self.lan_tab.connect("clicked", lambda _button: self.set_tab("lan"))
+        self.lan_tab.get_style_context().add_class("tab-button")
+        tabs.pack_start(self.lan_tab, False, False, 0)
 
         self.tailscale_tab_label = Gtk.Label()
         self.tailscale_tab_label.set_use_markup(True)
@@ -229,6 +425,11 @@ class UConsoleHelperWindow(Gtk.Window):
         self.power_tab.connect("clicked", lambda _button: self.set_tab("power"))
         self.power_tab.get_style_context().add_class("tab-button")
         tabs.pack_start(self.power_tab, False, False, 0)
+
+        self.mcu_tab = underlined_button("MCU", "C")
+        self.mcu_tab.connect("clicked", lambda _button: self.set_tab("mcu"))
+        self.mcu_tab.get_style_context().add_class("tab-button")
+        tabs.pack_start(self.mcu_tab, False, False, 0)
 
         self.utils_tab = underlined_button("Utils", "U")
         self.utils_tab.connect("clicked", lambda _button: self.set_tab("utils"))
@@ -264,6 +465,24 @@ class UConsoleHelperWindow(Gtk.Window):
         self.header_refresh_button.get_style_context().add_class("context-action")
         self.header_refresh_button.get_style_context().add_class("action-ready")
         header.pack_start(self.header_refresh_button, False, False, 0)
+
+        self.inline_panel_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.inline_panel_box.get_style_context().add_class("inline-panel")
+        panel_header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.inline_panel_title = Gtk.Label(label="", xalign=0)
+        self.inline_panel_title.get_style_context().add_class("inline-panel-title")
+        panel_header.pack_start(self.inline_panel_title, True, True, 0)
+        close_panel_button = Gtk.Button(label="Close")
+        close_panel_button.get_style_context().add_class("inline-panel-close")
+        close_panel_button.connect("clicked", lambda _button: self.hide_inline_panel())
+        panel_header.pack_start(close_panel_button, False, False, 0)
+        self.inline_panel_close_button = close_panel_button
+        self.inline_panel_box.pack_start(panel_header, False, False, 0)
+        self.inline_panel_body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.inline_panel_box.pack_start(self.inline_panel_body, False, False, 0)
+        self.inline_panel_box.set_no_show_all(True)
+        self.inline_panel_box.hide()
+        root.pack_start(self.inline_panel_box, False, False, 0)
 
         root.pack_start(self.stack, True, True, 0)
 
@@ -326,47 +545,68 @@ class UConsoleHelperWindow(Gtk.Window):
 
         return page
 
-    def _build_dhcp_page(self) -> Gtk.Widget:
-        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        page.get_style_context().add_class("page")
-
+    def _build_dhcp_config_card(self) -> Gtk.Widget:
         config_card = card_box()
-        page.pack_start(config_card, False, False, 0)
 
         grid = Gtk.Grid(column_spacing=12, row_spacing=10)
         config_card.pack_start(grid, False, False, 0)
 
-        self._attach_label(grid, "网口", 0, 0)
-        grid.attach(self.interface_combo, 1, 0, 1, 1)
-
-        self._attach_entry(grid, "本机地址", "server_ip", 0, 1)
-        self._attach_entry(grid, "子网掩码", "netmask", 2, 1)
-        self._attach_pool_address(grid, "地址池起始", "pool_start", 0, 2)
-        self._attach_pool_address(grid, "地址池结束", "pool_end", 2, 2)
-        self._attach_combo(grid, "租约时间", self.lease_time_combo, 0, 3)
-        self._attach_entry(grid, "网关(可选)", "gateway", 2, 3)
-        self._attach_entry(grid, "DNS(可选)", "dns", 0, 4)
+        self._attach_entry(grid, "本机地址", "server_ip", 0, 0)
+        self._attach_entry(grid, "子网掩码", "netmask", 2, 0)
+        self._attach_pool_address(grid, "地址池起始", "pool_start", 0, 1)
+        self._attach_pool_address(grid, "地址池结束", "pool_end", 2, 1)
+        self._attach_combo(grid, "租约时间", self.lease_time_combo, 0, 2)
+        self._attach_entry(grid, "网关(可选)", "gateway", 2, 2)
         self.update_pool_address_controls(self.dhcp_defaults)
 
-        return page
+        return config_card
 
-    def _build_lanscan_page(self) -> Gtk.Widget:
+    def _build_lan_page(self) -> Gtk.Widget:
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         page.get_style_context().add_class("page")
 
-        scan_card = card_box()
-        page.pack_start(scan_card, False, False, 0)
+        interface_card = card_box()
+        page.pack_start(interface_card, False, False, 0)
 
-        controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        scan_card.pack_start(controls, False, False, 0)
-        label = Gtk.Label(label="网口", xalign=0)
-        controls.pack_start(label, False, False, 0)
-        self.scan_interface_combo.set_hexpand(True)
-        controls.pack_start(self.scan_interface_combo, True, True, 0)
+        interface_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        self.interface_pin_tree = Gtk.TreeView(model=self.interface_status_store)
+        self.interface_pin_tree.set_headers_visible(True)
+        self.interface_pin_tree.get_selection().set_mode(Gtk.SelectionMode.SINGLE)
+        pin_renderer = Gtk.CellRendererText()
+        pin_column = Gtk.TreeViewColumn("设备", pin_renderer, text=0, foreground=6)
+        pin_column.set_sizing(Gtk.TreeViewColumnSizing.FIXED)
+        pin_column.set_fixed_width(120)
+        pin_column.set_resizable(True)
+        self.interface_pin_tree.append_column(pin_column)
+        self.interface_pin_tree.set_hexpand(False)
+        self.interface_pin_tree.set_vexpand(False)
+
+        self.interface_tree = Gtk.TreeView(model=self.interface_status_store)
+        self.interface_tree.set_headers_visible(True)
+        self.interface_tree.get_selection().set_mode(Gtk.SelectionMode.SINGLE)
+        for index, title in enumerate(["类型", "状态", "连接", "信号", "地址"], start=1):
+            renderer = Gtk.CellRendererText()
+            column = Gtk.TreeViewColumn(title, renderer, text=index, foreground=6)
+            column.set_resizable(True)
+            self.interface_tree.append_column(column)
+
+        self.interface_tree.set_hexpand(True)
+        self.interface_tree.set_vexpand(False)
+        self.interface_pin_tree.get_selection().connect("changed", self.on_interface_pin_selection_changed)
+        self.interface_tree.get_selection().connect("changed", self.on_interface_scroll_selection_changed)
+        interface_box.pack_start(fixed_table_scroll(self.interface_pin_tree, width=128), False, False, 0)
+        interface_box.pack_start(table_scroll(self.interface_tree, vexpand=False), True, True, 0)
+        interface_card.pack_start(interface_box, False, False, 0)
+
+        dhcp_card = self._build_dhcp_config_card()
+        page.pack_start(dhcp_card, False, False, 4)
+        self.message_label.get_style_context().add_class("muted")
+        self.message_label.set_no_show_all(True)
+        self.message_label.hide()
+        page.pack_start(self.message_label, False, False, 0)
 
         results_card = card_box()
-        page.pack_start(results_card, True, True, 0)
-
+        page.pack_start(results_card, True, True, 4)
         tree = Gtk.TreeView(model=self.scan_store)
         tree.set_headers_visible(True)
         for index, title in enumerate(["IP", "MAC", "状态", "主机名"]):
@@ -374,37 +614,11 @@ class UConsoleHelperWindow(Gtk.Window):
             column.set_resizable(True)
             tree.append_column(column)
 
-        scroll = Gtk.ScrolledWindow()
-        scroll.set_hexpand(True)
-        scroll.set_vexpand(True)
-        scroll.add(tree)
+        scroll = table_scroll(tree, vexpand=True)
         results_card.pack_start(scroll, True, True, 0)
 
         self.scan_message_label.get_style_context().add_class("muted")
         page.pack_start(self.scan_message_label, False, False, 0)
-        return page
-
-    def _build_interface_page(self) -> Gtk.Widget:
-        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        page.get_style_context().add_class("page")
-
-        card = card_box()
-        page.pack_start(card, True, True, 0)
-
-        tree = Gtk.TreeView(model=self.interface_status_store)
-        tree.set_headers_visible(True)
-        for index, title in enumerate(["设备", "类型", "状态", "连接", "信号", "地址"]):
-            renderer = Gtk.CellRendererText()
-            column = Gtk.TreeViewColumn(title, renderer, text=index, foreground=6)
-            column.set_resizable(True)
-            tree.append_column(column)
-
-        scroll = Gtk.ScrolledWindow()
-        scroll.set_hexpand(True)
-        scroll.set_vexpand(True)
-        scroll.set_margin_top(12)
-        scroll.add(tree)
-        card.pack_start(scroll, True, True, 0)
         return page
 
     def _build_tailscale_page(self) -> Gtk.Widget:
@@ -429,10 +643,7 @@ class UConsoleHelperWindow(Gtk.Window):
             column.set_resizable(True)
             self.tailscale_tree.append_column(column)
 
-        scroll = Gtk.ScrolledWindow()
-        scroll.set_hexpand(True)
-        scroll.set_vexpand(True)
-        scroll.add(self.tailscale_tree)
+        scroll = table_scroll(self.tailscale_tree, vexpand=True)
         devices_card.pack_start(scroll, True, True, 0)
         return page
 
@@ -481,7 +692,7 @@ class UConsoleHelperWindow(Gtk.Window):
             app_power_tree.append_column(column)
         app_power_tree.set_hexpand(True)
         app_power_tree.set_vexpand(False)
-        app_power_card.pack_start(app_power_tree, False, False, 6)
+        app_power_card.pack_start(table_scroll(app_power_tree, vexpand=False), False, False, 6)
 
         profiles_grid = Gtk.Grid(column_spacing=12, row_spacing=12)
         page.pack_start(profiles_grid, False, False, 0)
@@ -505,22 +716,45 @@ class UConsoleHelperWindow(Gtk.Window):
             profile_card.pack_start(profile_grid, False, False, 10)
             battery_freq = combo_text_from_values(("1500,1500", "1800,1800", "1500,2400"))
             self.power_controls[f"POWERSAVER_{profile}_BATTERY_CPU_FREQ"] = battery_freq
-            self._attach_power_control(profile_grid, "Battery MHz", battery_freq, 0)
-            ac_freq = combo_text_from_values(("restore", "1500,1500", "1800,1800", "1500,2400"))
+            self._attach_power_control(profile_grid, f"POWERSAVER_{profile}_BATTERY_CPU_FREQ", "Battery MHz", battery_freq, 0)
+            ac_freq = combo_text_from_values(("1500,1500", "1500,1800", "1500,2000", "1500,2400"))
             self.power_controls[f"POWERSAVER_{profile}_AC_CPU_FREQ"] = ac_freq
-            self._attach_power_control(profile_grid, "AC MHz", ac_freq, 1)
-            battery_screen_timeout = combo_text_from_values(SCREEN_TIMEOUT_OPTIONS)
-            self.power_controls[f"POWERSAVER_{profile}_BATTERY_SCREEN_TIMEOUT_SEC"] = battery_screen_timeout
-            self._attach_power_control(profile_grid, "Battery Screen", battery_screen_timeout, 2)
-            ac_screen_timeout = combo_text_from_values(SCREEN_TIMEOUT_OPTIONS)
-            self.power_controls[f"POWERSAVER_{profile}_AC_SCREEN_TIMEOUT_SEC"] = ac_screen_timeout
-            self._attach_power_control(profile_grid, "AC Screen", ac_screen_timeout, 3)
+            self._attach_power_control(profile_grid, f"POWERSAVER_{profile}_AC_CPU_FREQ", "AC MHz", ac_freq, 1)
             unknown_action = combo_text_from_values(("AC", "Battery", "Keep"))
             self.power_controls[f"POWERSAVER_{profile}_UNKNOWN_POWER_ACTION"] = unknown_action
-            self._attach_power_control(profile_grid, "Unknown", unknown_action, 4)
+            self._attach_power_control(profile_grid, f"POWERSAVER_{profile}_UNKNOWN_POWER_ACTION", "Unknown", unknown_action, 2)
             wwan_policy = combo_text_from_values(("ondemand", "keep", "off"))
             self.power_controls[f"POWERSAVER_{profile}_WWAN_POLICY"] = wwan_policy
-            self._attach_power_control(profile_grid, "WWAN", wwan_policy, 5)
+            self._attach_power_control(profile_grid, f"POWERSAVER_{profile}_WWAN_POLICY", "WWAN", wwan_policy, 3)
+            battery_screen_timeout = combo_text_from_values(SCREEN_TIMEOUT_OPTIONS)
+            self.power_controls[f"POWERSAVER_{profile}_BATTERY_SCREEN_TIMEOUT_SEC"] = battery_screen_timeout
+            self._attach_power_control(profile_grid, f"POWERSAVER_{profile}_BATTERY_SCREEN_TIMEOUT_SEC", "Battery Screen", battery_screen_timeout, 4)
+            ac_screen_timeout = combo_text_from_values(SCREEN_TIMEOUT_OPTIONS)
+            self.power_controls[f"POWERSAVER_{profile}_AC_SCREEN_TIMEOUT_SEC"] = ac_screen_timeout
+            self._attach_power_control(profile_grid, f"POWERSAVER_{profile}_AC_SCREEN_TIMEOUT_SEC", "AC Screen", ac_screen_timeout, 5)
+            auto_brightness = Gtk.Switch()
+            self.power_controls[f"POWERSAVER_{profile}_AUTO_BRIGHTNESS"] = auto_brightness
+            self._attach_power_control(profile_grid, f"POWERSAVER_{profile}_AUTO_BRIGHTNESS", "Auto Bright", auto_brightness, 6)
+            screen_mode = combo_text_from_values(("Default", "Auto"))
+            self.power_controls[f"POWERSAVER_{profile}_SCREEN_MODE"] = screen_mode
+            screen_mode.connect("changed", lambda _combo, value=profile: self.sync_power_screen_mode_visibility(value))
+            self._attach_power_control(profile_grid, f"POWERSAVER_{profile}_SCREEN_MODE", "Screen Mode", screen_mode, 7)
+            auto_battery = combo_text_from_values(AUTO_SCREEN_TIMEOUT_OPTIONS)
+            self.power_controls[f"POWERSAVER_{profile}_AUTO_BATTERY_PUTDOWN_TIMEOUT_SEC"] = auto_battery
+            self._attach_power_control(profile_grid, f"POWERSAVER_{profile}_AUTO_BATTERY_PUTDOWN_TIMEOUT_SEC", "Put Down (Battery)", auto_battery, 8)
+            auto_ac = combo_text_from_values(AUTO_SCREEN_TIMEOUT_OPTIONS)
+            self.power_controls[f"POWERSAVER_{profile}_AUTO_AC_PUTDOWN_TIMEOUT_SEC"] = auto_ac
+            self._attach_power_control(profile_grid, f"POWERSAVER_{profile}_AUTO_AC_PUTDOWN_TIMEOUT_SEC", "Put Down (AC)", auto_ac, 9)
+            stand_mode = Gtk.Switch()
+            self.power_controls[f"POWERSAVER_{profile}_STAND_MODE"] = stand_mode
+            self._attach_power_control(
+                profile_grid,
+                f"POWERSAVER_{profile}_STAND_MODE",
+                "Stand Mode",
+                stand_mode,
+                10,
+                tooltip="支架状态不自动熄屏，拿起仍会唤醒。",
+            )
 
         self.load_power_policy_controls()
 
@@ -550,8 +784,105 @@ class UConsoleHelperWindow(Gtk.Window):
         self.utils_calibrate_button.get_style_context().add_class("suggested-action")
         row.pack_start(self.utils_calibrate_button, False, False, 0)
 
+        usb_card = card_box()
+        page.pack_start(usb_card, False, False, 0)
+
+        usb_header = Gtk.Label(label="USB2.0 HUB", xalign=0)
+        usb_header.get_style_context().add_class("muted")
+        usb_card.pack_start(usb_header, False, False, 0)
+
+        usb_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        usb_row.set_margin_top(8)
+        usb_card.pack_start(usb_row, False, False, 0)
+
+        usb_hint = Gtk.Label(label="Reset USB2.0 HUB when USB devices have descriptor errors.", xalign=0)
+        usb_hint.set_line_wrap(True)
+        usb_hint.set_hexpand(True)
+        usb_hint.get_style_context().add_class("muted")
+        usb_row.pack_start(usb_hint, True, True, 0)
+
+        self.utils_reset_xiao_usb_button.set_tooltip_text("会短暂断开 USB2.0 HUB 下的设备；必要时会继续重置上一层 USB HUB。")
+        usb_row.pack_start(self.utils_reset_xiao_usb_button, False, False, 0)
+
+        usb_tree = Gtk.TreeView(model=self.utils_usb_store)
+        usb_tree.set_headers_visible(True)
+        for index, title in enumerate(("Hub", "Path", "Device", "ID", "Driver")):
+            renderer = Gtk.CellRendererText()
+            if index in {0, 2, 4}:
+                renderer.set_property("ellipsize", Pango.EllipsizeMode.END)
+            column = Gtk.TreeViewColumn(title, renderer, text=index)
+            column.set_resizable(True)
+            if index == 0:
+                column.set_min_width(110)
+            elif index == 1:
+                column.set_min_width(80)
+            elif index == 2:
+                column.set_min_width(180)
+            usb_tree.append_column(column)
+        usb_scrolled = Gtk.ScrolledWindow()
+        usb_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
+        usb_scrolled.set_min_content_height(118)
+        usb_scrolled.add(usb_tree)
+        usb_card.pack_start(usb_scrolled, False, False, 10)
+
         page.pack_start(self.utils_status_label, False, False, 0)
         self.refresh_utils_status()
+        return page
+
+    def _build_mcu_page(self) -> Gtk.Widget:
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        page.get_style_context().add_class("page")
+
+        summary_card = card_box()
+        page.pack_start(summary_card, False, False, 0)
+        grid = Gtk.Grid(column_spacing=14, row_spacing=10)
+        grid.set_hexpand(True)
+        summary_card.pack_start(grid, False, False, 0)
+
+        rows = [
+            ("device", "Device"),
+            ("mode", "Mode"),
+            ("state", "State"),
+            ("event", "Event"),
+            ("motion", "Motion"),
+            ("pose", "Pose"),
+            ("mic", "Mic"),
+            ("raw_imu", "6-Axis"),
+            ("light", "Light"),
+            ("updated", "Updated"),
+            ("error", "Error"),
+        ]
+        for index, (key, title) in enumerate(rows):
+            column = (index % 2) * 2
+            row = index // 2
+            label = Gtk.Label(label=title, xalign=0)
+            label.get_style_context().add_class("muted")
+            value = Gtk.Label(label="-", xalign=0)
+            value.set_selectable(True)
+            value.set_line_wrap(True)
+            value.set_line_wrap_mode(Pango.WrapMode.CHAR)
+            value.set_hexpand(True)
+            grid.attach(label, column, row, 1, 1)
+            grid.attach(value, column + 1, row, 1, 1)
+            self.mcu_status_labels[key] = value
+
+        summary_row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        summary_row.set_margin_top(6)
+        summary_card.pack_start(summary_row, False, False, 0)
+        summary_row.pack_start(self.mcu_summary_label, False, False, 0)
+        summary_row.pack_start(self.mcu_action_label, False, False, 0)
+        summary_row.pack_start(self.mcu_hint_label, False, False, 0)
+        action_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        action_row.set_margin_top(8)
+        summary_card.pack_start(action_row, False, False, 0)
+        self.mcu_pose_calibrate_button.get_style_context().add_class("suggested-action")
+        action_row.pack_start(self.mcu_pose_calibrate_button, False, False, 0)
+        mic_label = Gtk.Label(label="Mic Assist", xalign=0)
+        mic_label.get_style_context().add_class("muted")
+        action_row.pack_start(mic_label, False, False, 0)
+        action_row.pack_start(self.mcu_mic_assist_switch, False, False, 0)
+
+        self.mcu_page_ready = True
         return page
 
     def _build_mapper_page(self) -> Gtk.Widget:
@@ -571,7 +902,7 @@ class UConsoleHelperWindow(Gtk.Window):
                 ("Command / Action", 2),
             ],
         )
-        desktop_scroll = horizontal_table_scroll(desktop_tree)
+        desktop_scroll = table_scroll(desktop_tree, vexpand=False)
         desktop_card.pack_start(desktop_scroll, False, False, 6)
         desktop_buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         desktop_card.pack_start(desktop_buttons, False, False, 0)
@@ -595,7 +926,7 @@ class UConsoleHelperWindow(Gtk.Window):
                 ("Action", 2),
             ],
         )
-        binding_scroll = horizontal_table_scroll(binding_tree)
+        binding_scroll = table_scroll(binding_tree, vexpand=False)
         bindings_card.pack_start(binding_scroll, False, False, 6)
         binding_buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         bindings_card.pack_start(binding_buttons, False, False, 0)
@@ -652,11 +983,26 @@ class UConsoleHelperWindow(Gtk.Window):
             ("type", "paste", "type_enter", "clipboard", "fcitx_commit")
         )
         self._attach_asr_flow_control(options_flow, "Tmux Output", self.asr_controls["VOICE_TMUX_OUTPUT_MODE"])
-        pause_adjustment = Gtk.Adjustment(value=1600, lower=200, upper=10000, step_increment=100, page_increment=500, page_size=0)
-        pause_spin = Gtk.SpinButton(adjustment=pause_adjustment, climb_rate=100, digits=0)
-        pause_spin.set_numeric(True)
-        self.asr_controls["VOICE_PAUSE_SEGMENT_MS"] = pause_spin
-        self._attach_asr_flow_control(options_flow, "Pause (ms)", pause_spin)
+        timeout_adjustment = Gtk.Adjustment(value=15, lower=3, upper=300, step_increment=1, page_increment=10, page_size=0)
+        timeout_spin = Gtk.SpinButton(adjustment=timeout_adjustment, climb_rate=1, digits=0)
+        timeout_spin.set_numeric(True)
+        self.asr_controls["ASR_TIMEOUT"] = timeout_spin
+        self._attach_asr_flow_control(options_flow, "Request Timeout (s)", timeout_spin)
+        attempt_timeout_adjustment = Gtk.Adjustment(value=8, lower=1, upper=60, step_increment=1, page_increment=5, page_size=0)
+        attempt_timeout_spin = Gtk.SpinButton(adjustment=attempt_timeout_adjustment, climb_rate=1, digits=0)
+        attempt_timeout_spin.set_numeric(True)
+        self.asr_controls["ASR_REQUEST_ATTEMPT_TIMEOUT"] = attempt_timeout_spin
+        self._attach_asr_flow_control(options_flow, "Attempt Timeout (s)", attempt_timeout_spin)
+        connect_timeout_adjustment = Gtk.Adjustment(value=2.0, lower=0.2, upper=10.0, step_increment=0.1, page_increment=1.0, page_size=0)
+        connect_timeout_spin = Gtk.SpinButton(adjustment=connect_timeout_adjustment, climb_rate=0.1, digits=1)
+        connect_timeout_spin.set_numeric(True)
+        self.asr_controls["ASR_CONNECT_TIMEOUT"] = connect_timeout_spin
+        self._attach_asr_flow_control(options_flow, "Connect Timeout (s)", connect_timeout_spin)
+        retry_adjustment = Gtk.Adjustment(value=3, lower=1, upper=8, step_increment=1, page_increment=2, page_size=0)
+        retry_spin = Gtk.SpinButton(adjustment=retry_adjustment, climb_rate=1, digits=0)
+        retry_spin.set_numeric(True)
+        self.asr_controls["ASR_RETRY_COUNT"] = retry_spin
+        self._attach_asr_flow_control(options_flow, "Retries", retry_spin)
         self.asr_controls["VOICE_PASTE_BACKEND"] = combo_text_from_values(("uinput", "auto", "wtype"))
         self._attach_asr_flow_control(options_flow, "Paste Backend", self.asr_controls["VOICE_PASTE_BACKEND"])
         tmux_context = Gtk.Switch()
@@ -681,11 +1027,39 @@ class UConsoleHelperWindow(Gtk.Window):
 
         return page
 
-    def _attach_power_control(self, grid: Gtk.Grid, title: str, widget: Gtk.Widget, row: int) -> None:
+    def _attach_power_control(
+        self,
+        grid: Gtk.Grid,
+        key: str,
+        title: str,
+        widget: Gtk.Widget,
+        row: int,
+        tooltip: str | None = None,
+    ) -> None:
         label = Gtk.Label(label=title, xalign=0)
         label.get_style_context().add_class("muted")
+        if tooltip:
+            label.set_tooltip_text(tooltip)
+            widget.set_tooltip_text(tooltip)
         grid.attach(label, 0, row, 1, 1)
         grid.attach(widget, 1, row, 1, 1)
+        self.power_control_rows[key] = (label, widget)
+
+    def sync_power_screen_mode_visibility(self, profile: str) -> None:
+        mode = widget_text(self.power_controls.get(f"POWERSAVER_{profile}_SCREEN_MODE")).lower()
+        auto = mode == "auto"
+        visibility = {
+            f"POWERSAVER_{profile}_AUTO_BATTERY_PUTDOWN_TIMEOUT_SEC": auto,
+            f"POWERSAVER_{profile}_AUTO_AC_PUTDOWN_TIMEOUT_SEC": auto,
+            f"POWERSAVER_{profile}_STAND_MODE": auto,
+        }
+        for key, visible in visibility.items():
+            row = self.power_control_rows.get(key)
+            if row is None:
+                continue
+            label, widget = row
+            label.set_visible(visible)
+            widget.set_visible(visible)
 
     def _attach_asr_flow_control(self, flow: Gtk.FlowBox, title: str, widget: Gtk.Widget) -> None:
         row = asr_control_row(title, widget)
@@ -705,44 +1079,29 @@ class UConsoleHelperWindow(Gtk.Window):
         return tree
 
     def add_mapper_desktop_shortcut(self) -> None:
-        values = self.mapper_row_dialog(
+        self.show_mapper_row_panel(
             "Add Desktop Shortcut",
             [
                 ("Scope", "rightshift"),
                 ("Key", "x"),
                 ("Command / Action", "~/.local/bin/command"),
             ],
+            self.mapper_desktop_store,
         )
-        if values is not None:
-            self.mapper_desktop_store.append(values)
 
     def add_mapper_binding(self) -> None:
-        values = self.mapper_row_dialog(
+        self.show_mapper_row_panel(
             "Add Mapper Binding",
             [
                 ("Device", "gamepad"),
                 ("Buttons", "BTN_THUMB"),
                 ("Action", "command ~/.local/bin/command"),
             ],
+            self.mapper_binding_store,
         )
-        if values is not None:
-            self.mapper_binding_store.append(values)
 
-    def mapper_row_dialog(self, title: str, fields: list[tuple[str, str]]) -> list[str] | None:
-        dialog = Gtk.Dialog(
-            title=title,
-            transient_for=self,
-            flags=0,
-            buttons=(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OK, Gtk.ResponseType.OK),
-        )
-        dialog.set_default_response(Gtk.ResponseType.OK)
-        content = dialog.get_content_area()
+    def show_mapper_row_panel(self, title: str, fields: list[tuple[str, str]], store: Gtk.ListStore) -> None:
         grid = Gtk.Grid(column_spacing=12, row_spacing=10)
-        grid.set_margin_top(12)
-        grid.set_margin_bottom(12)
-        grid.set_margin_start(12)
-        grid.set_margin_end(12)
-        content.pack_start(grid, True, True, 0)
         entries: list[Gtk.Entry] = []
         for row, (label_text, default) in enumerate(fields):
             label = Gtk.Label(label=label_text, xalign=0)
@@ -753,13 +1112,26 @@ class UConsoleHelperWindow(Gtk.Window):
             grid.attach(label, 0, row, 1, 1)
             grid.attach(entry, 1, row, 1, 1)
             entries.append(entry)
-        dialog.show_all()
-        response = dialog.run()
+
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        cancel_button = Gtk.Button(label="Cancel")
+        cancel_button.connect("clicked", lambda _button: self.hide_inline_panel())
+        buttons.pack_start(cancel_button, False, False, 0)
+        add_button = Gtk.Button(label="Add")
+        add_button.get_style_context().add_class("suggested-action")
+        add_button.connect("clicked", lambda _button: self.finish_mapper_row_panel(store, entries))
+        buttons.pack_start(add_button, False, False, 0)
+        self.show_inline_panel(title, [grid, buttons], show_close=False)
+        if entries:
+            entries[0].grab_focus()
+
+    def finish_mapper_row_panel(self, store: Gtk.ListStore, entries: list[Gtk.Entry]) -> None:
         values = [entry.get_text().strip() for entry in entries]
-        dialog.destroy()
-        if response != Gtk.ResponseType.OK or not all(values):
-            return None
-        return values
+        if not all(values):
+            self.show_error("配置错误", "请填写所有字段。")
+            return
+        store.append(values)
+        self.hide_inline_panel()
 
     def remove_selected_tree_row(self, tree: Gtk.TreeView, store: Gtk.ListStore | None = None) -> None:
         _model, tree_iter = tree.get_selection().get_selected()
@@ -928,6 +1300,33 @@ class UConsoleHelperWindow(Gtk.Window):
                 border-color: #39e58a;
                 color: #ffffff;
             }
+            .mcu-event-pill {
+                background: #171b20;
+                border: 1px solid #33464c;
+                border-radius: 6px;
+                color: #b7c8cc;
+                padding: 4px 8px;
+                font-weight: 700;
+            }
+            .mcu-event-pill.mcu-event-active {
+                background: #2f6f6d;
+                border-color: #61d6d6;
+                color: #ffffff;
+            }
+            .inline-panel {
+                background: #2a1717;
+                border: 1px solid #b84a4a;
+                border-radius: 8px;
+                padding: 8px 10px;
+            }
+            .inline-panel-title {
+                color: #ffd7d7;
+                font-weight: 700;
+            }
+            .inline-panel-close {
+                min-height: 28px;
+                padding: 3px 8px;
+            }
             button.suggested-action {
                 background: #2f6f6d;
                 border-color: #2f6f6d;
@@ -992,6 +1391,8 @@ class UConsoleHelperWindow(Gtk.Window):
         )
 
     def set_tab(self, name: str) -> None:
+        if name == "dhcp":
+            name = "lan"
         current = self.stack.get_visible_child_name()
         if current == name:
             return
@@ -999,35 +1400,32 @@ class UConsoleHelperWindow(Gtk.Window):
         if entering_power:
             self.reset_app_power_ranking()
         self.stack.set_visible_child_name(name)
-        self.refresh_page(name)
+        self.refresh_page(name, reload_config=True)
 
     def update_header(self) -> None:
         page = self.stack.get_visible_child_name() or "dashboard"
-        dot = "●" if self.dhcp_running else "○"
-        self.dhcp_tab_label.set_markup(f"{dot} {underlined_markup('DHCP', 'D')}")
         self.tailscale_tab_label.set_markup(tailscale_tab_markup())
         self.power_tab_label.set_markup(power_tab_markup())
+        toggle_style_class(self.mcu_tab, "tab-active", page == "mcu")
         self.mapper_tab_label.set_markup(mapper_tab_markup())
         toggle_style_class(self.dashboard_tab, "tab-active", page == "dashboard")
-        toggle_style_class(self.dhcp_tab, "tab-active", page == "dhcp")
-        toggle_style_class(self.lanscan_tab, "tab-active", page == "lanscan")
-        toggle_style_class(self.interface_tab, "tab-active", page == "interface")
+        toggle_style_class(self.lan_tab, "tab-active", page == "lan")
         toggle_style_class(self.tailscale_tab, "tab-active", page == "tailscale")
         toggle_style_class(self.power_tab, "tab-active", page == "power")
         toggle_style_class(self.utils_tab, "tab-active", page == "utils")
         toggle_style_class(self.mapper_tab, "tab-active", page == "mapper")
         toggle_style_class(self.asr_tab, "tab-active", page == "asr")
-        self.tailscale_reconnect_button.set_visible(page in {"dhcp", "tailscale", "power", "mapper"})
+        self.tailscale_reconnect_button.set_visible(page in {"lan", "tailscale", "power", "mapper"})
         self.tailscale_reconnect_button.set_sensitive(page != "tailscale" or not self.tailscale_reconnecting)
         reconnect_context = self.tailscale_reconnect_button.get_style_context()
         for class_name in ("action-ready", "action-active", "action-busy"):
             reconnect_context.remove_class(class_name)
-        if page == "dhcp":
+        if page == "lan":
             if self.dhcp_running:
                 set_underlined_button_label(self.tailscale_reconnect_button, "Disable", "E")
                 reconnect_context.add_class("action-active")
             else:
-                set_underlined_button_label(self.tailscale_reconnect_button, "Enable", "E")
+                set_underlined_button_label(self.tailscale_reconnect_button, "DHCP", "D")
                 reconnect_context.add_class("action-ready")
         elif page == "power":
             enabled = powersaver_enabled()
@@ -1047,21 +1445,23 @@ class UConsoleHelperWindow(Gtk.Window):
         for class_name in ("action-ready", "action-active", "action-busy"):
             action_context.remove_class(class_name)
 
-        if page == "dhcp":
-            self.context_action_button.hide()
-            return
-
         if page in {"power", "mapper", "asr"}:
             self.context_action_button.show()
             set_underlined_button_label(self.context_action_button, "Save", "V")
             action_context.add_class("action-ready")
             return
 
-        if page == "lanscan" and self.scan_running:
+        if page == "mcu":
+            self.context_action_button.show()
+            set_underlined_button_label(self.context_action_button, "Bootloader", "B")
+            action_context.add_class("action-ready")
+            return
+
+        if page == "lan" and self.scan_running:
             self.context_action_button.show()
             set_underlined_button_label(self.context_action_button, "Stop", "S")
             action_context.add_class("action-busy")
-        elif page == "lanscan":
+        elif page == "lan":
             self.context_action_button.show()
             set_underlined_button_label(self.context_action_button, "Scan", "S")
             action_context.add_class("action-ready")
@@ -1092,7 +1492,7 @@ class UConsoleHelperWindow(Gtk.Window):
 
     def run_secondary_header_action(self) -> None:
         page = self.stack.get_visible_child_name()
-        if page == "dhcp":
+        if page == "lan":
             if self.dhcp_running:
                 self.stop_server()
             else:
@@ -1106,30 +1506,38 @@ class UConsoleHelperWindow(Gtk.Window):
 
     def run_context_action(self) -> None:
         page = self.stack.get_visible_child_name()
-        if page == "dhcp":
-            if self.dhcp_running:
-                self.stop_server()
-            else:
-                self.start_server()
-            return
-
-        if page == "interface":
-            self.refresh_interface_status()
-            return
         if page == "tailscale":
             self.refresh_tailscale_status()
             return
         if page == "power":
-            if self.save_power_policy():
+            self.set_header_button_busy(self.context_action_button, "Saving", "V")
+            try:
+                saved = self.save_power_policy()
+            except Exception as exc:
+                self.show_error("Save policy failed", str(exc))
+                saved = False
+            if saved:
                 self.flash_header_button(self.context_action_button, "Saved", "V")
+            else:
+                self.update_header()
+            return
+        if page == "mcu":
+            self.trigger_mcu_bootloader()
+            self.flash_header_button(self.context_action_button, "Sent", "B")
             return
         if page == "mapper":
+            self.set_header_button_busy(self.context_action_button, "Saving", "V")
             if self.save_mapper_all():
                 self.flash_header_button(self.context_action_button, "Saved", "V")
+            else:
+                self.update_header()
             return
         if page == "asr":
+            self.set_header_button_busy(self.context_action_button, "Saving", "V")
             if self.save_asr_config():
                 self.flash_header_button(self.context_action_button, "Saved", "V")
+            else:
+                self.update_header()
             return
         if page == "dashboard":
             self.refresh_dashboard()
@@ -1141,26 +1549,31 @@ class UConsoleHelperWindow(Gtk.Window):
             self.start_lan_scan()
 
     def run_refresh_action(self) -> None:
-        if self.refresh_page(self.stack.get_visible_child_name()):
+        if self.refresh_page(self.stack.get_visible_child_name(), reload_config=True):
             self.flash_header_button(self.header_refresh_button, "Refreshed", "R")
 
-    def refresh_page(self, page: str | None) -> bool:
+    def refresh_page(self, page: str | None, *, reload_config: bool = False) -> bool:
         if page == "dashboard":
             self.refresh_dashboard()
-        elif page in {"dhcp", "lanscan"}:
-            self.refresh_interfaces()
-        elif page == "interface":
+        elif page == "lan":
+            self.refresh_dhcp_defaults()
             self.refresh_interface_status()
         elif page == "tailscale":
             self.refresh_tailscale_status()
         elif page == "power":
-            self.refresh_power_status()
+            self.refresh_power_status(reload_config=reload_config)
         elif page == "utils":
             self.refresh_utils_status()
         elif page == "mapper":
-            self.refresh_mapper_status()
+            if reload_config:
+                self.refresh_mapper_status()
+            else:
+                self.update_header()
         elif page == "asr":
-            self.load_asr_config_controls()
+            if reload_config:
+                self.load_asr_config_controls()
+        elif page == "mcu":
+            self.refresh_mcu_status()
         else:
             return False
         return True
@@ -1172,6 +1585,15 @@ class UConsoleHelperWindow(Gtk.Window):
         context.add_class("action-success")
         set_underlined_button_label(button, text, key)
         GLib.timeout_add(900, self.finish_header_button_flash, button)
+
+    def set_header_button_busy(self, button: Gtk.Button, text: str, key: str) -> None:
+        context = button.get_style_context()
+        for class_name in ("action-ready", "action-active", "action-success"):
+            context.remove_class(class_name)
+        context.add_class("action-busy")
+        set_underlined_button_label(button, text, key)
+        while Gtk.events_pending():
+            Gtk.main_iteration()
 
     def finish_header_button_flash(self, button: Gtk.Button) -> bool:
         button.get_style_context().remove_class("action-success")
@@ -1190,27 +1612,24 @@ class UConsoleHelperWindow(Gtk.Window):
             self.set_tab("dashboard")
             return True
         if ctrl and key == "2":
-            self.set_tab("dhcp")
+            self.set_tab("lan")
             return True
         if ctrl and key == "3":
-            self.set_tab("lanscan")
-            return True
-        if ctrl and key == "4":
-            self.set_tab("interface")
-            return True
-        if ctrl and key == "5":
             self.set_tab("tailscale")
             return True
-        if ctrl and key == "6":
+        if ctrl and key == "4":
             self.set_tab("power")
             return True
-        if ctrl and key == "7":
+        if ctrl and key == "5":
+            self.set_tab("mcu")
+            return True
+        if ctrl and key == "6":
             self.set_tab("utils")
             return True
-        if ctrl and key == "8":
+        if ctrl and key == "7":
             self.set_tab("mapper")
             return True
-        if ctrl and key == "9":
+        if ctrl and key == "8":
             self.set_tab("asr")
             return True
         if alt and key in {"Left", "Right"}:
@@ -1221,14 +1640,8 @@ class UConsoleHelperWindow(Gtk.Window):
         if key_lower == "h":
             self.set_tab("dashboard")
             return True
-        if key_lower == "d":
-            self.set_tab("dhcp")
-            return True
         if key_lower == "l":
-            self.set_tab("lanscan")
-            return True
-        if key_lower == "i":
-            self.set_tab("interface")
+            self.set_tab("lan")
             return True
         if key_lower == "t":
             self.set_tab("tailscale")
@@ -1248,7 +1661,7 @@ class UConsoleHelperWindow(Gtk.Window):
         if key_lower == "r":
             self.run_refresh_action()
             return True
-        if key_lower == "s" and self.stack.get_visible_child_name() == "lanscan":
+        if key_lower == "s" and self.stack.get_visible_child_name() == "lan":
             self.run_context_action()
             return True
         if key_lower == "v" and self.stack.get_visible_child_name() in {"power", "mapper", "asr"}:
@@ -1257,13 +1670,16 @@ class UConsoleHelperWindow(Gtk.Window):
         if key_lower == "c" and self.stack.get_visible_child_name() == "tailscale":
             self.run_secondary_header_action()
             return True
+        if key_lower == "c":
+            self.set_tab("mcu")
+            return True
         if key in {"Return", "KP_Enter"}:
             self.run_context_action()
             return True
         return False
 
     def switch_tab(self, direction: int) -> None:
-        pages = ["dashboard", "dhcp", "lanscan", "interface", "tailscale", "power", "utils", "mapper", "asr"]
+        pages = ["dashboard", "lan", "tailscale", "power", "mcu", "utils", "mapper", "asr"]
         current = self.stack.get_visible_child_name()
         try:
             index = pages.index(current)
@@ -1357,31 +1773,6 @@ class UConsoleHelperWindow(Gtk.Window):
         except ValueError:
             return self.dhcp_defaults.get(key, DEFAULTS[key])
 
-    def refresh_interfaces(self) -> None:
-        self.refresh_dhcp_defaults()
-        interfaces = discover_interfaces()
-        scan_interfaces = discover_scan_interfaces()
-        current = self.selected_interface_name()
-        self.interface_store.clear()
-        scan_current = self.selected_scan_interface_name()
-        self.scan_interface_store.clear()
-        selected_index = populate_interface_store(
-            self.interface_store,
-            interfaces,
-            current,
-            preferred=preferred_dhcp_interface(interfaces),
-        )
-        scan_selected_index = populate_interface_store(
-            self.scan_interface_store,
-            scan_interfaces,
-            scan_current,
-            preferred=preferred_scan_interface(scan_interfaces),
-        )
-        if selected_index != -1:
-            self.interface_combo.set_active(selected_index)
-        if scan_selected_index != -1:
-            self.scan_interface_combo.set_active(scan_selected_index)
-
     def refresh_dhcp_defaults(self) -> None:
         current_defaults = self.dhcp_defaults
         current_values = self.current_dhcp_form_values()
@@ -1390,7 +1781,28 @@ class UConsoleHelperWindow(Gtk.Window):
         self.dhcp_defaults = dhcp_defaults()
         self.set_dhcp_config_values(self.dhcp_defaults)
 
+    def on_interface_pin_selection_changed(self, selection: Gtk.TreeSelection) -> None:
+        self.sync_interface_selection(selection, self.interface_tree)
+
+    def on_interface_scroll_selection_changed(self, selection: Gtk.TreeSelection) -> None:
+        self.sync_interface_selection(selection, self.interface_pin_tree)
+
+    def sync_interface_selection(self, source_selection: Gtk.TreeSelection, target_tree: Gtk.TreeView | None) -> None:
+        if target_tree is None:
+            return
+        model, tree_iter = source_selection.get_selected()
+        if tree_iter is None:
+            return
+        path = model.get_path(tree_iter)
+        target_selection = target_tree.get_selection()
+        target_model, target_iter = target_selection.get_selected()
+        if target_iter is not None and target_model.get_path(target_iter) == path:
+            return
+        target_selection.select_path(path)
+        target_tree.scroll_to_cell(path, None, False, 0.0, 0.0)
+
     def refresh_interface_status(self) -> None:
+        selected_name = self.selected_scan_interface_name()
         self.interface_status_store.clear()
         wifi_signals = wifi_signal_by_device()
         modem_signals = modem_signal_by_port()
@@ -1427,6 +1839,7 @@ class UConsoleHelperWindow(Gtk.Window):
                     row_color,
                 ]
             )
+        self.select_scan_interface(selected_name or preferred_scan_interface(discover_scan_interfaces()))
 
     def refresh_tailscale_status(self) -> None:
         status = tailscale_status()
@@ -1435,7 +1848,7 @@ class UConsoleHelperWindow(Gtk.Window):
             self.tailscale_summary_label.set_text("Tailscale status unavailable")
             return
 
-        self.tailscale_summary_label.set_text(tailscale_admin_summary(status))
+        self.tailscale_summary_label.set_text(tailscale_network_summary())
         for device in tailscale_devices(status):
             self.tailscale_store.append(
                 [
@@ -1465,12 +1878,15 @@ class UConsoleHelperWindow(Gtk.Window):
         thread.start()
 
     def _tailscale_reconnect_worker(self) -> None:
-        for command in (["tailscale", "down"], ["tailscale", "up"]):
+        commands = (["tailscale", "down"], ["tailscale", "up"])
+        for index, command in enumerate(commands):
             result = subprocess.run(command, text=True, capture_output=True, check=False)
             if result.returncode != 0:
                 error = f"{' '.join(command)} failed:\n{combine_output(result) or '命令执行失败。'}"
                 GLib.idle_add(self.finish_tailscale_reconnect, error)
                 return
+            if index == 0:
+                time.sleep(2)
         GLib.idle_add(self.finish_tailscale_reconnect, None)
 
     def finish_tailscale_reconnect(self, error: str | None) -> bool:
@@ -1482,13 +1898,41 @@ class UConsoleHelperWindow(Gtk.Window):
         return False
 
     def refresh_dashboard(self) -> None:
-        cpu_sample = read_cpu_sample()
-        cpu_percent = cpu_usage_percent(self.dashboard_cpu_sample, cpu_sample)
+        if self.dashboard_refresh_running:
+            return
+        self.dashboard_refresh_running = True
+        if all((label.get_text() or "-") == "-" for label in self.dashboard_labels.values()):
+            for label in self.dashboard_labels.values():
+                label.set_text("Loading...")
+        thread = threading.Thread(target=self._dashboard_refresh_worker, daemon=True)
+        thread.start()
+
+    def _dashboard_refresh_worker(self) -> None:
+        try:
+            cpu_sample = read_cpu_sample()
+            cpu_percent = cpu_usage_percent(self.dashboard_cpu_sample, cpu_sample)
+            net_sample = read_network_sample()
+            net_rates = network_rates(self.dashboard_net_sample, net_sample)
+            data = dashboard_status(cpu_percent=cpu_percent, net_rates=net_rates)
+        except Exception as exc:
+            GLib.idle_add(self.finish_dashboard_refresh_error, str(exc))
+            return
+        GLib.idle_add(self.finish_dashboard_refresh, data, cpu_sample, net_sample)
+
+    def finish_dashboard_refresh_error(self, error: str) -> bool:
+        self.dashboard_refresh_running = False
+        self.show_error("Dashboard refresh failed", error)
+        return False
+
+    def finish_dashboard_refresh(
+        self,
+        data: dict[str, dict[str, object]],
+        cpu_sample: dict[str, int],
+        net_sample: dict[str, tuple[int, int]],
+    ) -> bool:
         self.dashboard_cpu_sample = cpu_sample
-        net_sample = read_network_sample()
-        net_rates = network_rates(self.dashboard_net_sample, net_sample)
         self.dashboard_net_sample = net_sample
-        data = dashboard_status(cpu_percent=cpu_percent, net_rates=net_rates)
+        self.dashboard_refresh_running = False
         for key, label in self.dashboard_labels.items():
             item = data.get(key, {})
             if isinstance(item, dict):
@@ -1508,18 +1952,214 @@ class UConsoleHelperWindow(Gtk.Window):
                     secondary_bar.set_text(str(item.get("second_meter") or f"{second_percent}%"))
             else:
                 label.set_text(str(item or "-"))
+        return False
 
     def auto_refresh_visible_status(self) -> bool:
+        self.gui_refresh_active = self.should_refresh_ui()
+        if not self.should_refresh_ui():
+            return True
         self.refresh_page(self.stack.get_visible_child_name())
         return True
 
-    def refresh_power_status(self) -> None:
+    def on_visible_page_changed(self, *_args: object) -> None:
+        self.current_page_name = self.stack.get_visible_child_name() or "dashboard"
+        self.update_header()
+
+    def on_window_state_event(self, _window: Gtk.Window, _event: Gdk.EventWindowState) -> bool:
+        self.gui_refresh_active = self.should_refresh_ui()
+        return False
+
+    def on_focus_visibility_event(self, *_args: object) -> bool:
+        self.gui_refresh_active = self.should_refresh_ui()
+        return False
+
+    def should_refresh_ui(self) -> bool:
+        if not self.get_visible():
+            return False
+        window = self.get_window()
+        if window is None:
+            return True
+        state = window.get_state()
+        if state & (Gdk.WindowState.ICONIFIED | Gdk.WindowState.WITHDRAWN):
+            return False
+        return self.is_active()
+
+    def refresh_power_status(self, *, reload_config: bool = False) -> None:
         status = power_status()
         for key, label in self.power_labels.items():
             label.set_text(status.get(key, "-"))
         self.refresh_app_power_ranking()
-        self.load_power_policy_controls()
+        if reload_config:
+            self.load_power_policy_controls()
         self.update_header()
+
+    def refresh_mcu_status(self) -> None:
+        if not self.mcu_page_ready:
+            return
+        snapshot = self.mcu_latest_snapshot or mcu_snapshot_placeholder()
+        self.mcu_last_rendered = snapshot
+        self.mcu_status_labels["device"].set_text(mcu_device_label(snapshot.device))
+        self.mcu_status_labels["mode"].set_text(snapshot.device.mode or "-")
+        self.mcu_status_labels["state"].set_text(snapshot.state)
+        self.mcu_status_labels["event"].set_text(snapshot.event)
+        self.mcu_status_labels["motion"].set_text(snapshot.motion)
+        self.mcu_status_labels["pose"].set_text(format_pose_label(snapshot.pose))
+        self.mcu_status_labels["mic"].set_text(format_mic_label(snapshot))
+        self.mcu_status_labels["raw_imu"].set_text(snapshot.raw_line or "-")
+        self.mcu_status_labels["light"].set_text(format_light_label(snapshot))
+        self.mcu_status_labels["updated"].set_text(mcu_updated_label(snapshot))
+        self.mcu_status_labels["error"].set_text(snapshot.last_error or "-")
+        for event_name, label in self.mcu_event_labels.items():
+            toggle_style_class(label, "mcu-event-active", event_name == snapshot.state)
+        self.mcu_summary_label.set_text(mcu_summary_text(snapshot))
+        self.mcu_action_label.set_text(mcu_action_text(snapshot))
+        self.mcu_hint_label.set_text(mcu_hint_text(snapshot))
+        self.update_mcu_mic_assist_switch(snapshot)
+        self.mcu_event_store.clear()
+        for row in mcu_recent_rows(snapshot):
+            self.mcu_event_store.append(row)
+        self.update_header()
+
+    def _mcu_monitor_worker(self) -> None:
+        state = McuTelemetryState()
+        while not self.mcu_monitor_stop.is_set():
+            if not self.gui_refresh_active or self.current_page_name != "mcu":
+                time.sleep(5.0)
+                continue
+            try:
+                snapshot = read_mcu_snapshot(state)
+                state = snapshot_to_telemetry_state(snapshot, state)
+                GLib.idle_add(self.finish_mcu_refresh, snapshot)
+            except Exception as exc:
+                device = find_xiao_device()
+                if state.samples:
+                    last_sample = state.samples[-1]
+                    snapshot = McuStateSnapshot(
+                        device=device,
+                        state=state.last_state or ("未连接" if not device.present else ("刷机模式" if device.mode == "bootloader" else "已连接")),
+                        event=state.last_event or "等待样本",
+                        motion=state.last_motion or "-",
+                        still_for=max(0.0, time.time() - state.stable_since) if state.stable_since is not None else 0.0,
+                        g_force=vector_magnitude(last_sample.ax, last_sample.ay, last_sample.az),
+                        tilt_deg=estimate_tilt_deg(last_sample.ax, last_sample.ay, last_sample.az),
+                        sample_rate_hz=estimate_sample_rate(state.samples),
+                        pose=last_sample.firmware_pose or "-",
+                        light_lux=last_sample.light_lux,
+                        smoothed_light_lux=state.smoothed_light_lux,
+                        suggested_backlight=state.suggested_backlight,
+                        light_raw=last_sample.light_raw,
+                        light_ready=last_sample.light_ready,
+                        last_update=last_sample.timestamp,
+                        raw_line=format_sample_line(last_sample),
+                        last_error=str(exc),
+                        mic_ready=last_sample.mic_ready,
+                        mic_enabled=last_sample.mic_enabled,
+                        mic_assist=last_sample.mic_assist,
+                        mic_peak=last_sample.mic_peak,
+                        mic_recent_peak=last_sample.mic_recent_peak,
+                        recent_rows=recent_rows_from_samples(state.samples),
+                    )
+                    GLib.idle_add(self.finish_mcu_refresh, snapshot)
+                    time.sleep(1.5)
+                    continue
+                snapshot = McuStateSnapshot(
+                    device=device,
+                    state="未连接" if not device.present else ("刷机模式" if device.mode == "bootloader" else "等待数据"),
+                    event="等待数据",
+                    motion="-",
+                    still_for=0.0,
+                    g_force=0.0,
+                    tilt_deg=0.0,
+                    sample_rate_hz=0.0,
+                    pose="-",
+                    light_lux=None,
+                    smoothed_light_lux=state.smoothed_light_lux,
+                    suggested_backlight=state.suggested_backlight,
+                    light_raw=None,
+                    light_ready=False,
+                    last_update=time.time(),
+                    raw_line="",
+                    last_error=str(exc),
+                )
+                GLib.idle_add(self.finish_mcu_refresh, snapshot)
+            time.sleep(1.5)
+
+    def finish_mcu_refresh(self, snapshot: McuStateSnapshot) -> bool:
+        self.mcu_latest_snapshot = snapshot
+        if self.stack.get_visible_child_name() == "mcu":
+            self.refresh_mcu_status()
+        return False
+
+    def trigger_mcu_bootloader(self) -> None:
+        device = find_xiao_device()
+        if not device.present:
+            self.show_error("XIAO not found", "没有检测到 XIAO 设备。")
+            return
+        if device.tty:
+            try:
+                touch_xiao_bootloader(device.tty)
+                self.mcu_action_label.set_text("Bootloader request sent. Watch for UF2 mode.")
+            except OSError as exc:
+                self.show_error("Bootloader request failed", str(exc))
+                return
+        else:
+            self.show_error("Bootloader request failed", "当前没有可用的串口，无法发送 1200-baud 请求。")
+
+    def calibrate_mcu_pose(self) -> None:
+        message = Gtk.Label(label="请先将机器水平放置好，保持静止后再确认校准。", xalign=0)
+        message.set_line_wrap(True)
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        cancel_button = Gtk.Button(label="Cancel")
+        cancel_button.connect("clicked", lambda _button: self.hide_inline_panel())
+        confirm_button = Gtk.Button(label="Confirm Calibration")
+        confirm_button.get_style_context().add_class("suggested-action")
+        confirm_button.connect("clicked", lambda _button: self.confirm_mcu_pose_calibration())
+        buttons.pack_start(cancel_button, False, False, 0)
+        buttons.pack_start(confirm_button, False, False, 0)
+        self.show_inline_panel("放置姿态校准", [message, buttons], show_close=False)
+
+    def confirm_mcu_pose_calibration(self) -> None:
+        try:
+            send_xiao_command("calibrate pose")
+        except OSError as exc:
+            self.show_error("Pose calibration failed", str(exc))
+            return
+        message = Gtk.Label(label="校准已保存。", xalign=0)
+        message.set_line_wrap(True)
+        self.show_inline_panel("放置姿态校准", [message], show_close=False)
+        GLib.timeout_add(1200, self.hide_inline_panel_after_timeout)
+        self.mcu_action_label.set_text("放置姿态校准已发送：当前摆放姿态会作为新的放置基准。")
+
+    def on_mcu_mic_assist_changed(self, switch: Gtk.Switch, _pspec: object) -> None:
+        if self.mcu_mic_assist_updating:
+            return
+        command = "mic assist on" if switch.get_active() else "mic assist off"
+        try:
+            send_xiao_command(command)
+        except OSError as exc:
+            self.show_error("Mic assist failed", str(exc))
+            self.mcu_mic_assist_updating = True
+            switch.set_active(not switch.get_active())
+            self.mcu_mic_assist_updating = False
+            return
+        self.mcu_action_label.set_text("麦克风辅助已更新。")
+
+    def update_mcu_mic_assist_switch(self, snapshot: McuStateSnapshot) -> None:
+        if not hasattr(self, "mcu_mic_assist_switch"):
+            return
+        enabled = snapshot.device.present and snapshot.device.mode != "bootloader" and bool(snapshot.device.tty)
+        self.mcu_mic_assist_switch.set_sensitive(enabled)
+        if snapshot.mic_assist is None:
+            return
+        if self.mcu_mic_assist_switch.get_active() == snapshot.mic_assist:
+            return
+        self.mcu_mic_assist_updating = True
+        self.mcu_mic_assist_switch.set_active(snapshot.mic_assist)
+        self.mcu_mic_assist_updating = False
+
+    def hide_inline_panel_after_timeout(self) -> bool:
+        self.hide_inline_panel()
+        return False
 
     def refresh_app_power_ranking(self) -> None:
         now = time.monotonic()
@@ -1537,7 +2177,7 @@ class UConsoleHelperWindow(Gtk.Window):
         self.app_power_previous_time = now
         self.app_power_store.clear()
         if not rows:
-            self.app_power_store.append(["No active apps", "-", "-", "-", "-"])
+            self.app_power_store.append(["No high power apps", "-", "-", "-", "-"])
             return
         for row in rows[:5]:
             self.app_power_store.append(
@@ -1563,10 +2203,21 @@ class UConsoleHelperWindow(Gtk.Window):
         else:
             self.utils_battery_label.set_text("Unknown")
         self.utils_calibrate_button.set_sensitive(capacity == 100)
+        self.utils_reset_xiao_usb_button.set_sensitive(not self.utils_usb_reset_running)
         if capacity == 100:
             self.utils_calibrate_button.set_tooltip_text("电量为 100%，可以执行电量校准。")
         else:
             self.utils_calibrate_button.set_tooltip_text("只有电池电量为 100% 时才能执行电量校准。")
+        self.refresh_utils_usb_devices()
+
+    def refresh_utils_usb_devices(self) -> None:
+        self.utils_usb_store.clear()
+        rows = usb_hub_device_rows(("1-1.4", "1-1.4.2"))
+        if not rows:
+            self.utils_usb_store.append(["-", "-", "No USB devices", "-", "-"])
+            return
+        for row in rows:
+            self.utils_usb_store.append(list(row))
 
     def calibrate_battery(self) -> None:
         capacity = battery_capacity_percent()
@@ -1582,6 +2233,53 @@ class UConsoleHelperWindow(Gtk.Window):
             return
         self.utils_status_label.set_text("Battery calibration command executed.")
         self.refresh_utils_status()
+
+    def reset_xiao_usb_hub(self) -> None:
+        if self.utils_usb_reset_running:
+            return
+        self.utils_usb_reset_running = True
+        self.utils_reset_xiao_usb_button.set_sensitive(False)
+        self.utils_status_label.set_text("Resetting USB2.0 HUB...")
+        thread = threading.Thread(target=self._reset_xiao_usb_hub_worker, daemon=True)
+        thread.start()
+
+    def _reset_xiao_usb_hub_worker(self) -> None:
+        messages: list[str] = []
+        error = ""
+        try:
+            for index, target in enumerate(xiao_usb_reset_targets()):
+                reset_usb_device(target, settle_seconds=2.0 if index == 0 else 3.0)
+                messages.append(f"reset {usb_device_product(target)}")
+                time.sleep(1.0)
+                device = find_xiao_device()
+                if device.present and device.tty:
+                    GLib.idle_add(
+                        self.finish_xiao_usb_hub_reset,
+                        f"USB2.0 HUB reset done: /dev/{device.tty} ({', '.join(messages)})",
+                        None,
+                    )
+                    return
+        except Exception as exc:
+            error = str(exc)
+        device = find_xiao_device()
+        if device.present:
+            if device.tty:
+                message = f"USB2.0 HUB reset done: /dev/{device.tty}"
+            else:
+                message = "USB2.0 HUB reset done, but ttyACM is not ready."
+        else:
+            message = "XIAO still not detected after USB hub reset."
+        if messages:
+            message = f"{message} ({', '.join(messages)})"
+        GLib.idle_add(self.finish_xiao_usb_hub_reset, message, error or None)
+
+    def finish_xiao_usb_hub_reset(self, message: str, error: str | None) -> bool:
+        self.utils_usb_reset_running = False
+        self.refresh_utils_status()
+        self.utils_status_label.set_text(message)
+        if error:
+            self.show_error("USB2.0 HUB reset failed", error)
+        return False
 
     def refresh_mapper_status(self) -> None:
         self.load_mapper_shortcuts()
@@ -1614,7 +2312,9 @@ class UConsoleHelperWindow(Gtk.Window):
         self.asr_status_label.set_text("")
 
     def save_asr_config(self) -> bool:
-        values = default_asr_config()
+        values = env_config(MAPPER_ASR_CONFIG, default_asr_config())
+        for key, value in default_asr_config().items():
+            values.setdefault(key, value)
         for key, widget in self.asr_controls.items():
             if isinstance(widget, Gtk.Switch):
                 values[key] = "1" if widget.get_active() else "0"
@@ -1661,9 +2361,15 @@ class UConsoleHelperWindow(Gtk.Window):
                     value = unknown_action_display_value(value)
                 elif key.endswith("_SCREEN_TIMEOUT_SEC"):
                     value = screen_timeout_display_value(value)
+                elif "_AUTO_" in key and key.endswith("_TIMEOUT_SEC"):
+                    value = auto_screen_timeout_display_value(value)
+                elif key.endswith("_SCREEN_MODE"):
+                    value = screen_mode_display_value(value)
                 set_combo_text(widget, value)
             elif isinstance(widget, Gtk.Entry):
                 widget.set_text(value)
+        for profile in ("ECO", "BALANCED", "PERFORMANCE"):
+            self.sync_power_screen_mode_visibility(profile)
 
     def save_power_policy(self) -> bool:
         try:
@@ -1672,21 +2378,19 @@ class UConsoleHelperWindow(Gtk.Window):
             self.show_error("Power policy error", str(exc))
             return False
         config_text = power_policy_config_text(values)
-        command = ["pkexec", "tee", str(SERVICE_CONFIG)]
-        if shutil.which("pkexec") is None:
-            command = ["sudo", "tee", str(SERVICE_CONFIG)]
-        result = subprocess.run(
-            command,
-            input=config_text,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            self.show_error("Save policy failed", combine_output(result) or "命令执行失败。")
+        if not self.write_power_config(config_text):
             return False
-        restart = self.run_systemctl(["restart", SYSTEM_SERVICE], "Restart service")
-        if restart.returncode != 0:
+        saved_values = helper_service_config()
+        mismatched = [
+            key
+            for key, value in values.items()
+            if key.startswith("POWERSAVER_") and saved_values.get(key) != value
+        ]
+        if mismatched:
+            self.show_error("Save policy failed", f"配置写入后校验失败: {mismatched[0]}")
+            return False
+        idle_restart = self.run_user_systemctl(["restart", "uconsole-helper-idle.service"], "Restart idle service")
+        if idle_restart.returncode != 0:
             return False
         self.refresh_power_status()
         return True
@@ -1713,17 +2417,26 @@ class UConsoleHelperWindow(Gtk.Window):
             self.show_error("Power policy error", str(exc))
             return
         config_text = power_policy_config_text(values)
-        command = ["pkexec", "tee", str(SERVICE_CONFIG)]
-        if shutil.which("pkexec") is None:
-            command = ["sudo", "tee", str(SERVICE_CONFIG)]
-        result = subprocess.run(command, input=config_text, text=True, capture_output=True, check=False)
-        if result.returncode != 0:
-            self.show_error("Save policy failed", combine_output(result) or "命令执行失败。")
-            return
-        restart = self.run_systemctl(["restart", SYSTEM_SERVICE], "Restart service")
-        if restart.returncode != 0:
+        if not self.write_power_config(config_text):
             return
         self.refresh_power_status()
+
+    def write_power_config(self, config_text: str) -> bool:
+        try:
+            result = subprocess.run(
+                ["sudo", "-n", "/usr/local/bin/uconsole-helper-service", "write-config"],
+                input=config_text,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        except OSError as exc:
+            self.show_error("Save policy failed", f"配置写入失败: {exc}")
+            return False
+        if result.returncode != 0:
+            self.show_error("Save policy failed", combine_output(result) or "配置写入失败。")
+            return False
+        return True
 
     def power_policy_values(self, enabled_override: bool | None = None) -> dict[str, str]:
         current_enabled = powersaver_enabled()
@@ -1740,12 +2453,22 @@ class UConsoleHelperWindow(Gtk.Window):
             ac_screen_key = f"POWERSAVER_{profile}_AC_SCREEN_TIMEOUT_SEC"
             unknown_key = f"POWERSAVER_{profile}_UNKNOWN_POWER_ACTION"
             wwan_key = f"POWERSAVER_{profile}_WWAN_POLICY"
+            screen_mode_key = f"POWERSAVER_{profile}_SCREEN_MODE"
+            auto_brightness_key = f"POWERSAVER_{profile}_AUTO_BRIGHTNESS"
+            stand_mode_key = f"POWERSAVER_{profile}_STAND_MODE"
+            auto_battery_key = f"POWERSAVER_{profile}_AUTO_BATTERY_PUTDOWN_TIMEOUT_SEC"
+            auto_ac_key = f"POWERSAVER_{profile}_AUTO_AC_PUTDOWN_TIMEOUT_SEC"
             values[battery_key] = widget_text(self.power_controls[battery_key])
             values[ac_key] = widget_text(self.power_controls[ac_key])
             values[battery_screen_key] = screen_timeout_config_value(widget_text(self.power_controls[battery_screen_key]))
             values[ac_screen_key] = screen_timeout_config_value(widget_text(self.power_controls[ac_screen_key]))
             values[unknown_key] = unknown_action_config_value(widget_text(self.power_controls[unknown_key]))
             values[wwan_key] = widget_text(self.power_controls[wwan_key])
+            values[screen_mode_key] = screen_mode_config_value(widget_text(self.power_controls[screen_mode_key]))
+            values[auto_brightness_key] = "1" if self.power_controls[auto_brightness_key].get_active() else "0"
+            values[stand_mode_key] = "1" if self.power_controls[stand_mode_key].get_active() else "0"
+            values[auto_battery_key] = auto_screen_timeout_config_value(widget_text(self.power_controls[auto_battery_key]))
+            values[auto_ac_key] = auto_screen_timeout_config_value(widget_text(self.power_controls[auto_ac_key]))
             validate_freq_pair(values[battery_key], f"{profile.title()} Battery MHz")
             if values[ac_key] != "restore":
                 validate_freq_pair(values[ac_key], f"{profile.title()} AC MHz")
@@ -1758,6 +2481,16 @@ class UConsoleHelperWindow(Gtk.Window):
                 raise ValueError(f"{profile.title()} Unknown must be AC, Battery, or Keep.")
             if values[wwan_key] not in {"keep", "off", "ondemand"}:
                 raise ValueError(f"{profile.title()} WWAN must be keep, off, or ondemand.")
+            if values[screen_mode_key] not in {"default", "auto"}:
+                raise ValueError(f"{profile.title()} Screen Mode must be Default or Auto.")
+            for key in (auto_battery_key, auto_ac_key):
+                try:
+                    if int(values[key]) < 0:
+                        raise ValueError
+                except ValueError as exc:
+                    raise ValueError(f"{profile.title()} auto screen timeouts must be seconds or Never.") from exc
+        values["POWERSAVER_BATTERY_SCREEN_TIMEOUT_SEC"] = values["POWERSAVER_BALANCED_BATTERY_SCREEN_TIMEOUT_SEC"]
+        values["POWERSAVER_AC_SCREEN_TIMEOUT_SEC"] = values["POWERSAVER_BALANCED_AC_SCREEN_TIMEOUT_SEC"]
         values["POWERSAVER_UNKNOWN_POWER_ACTION"] = values["POWERSAVER_BALANCED_UNKNOWN_POWER_ACTION"]
         values["POWERSAVER_WWAN_POLICY"] = values["POWERSAVER_BALANCED_WWAN_POLICY"]
         if values["POWERSAVER_MODE"] not in {"eco", "balanced", "performance"}:
@@ -1772,9 +2505,7 @@ class UConsoleHelperWindow(Gtk.Window):
         return values
 
     def run_systemctl(self, args: list[str], title: str) -> subprocess.CompletedProcess[str]:
-        command = ["pkexec", "systemctl", *args]
-        if shutil.which("pkexec") is None:
-            command = ["sudo", "systemctl", *args]
+        command = ["sudo", "-n", "systemctl", *args]
         result = subprocess.run(command, text=True, capture_output=True, check=False)
         if result.returncode != 0:
             self.show_error(f"{title} failed", combine_output(result) or "命令执行失败。")
@@ -1816,22 +2547,25 @@ class UConsoleHelperWindow(Gtk.Window):
             self.show_error("缺少依赖", "未找到 dnsmasq，请先安装 dnsmasq。")
             return
 
-        dialog = Gtk.MessageDialog(
-            transient_for=self,
-            flags=0,
-            message_type=Gtk.MessageType.WARNING,
-            buttons=Gtk.ButtonsType.OK_CANCEL,
-            text="确认启动 DHCP Server",
+        message = Gtk.Label(
+            label=f"将刷新 {config['interface']} 的地址并启动 DHCP Server。\n不要选择正在上网或远程连接的网口。",
+            xalign=0,
         )
-        dialog.format_secondary_text(
-            f"将刷新 {config['interface']} 的地址并启动 DHCP Server。\n不要选择正在上网或远程连接的网口。"
-        )
-        response = dialog.run()
-        dialog.destroy()
-        if response != Gtk.ResponseType.OK:
-            return
+        message.set_line_wrap(True)
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        cancel_button = Gtk.Button(label="Cancel")
+        cancel_button.connect("clicked", lambda _button: self.hide_inline_panel())
+        buttons.pack_start(cancel_button, False, False, 0)
+        start_button = Gtk.Button(label="Start")
+        start_button.get_style_context().add_class("suggested-action")
+        start_button.connect("clicked", lambda _button, value=config: self.confirm_start_server(value))
+        buttons.pack_start(start_button, False, False, 0)
+        self.show_inline_panel("确认启动 DHCP Server", [message, buttons], show_close=False)
 
+    def confirm_start_server(self, config: dict[str, str]) -> None:
+        self.hide_inline_panel()
         self.message_label.set_text("正在启动 DHCP Server...")
+        self.message_label.show()
         while Gtk.events_pending():
             Gtk.main_iteration()
         result = run_helper("start", config)
@@ -1847,6 +2581,7 @@ class UConsoleHelperWindow(Gtk.Window):
 
     def stop_server(self) -> None:
         self.message_label.set_text("正在停止 DHCP Server...")
+        self.message_label.show()
         while Gtk.events_pending():
             Gtk.main_iteration()
         result = run_helper("stop")
@@ -1860,14 +2595,14 @@ class UConsoleHelperWindow(Gtk.Window):
         self.update_header()
 
     def validated_config(self) -> dict[str, str]:
-        selected = self.selected_interface()
+        selected = self.selected_dhcp_interface()
         interface = selected.name if selected else ""
         if not interface:
             raise ValueError("请选择网口。")
         if selected and not selected.supported:
             detail = f"原因: {selected.reason}" if selected.reason else "该网口不适合用于 DHCP Server。"
             raise ValueError(f"{interface} 不支持作为 DHCP Server 网口。\n{detail}")
-        if interface not in list_interfaces():
+        if not interface_exists(interface):
             raise ValueError("选择的网口不存在。")
 
         config = self.current_dhcp_form_values()
@@ -1899,45 +2634,39 @@ class UConsoleHelperWindow(Gtk.Window):
         config["interface"] = interface
         return config
 
-    def selected_interface(self) -> InterfaceInfo | None:
-        active = self.interface_combo.get_active_iter()
-        if active is None:
-            return None
-        name = self.interface_store[active][1]
-        if name == "__separator__":
-            return None
-        supported = self.interface_store[active][2]
-        label = self.interface_store[active][0]
-        reason = self.interface_store[active][5]
-        status = label.removeprefix(name).strip(" ()")
-        return InterfaceInfo(name=name, supported=supported, status=status, reason=reason)
-
-    def selected_interface_name(self) -> str:
-        active = self.interface_combo.get_active_iter()
-        if active is None:
-            return ""
-        name = self.interface_store[active][1]
-        return "" if name == "__separator__" else name
-
     def selected_scan_interface(self) -> InterfaceInfo | None:
-        active = self.scan_interface_combo.get_active_iter()
-        if active is None:
+        name = self.selected_scan_interface_name()
+        if not name:
             return None
-        name = self.scan_interface_store[active][1]
-        if name == "__separator__":
+        return scan_interface_info(name, "")
+
+    def selected_dhcp_interface(self) -> InterfaceInfo | None:
+        name = self.selected_scan_interface_name()
+        if not name:
             return None
-        supported = self.scan_interface_store[active][2]
-        label = self.scan_interface_store[active][0]
-        reason = self.scan_interface_store[active][5]
-        status = label.removeprefix(name).strip(" ()")
-        return InterfaceInfo(name=name, supported=supported, status=status, reason=reason)
+        return dhcp_interface_info(name)
 
     def selected_scan_interface_name(self) -> str:
-        active = self.scan_interface_combo.get_active_iter()
-        if active is None:
+        tree = self.interface_pin_tree or self.interface_tree
+        if tree is None:
             return ""
-        name = self.scan_interface_store[active][1]
-        return "" if name == "__separator__" else name
+        model, tree_iter = tree.get_selection().get_selected()
+        if tree_iter is None:
+            return ""
+        return str(model[tree_iter][0])
+
+    def select_scan_interface(self, name: str) -> None:
+        if self.interface_tree is None or not name:
+            return
+        for row in self.interface_status_store:
+            if row[0] == name:
+                path = self.interface_status_store.get_path(row.iter)
+                if self.interface_pin_tree is not None:
+                    self.interface_pin_tree.get_selection().select_iter(row.iter)
+                    self.interface_pin_tree.scroll_to_cell(path, None, False, 0.0, 0.0)
+                self.interface_tree.get_selection().select_iter(row.iter)
+                self.interface_tree.scroll_to_cell(path, None, False, 0.0, 0.0)
+                return
 
     def start_lan_scan(self) -> None:
         if self.scan_running:
@@ -2005,16 +2734,32 @@ class UConsoleHelperWindow(Gtk.Window):
         return False
 
     def show_error(self, title: str, message: str) -> None:
-        dialog = Gtk.MessageDialog(
-            transient_for=self,
-            flags=0,
-            message_type=Gtk.MessageType.ERROR,
-            buttons=Gtk.ButtonsType.OK,
-            text=title,
-        )
-        dialog.format_secondary_text(message)
-        dialog.run()
-        dialog.destroy()
+        message_label = Gtk.Label(label=message, xalign=0)
+        message_label.set_line_wrap(True)
+        message_label.set_selectable(True)
+        self.show_inline_panel(title, [message_label], show_close=True)
+
+    def show_inline_panel(self, title: str, widgets: list[Gtk.Widget], show_close: bool = True) -> None:
+        if self.inline_panel_box is None or self.inline_panel_title is None or self.inline_panel_body is None:
+            print(title, file=sys.stderr)
+            return
+        for child in list(self.inline_panel_body.get_children()):
+            self.inline_panel_body.remove(child)
+        self.inline_panel_title.set_text(title)
+        if self.inline_panel_close_button is not None:
+            self.inline_panel_close_button.set_visible(show_close)
+        for widget in widgets:
+            self.inline_panel_body.pack_start(widget, False, False, 0)
+        self.inline_panel_box.set_no_show_all(False)
+        self.inline_panel_box.show_all()
+        self.inline_panel_box.set_no_show_all(True)
+
+    def hide_error(self) -> None:
+        self.hide_inline_panel()
+
+    def hide_inline_panel(self) -> None:
+        if self.inline_panel_box is not None:
+            self.inline_panel_box.hide()
 
 
 def card_box() -> Gtk.Box:
@@ -2048,16 +2793,26 @@ def scrolled_page(content: Gtk.Widget) -> Gtk.ScrolledWindow:
     scroll = Gtk.ScrolledWindow()
     scroll.set_hexpand(True)
     scroll.set_vexpand(True)
-    scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+    scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
     scroll.add(content)
     return scroll
 
 
-def horizontal_table_scroll(content: Gtk.Widget) -> Gtk.ScrolledWindow:
+def table_scroll(content: Gtk.Widget, vexpand: bool) -> Gtk.ScrolledWindow:
     scroll = Gtk.ScrolledWindow()
     scroll.set_hexpand(True)
+    scroll.set_vexpand(vexpand)
+    scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC if vexpand else Gtk.PolicyType.NEVER)
+    scroll.add(content)
+    return scroll
+
+
+def fixed_table_scroll(content: Gtk.Widget, width: int) -> Gtk.ScrolledWindow:
+    scroll = Gtk.ScrolledWindow()
+    scroll.set_hexpand(False)
     scroll.set_vexpand(False)
-    scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
+    scroll.set_size_request(width, -1)
+    scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.NEVER)
     scroll.add(content)
     return scroll
 
@@ -2274,6 +3029,42 @@ def screen_timeout_config_value(value: str) -> str:
     }.get(value, value)
 
 
+def screen_mode_display_value(value: str) -> str:
+    return "Auto" if value == "auto" else "Default"
+
+
+def screen_mode_config_value(value: str) -> str:
+    return "auto" if value == "Auto" else "default"
+
+
+def auto_screen_timeout_display_value(value: str) -> str:
+    return {
+        "-1": "Never",
+        "15": "15s",
+        "30": "30s",
+        "60": "1min",
+        "120": "2min",
+        "300": "5min",
+        "600": "10min",
+        "900": "15min",
+        "1800": "30min",
+    }.get(value, value)
+
+
+def auto_screen_timeout_config_value(value: str) -> str:
+    return {
+        "Never": "-1",
+        "15s": "15",
+        "30s": "30",
+        "1min": "60",
+        "2min": "120",
+        "5min": "300",
+        "10min": "600",
+        "15min": "900",
+        "30min": "1800",
+    }.get(value, value)
+
+
 def widget_text(widget: Gtk.Widget) -> str:
     if isinstance(widget, Gtk.Entry):
         return widget.get_text().strip()
@@ -2327,23 +3118,38 @@ def power_policy_config_text(values: dict[str, str]) -> str:
             f"POWERSAVER_ECO_AC_SCREEN_TIMEOUT_SEC={values['POWERSAVER_ECO_AC_SCREEN_TIMEOUT_SEC']}",
             f"POWERSAVER_ECO_UNKNOWN_POWER_ACTION={values['POWERSAVER_ECO_UNKNOWN_POWER_ACTION']}",
             f"POWERSAVER_ECO_WWAN_POLICY={values['POWERSAVER_ECO_WWAN_POLICY']}",
+            f"POWERSAVER_ECO_SCREEN_MODE={values['POWERSAVER_ECO_SCREEN_MODE']}",
+            f"POWERSAVER_ECO_AUTO_BRIGHTNESS={values['POWERSAVER_ECO_AUTO_BRIGHTNESS']}",
+            f"POWERSAVER_ECO_STAND_MODE={values['POWERSAVER_ECO_STAND_MODE']}",
+            f"POWERSAVER_ECO_AUTO_BATTERY_PUTDOWN_TIMEOUT_SEC={values['POWERSAVER_ECO_AUTO_BATTERY_PUTDOWN_TIMEOUT_SEC']}",
+            f"POWERSAVER_ECO_AUTO_AC_PUTDOWN_TIMEOUT_SEC={values['POWERSAVER_ECO_AUTO_AC_PUTDOWN_TIMEOUT_SEC']}",
             f"POWERSAVER_BALANCED_BATTERY_CPU_FREQ={values['POWERSAVER_BALANCED_BATTERY_CPU_FREQ']}",
             f"POWERSAVER_BALANCED_AC_CPU_FREQ={values['POWERSAVER_BALANCED_AC_CPU_FREQ']}",
             f"POWERSAVER_BALANCED_BATTERY_SCREEN_TIMEOUT_SEC={values['POWERSAVER_BALANCED_BATTERY_SCREEN_TIMEOUT_SEC']}",
             f"POWERSAVER_BALANCED_AC_SCREEN_TIMEOUT_SEC={values['POWERSAVER_BALANCED_AC_SCREEN_TIMEOUT_SEC']}",
             f"POWERSAVER_BALANCED_UNKNOWN_POWER_ACTION={values['POWERSAVER_BALANCED_UNKNOWN_POWER_ACTION']}",
             f"POWERSAVER_BALANCED_WWAN_POLICY={values['POWERSAVER_BALANCED_WWAN_POLICY']}",
+            f"POWERSAVER_BALANCED_SCREEN_MODE={values['POWERSAVER_BALANCED_SCREEN_MODE']}",
+            f"POWERSAVER_BALANCED_AUTO_BRIGHTNESS={values['POWERSAVER_BALANCED_AUTO_BRIGHTNESS']}",
+            f"POWERSAVER_BALANCED_STAND_MODE={values['POWERSAVER_BALANCED_STAND_MODE']}",
+            f"POWERSAVER_BALANCED_AUTO_BATTERY_PUTDOWN_TIMEOUT_SEC={values['POWERSAVER_BALANCED_AUTO_BATTERY_PUTDOWN_TIMEOUT_SEC']}",
+            f"POWERSAVER_BALANCED_AUTO_AC_PUTDOWN_TIMEOUT_SEC={values['POWERSAVER_BALANCED_AUTO_AC_PUTDOWN_TIMEOUT_SEC']}",
             f"POWERSAVER_PERFORMANCE_BATTERY_CPU_FREQ={values['POWERSAVER_PERFORMANCE_BATTERY_CPU_FREQ']}",
             f"POWERSAVER_PERFORMANCE_AC_CPU_FREQ={values['POWERSAVER_PERFORMANCE_AC_CPU_FREQ']}",
             f"POWERSAVER_PERFORMANCE_BATTERY_SCREEN_TIMEOUT_SEC={values['POWERSAVER_PERFORMANCE_BATTERY_SCREEN_TIMEOUT_SEC']}",
             f"POWERSAVER_PERFORMANCE_AC_SCREEN_TIMEOUT_SEC={values['POWERSAVER_PERFORMANCE_AC_SCREEN_TIMEOUT_SEC']}",
             f"POWERSAVER_PERFORMANCE_UNKNOWN_POWER_ACTION={values['POWERSAVER_PERFORMANCE_UNKNOWN_POWER_ACTION']}",
             f"POWERSAVER_PERFORMANCE_WWAN_POLICY={values['POWERSAVER_PERFORMANCE_WWAN_POLICY']}",
+            f"POWERSAVER_PERFORMANCE_SCREEN_MODE={values['POWERSAVER_PERFORMANCE_SCREEN_MODE']}",
+            f"POWERSAVER_PERFORMANCE_AUTO_BRIGHTNESS={values['POWERSAVER_PERFORMANCE_AUTO_BRIGHTNESS']}",
+            f"POWERSAVER_PERFORMANCE_STAND_MODE={values['POWERSAVER_PERFORMANCE_STAND_MODE']}",
+            f"POWERSAVER_PERFORMANCE_AUTO_BATTERY_PUTDOWN_TIMEOUT_SEC={values['POWERSAVER_PERFORMANCE_AUTO_BATTERY_PUTDOWN_TIMEOUT_SEC']}",
+            f"POWERSAVER_PERFORMANCE_AUTO_AC_PUTDOWN_TIMEOUT_SEC={values['POWERSAVER_PERFORMANCE_AUTO_AC_PUTDOWN_TIMEOUT_SEC']}",
             "",
             "### Screen idle timeout seconds --- 0 disables helper-managed timeout",
             "# Legacy global keys are kept for downgrade compatibility.",
-            f"POWERSAVER_BATTERY_SCREEN_TIMEOUT_SEC={values['POWERSAVER_BALANCED_BATTERY_SCREEN_TIMEOUT_SEC']}",
-            f"POWERSAVER_AC_SCREEN_TIMEOUT_SEC={values['POWERSAVER_BALANCED_AC_SCREEN_TIMEOUT_SEC']}",
+            f"POWERSAVER_BATTERY_SCREEN_TIMEOUT_SEC={values['POWERSAVER_BATTERY_SCREEN_TIMEOUT_SEC']}",
+            f"POWERSAVER_AC_SCREEN_TIMEOUT_SEC={values['POWERSAVER_AC_SCREEN_TIMEOUT_SEC']}",
             "",
             "### POWERSAVER_UNKNOWN_POWER_ACTION --- [restore|battery|keep]",
             f"POWERSAVER_UNKNOWN_POWER_ACTION={values['POWERSAVER_UNKNOWN_POWER_ACTION']}",
@@ -2389,53 +3195,15 @@ def section_header(title: str, subtitle: str) -> Gtk.Box:
 
 
 
-def list_interfaces() -> list[str]:
-    return [info.name for info in discover_interfaces() if info.supported]
-
-
-def populate_interface_store(
-    store: Gtk.ListStore,
-    interfaces: list[InterfaceInfo],
-    current: str,
-    preferred: str = "",
-) -> int:
-    selected_index = -1
-    first_supported_index = -1
-    supported_interfaces = [info for info in interfaces if info.supported]
-    unsupported_interfaces = [info for info in interfaces if not info.supported]
-    ordered_interfaces = supported_interfaces[:]
-    if supported_interfaces and unsupported_interfaces:
-        ordered_interfaces.append(InterfaceInfo(name="__separator__", supported=False, status=""))
-    ordered_interfaces.extend(unsupported_interfaces)
-
-    for index, info in enumerate(ordered_interfaces):
-        if info.name == "__separator__":
-            store.append(["", info.name, False, "#000000", False, ""])
-            continue
-        is_unavailable = info.supported and info.status == "不可用"
-        color = "#8a8f98" if (not info.supported or is_unavailable) else "#f0f0f0"
-        row = [info.label, info.name, info.supported, color, (not info.supported or is_unavailable), info.reason]
-        store.append(row)
-        if info.supported and first_supported_index == -1:
-            first_supported_index = index
-        if info.name == current:
-            selected_index = index
-        if selected_index == -1 and preferred and info.name == preferred:
-            selected_index = index
-
-    if selected_index == -1:
-        return first_supported_index if first_supported_index != -1 else (0 if interfaces else -1)
-    return selected_index
-
-
-def preferred_dhcp_interface(interfaces: list[InterfaceInfo]) -> str:
-    for info in interfaces:
-        if info.supported and info.status == "已连接":
-            return info.name
-    for info in interfaces:
-        if info.supported:
-            return info.name
-    return ""
+def interface_exists(name: str) -> bool:
+    if not name:
+        return False
+    if SYS_NET.exists():
+        return (SYS_NET / name).exists()
+    try:
+        return any(interface_name == name for _, interface_name in socket.if_nameindex())
+    except OSError:
+        return False
 
 
 def preferred_scan_interface(interfaces: list[InterfaceInfo]) -> str:
@@ -2455,11 +3223,6 @@ def preferred_route_interface() -> str:
         return ""
     default_routes.sort(key=lambda route: route["metric"])
     return default_routes[0]["device"]
-
-
-def interface_row_is_separator(model: Gtk.TreeModel, tree_iter: Gtk.TreeIter) -> bool:
-    return model[tree_iter][1] == "__separator__"
-
 
 def discover_interfaces() -> list[InterfaceInfo]:
     if not SYS_NET.exists():
@@ -2489,6 +3252,17 @@ def discover_interfaces() -> list[InterfaceInfo]:
         )
 
     return interfaces
+
+
+def dhcp_interface_info(name: str) -> InterfaceInfo:
+    nm_type, nm_state = network_manager_devices().get(name, ("", ""))
+    reason = interface_filter_reason(name, nm_type)
+    return InterfaceInfo(
+        name=name,
+        supported=not reason,
+        status=interface_status(name, nm_state),
+        reason=reason or "",
+    )
 
 
 def discover_scan_interfaces() -> list[InterfaceInfo]:
@@ -2767,18 +3541,25 @@ def wifi_signal_by_device() -> dict[str, str]:
 def modem_signal_by_port() -> dict[str, dict[str, str | bool]]:
     if shutil.which("mmcli") is None:
         return {}
-    list_result = subprocess.run(["mmcli", "-L"], text=True, capture_output=True, check=False)
+    try:
+        list_result = subprocess.run(["mmcli", "-L"], text=True, capture_output=True, timeout=2, check=False)
+    except subprocess.TimeoutExpired:
+        return {}
     if list_result.returncode != 0:
         return {}
 
     signals: dict[str, dict[str, str | bool]] = {}
     for modem_id in re.findall(r"/Modem/(\d+)", list_result.stdout):
-        result = subprocess.run(
-            ["mmcli", "-m", modem_id, "--output-keyvalue"],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
+        try:
+            result = subprocess.run(
+                ["mmcli", "-m", modem_id, "--output-keyvalue"],
+                text=True,
+                capture_output=True,
+                timeout=2,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            continue
         if result.returncode != 0:
             continue
         data = parse_key_value_output(result.stdout)
@@ -2828,12 +3609,16 @@ def modem_quality_label(data: dict[str, str]) -> str:
 
 
 def modem_signal_detail(modem_id: str) -> str:
-    result = subprocess.run(
-        ["mmcli", "-m", modem_id, "--signal-get"],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["mmcli", "-m", modem_id, "--signal-get"],
+            text=True,
+            capture_output=True,
+            timeout=2,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return ""
     if result.returncode != 0:
         return ""
     rsrp = signal_metric(result.stdout, "rsrp")
@@ -2877,18 +3662,25 @@ def hidden_duplicate_modem_ports() -> set[str]:
     hidden = hidden_duplicate_modem_ports_from_sysfs()
     if shutil.which("mmcli") is None:
         return hidden
-    list_result = subprocess.run(["mmcli", "-L"], text=True, capture_output=True, check=False)
+    try:
+        list_result = subprocess.run(["mmcli", "-L"], text=True, capture_output=True, timeout=2, check=False)
+    except subprocess.TimeoutExpired:
+        return hidden
     if list_result.returncode != 0:
         return hidden
 
     sys_net_names = {path.name for path in SYS_NET.iterdir()} if SYS_NET.exists() else set()
     for modem_id in re.findall(r"/Modem/(\d+)", list_result.stdout):
-        result = subprocess.run(
-            ["mmcli", "-m", modem_id, "--output-keyvalue"],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
+        try:
+            result = subprocess.run(
+                ["mmcli", "-m", modem_id, "--output-keyvalue"],
+                text=True,
+                capture_output=True,
+                timeout=2,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            continue
         if result.returncode != 0:
             continue
         data = parse_key_value_output(result.stdout)
@@ -2969,12 +3761,16 @@ def first_key_value(data: dict[str, str], prefix: str) -> str:
 def tailscale_status() -> dict[str, object]:
     if shutil.which("tailscale") is None:
         return {}
-    result = subprocess.run(
-        ["tailscale", "status", "--json"],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["tailscale", "status", "--json"],
+            text=True,
+            capture_output=True,
+            timeout=2,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {}
     if result.returncode != 0:
         return {}
     try:
@@ -3112,6 +3908,32 @@ def tailscale_admin_summary(status: dict[str, object]) -> str:
     if hostname:
         parts.append(hostname)
     return "  |  ".join(parts)
+
+
+def tailscale_network_summary() -> str:
+    route = preferred_route_interface()
+    if not route:
+        return "Network -"
+    devices = nmcli_device_status()
+    wifi_signals = wifi_signal_by_device()
+    modem_signals = modem_signal_by_port()
+    hidden_modem_ports = hidden_duplicate_modem_ports()
+    for device in devices:
+        name = device["device"]
+        if name != route or name in hidden_modem_ports:
+            continue
+        if device["type"] == "wifi":
+            signal = signal_with_bars(wifi_signals.get(name, "-"))
+            connection = device["connection"] or "Wi-Fi"
+            return f"Network Wi-Fi {name} {connection} {signal}"
+        elif device["type"] in {"ethernet", "gsm", "cdma"} or name in modem_signals:
+            modem = modem_signals.get(name, {})
+            signal = signal_with_bars(str(modem.get("signal") or "-"))
+            connection = str(modem.get("connection") or device["connection"] or device["type"])
+            return f"Network {name} {connection} {signal}"
+        connection = device["connection"] or device["type"] or "-"
+        return f"Network {name} {connection}"
+    return f"Network {route}"
 
 
 def tailscale_devices(status: dict[str, object]) -> list[dict[str, str]]:
@@ -3421,7 +4243,7 @@ def app_power_rows(
         cpu_percent = cpu_delta / elapsed * 100
         io_rate = io_delta / elapsed
         score = cpu_percent + min(50.0, io_rate / 1_000_000)
-        if score < 0.1:
+        if score < APP_POWER_MIN_SCORE:
             continue
         name = str(sample["name"])
         item = grouped.setdefault(name, {"name": name, "pids": [], "cpu": 0.0, "io_rate": 0.0, "score": 0.0})
@@ -3752,22 +4574,23 @@ def format_rate(bytes_per_sec: float) -> str:
 
 def dashboard_cellular_summary() -> str:
     wwan = current_wwan_summary()
-    config = helper_service_config()
-    policy = config.get("POWERSAVER_WWAN_POLICY", "ondemand")
     if wwan.lower() in {"disabled", "off", "已禁用"}:
-        return "\n".join([kv_line("PWR", "OFF"), kv_line("WWAN", wwan), kv_line("POL", policy)])
+        return "Off"
     modems = modem_signal_by_port()
     hidden_ports = hidden_duplicate_modem_ports()
-    if not modems:
-        return "\n".join([kv_line("WWAN", wwan), kv_line("POL", policy), kv_line("MODEM", "-")])
-    lines = []
     visible_modems = [(port, info) for port, info in sorted(modems.items()) if port not in hidden_ports]
-    for port, info in visible_modems[:3]:
-        signal = compact_cellular_signal(str(info.get("signal") or "-"))
-        connection = str(info.get("connection") or "-")
-        connected = "connected" if info.get("connected") else "registered"
-        lines.append("\n".join([kv_line(port[:5], connected), kv_line("NET", connection), kv_line("SIG", signal)]))
-    return "\n".join(lines) if lines else "-"
+    if not visible_modems:
+        return "-"
+    return cellular_operator_summary(visible_modems[0][1])
+
+
+def cellular_operator_summary(info: dict[str, str | bool]) -> str:
+    connection = str(info.get("connection") or "-")
+    signal = str(info.get("signal") or "-")
+    bars = signal_bars(signal)
+    if bars is None:
+        return connection
+    return f"{signal_bar_icon(bars)} {connection}"
 
 
 def compact_cellular_signal(signal: str) -> str:
@@ -3815,6 +4638,9 @@ def cellular_meter_percent() -> int:
 def power_status() -> dict[str, str]:
     config = helper_service_config()
     power = current_power_state(config)
+    wwan = current_wwan_summary()
+    if wwan.lower() == "enabled":
+        wwan = power_wwan_signal_summary()
     return {
         "time": power_time_estimate(),
         "watts": realtime_power_label(power),
@@ -3822,9 +4648,18 @@ def power_status() -> dict[str, str]:
         "power": power,
         "cpu_freq": current_cpu_freq_summary(config),
         "cpu": current_cpu_summary(config),
-        "wwan": current_wwan_summary(),
+        "wwan": wwan,
         "powersaver": powersaver_config_summary(config),
     }
+
+
+def power_wwan_signal_summary() -> str:
+    modems = modem_signal_by_port()
+    hidden_ports = hidden_duplicate_modem_ports()
+    visible_modems = [(port, info) for port, info in sorted(modems.items()) if port not in hidden_ports]
+    if not visible_modems:
+        return "-"
+    return cellular_operator_summary(visible_modems[0][1])
 
 
 def desktop_shortcut_rows() -> list[dict[str, str]]:
@@ -3971,7 +4806,9 @@ def mapper_config_text(rows: list[dict[str, str]]) -> str:
             "enabled = true",
             "grab = false",
             'device_name_patterns = ["ClockworkPI uConsole Keyboard", "keyd virtual keyboard"]',
-            "debounce_ms = 250",
+            "debounce_ms = 50",
+            "repeat_rate = 20",
+            "repeat_delay_ms = 600",
             "",
         ]
     )
@@ -3982,7 +4819,7 @@ def mapper_config_text(rows: list[dict[str, str]]) -> str:
             "[lock]",
             "enabled = false",
             'key = "KEY_COFFEE"',
-            'lock_command = "sudo -n /usr/local/bin/uconsole-helper-mapper-display-control off"',
+            'lock_command = "rm -f ${XDG_RUNTIME_DIR:-/tmp}/uconsole-helper-auto-screen-off && sudo -n /usr/local/bin/uconsole-helper-mapper-display-control off"',
             'unlock_command = "sudo -n /usr/local/bin/uconsole-helper-mapper-display-control on"',
             'keyboard_backlight_script = "~/WorkSpace/uconsole-keyboard/tools/keyboard_state.sh"',
             "",
@@ -4090,18 +4927,21 @@ def helper_service_config() -> dict[str, str]:
         "POWERSAVER_ECO_AC_SCREEN_TIMEOUT_SEC": "0",
         "POWERSAVER_ECO_UNKNOWN_POWER_ACTION": "restore",
         "POWERSAVER_ECO_WWAN_POLICY": "ondemand",
+        "POWERSAVER_ECO_AUTO_BRIGHTNESS": "0",
         "POWERSAVER_BALANCED_BATTERY_CPU_FREQ": "1500,1500",
         "POWERSAVER_BALANCED_AC_CPU_FREQ": "restore",
         "POWERSAVER_BALANCED_BATTERY_SCREEN_TIMEOUT_SEC": "0",
         "POWERSAVER_BALANCED_AC_SCREEN_TIMEOUT_SEC": "0",
         "POWERSAVER_BALANCED_UNKNOWN_POWER_ACTION": "restore",
         "POWERSAVER_BALANCED_WWAN_POLICY": "ondemand",
+        "POWERSAVER_BALANCED_AUTO_BRIGHTNESS": "0",
         "POWERSAVER_PERFORMANCE_BATTERY_CPU_FREQ": "1500,2400",
         "POWERSAVER_PERFORMANCE_AC_CPU_FREQ": "restore",
         "POWERSAVER_PERFORMANCE_BATTERY_SCREEN_TIMEOUT_SEC": "0",
         "POWERSAVER_PERFORMANCE_AC_SCREEN_TIMEOUT_SEC": "0",
         "POWERSAVER_PERFORMANCE_UNKNOWN_POWER_ACTION": "restore",
         "POWERSAVER_PERFORMANCE_WWAN_POLICY": "ondemand",
+        "POWERSAVER_PERFORMANCE_AUTO_BRIGHTNESS": "0",
         "POWERSAVER_UNKNOWN_POWER_ACTION": "restore",
         "POWERSAVER_WWAN_POLICY": "ondemand",
         "POWERSAVER_POLL_INTERVAL_SEC": "5",
@@ -4168,23 +5008,41 @@ def default_asr_config() -> dict[str, str]:
         "ASR_AUTH_TOKEN": "",
         "ASR_LANGUAGE": "zh",
         "ASR_CORRECTION_MODE": "auto",
-        "VOICE_RECORDER": "auto",
+        "ASR_TIMEOUT": "15",
+        "ASR_REQUEST_ATTEMPT_TIMEOUT": "8",
+        "ASR_CONNECT_TIMEOUT": "2",
+        "ASR_RETRY_COUNT": "3",
+        "ASR_RETRY_DELAY": "0.35",
+        "VOICE_RECORDER": "arecord",
         "VOICE_INPUT": "default",
         "VOICE_OUTPUT_MODE": "paste",
         "VOICE_TMUX_OUTPUT_MODE": "type",
-        "VOICE_PAUSE_SEGMENT_MS": "1600",
         "VOICE_PASTE_BACKEND": "uinput",
+        "VOICE_TMUX_CONTEXT": "1",
     }
 
 
 def asr_config_text(values: dict[str, str]) -> str:
+    current_values = env_config(MAPPER_ASR_CONFIG, {})
+    merged_values = current_values.copy()
+    merged_values.update(values)
+    asr_defaults = {
+        "VOICE_STREAM_PREVIEW": "1",
+        "VOICE_STREAM_SEND_INTERVAL_MS": "100",
+    }
+    for key, value in asr_defaults.items():
+        merged_values.setdefault(key, value)
     lines = [
         "ASR_URL={ASR_URL}",
         "ASR_LANGUAGE={ASR_LANGUAGE}",
         "ASR_AUTH_TOKEN={ASR_AUTH_TOKEN}",
         "ASR_CORRECTION_MODE={ASR_CORRECTION_MODE}",
         "ASR_NO_PROXY=1",
-        "ASR_TIMEOUT=60",
+        "ASR_TIMEOUT={ASR_TIMEOUT}",
+        "ASR_REQUEST_ATTEMPT_TIMEOUT={ASR_REQUEST_ATTEMPT_TIMEOUT}",
+        "ASR_CONNECT_TIMEOUT={ASR_CONNECT_TIMEOUT}",
+        "ASR_RETRY_COUNT={ASR_RETRY_COUNT}",
+        "ASR_RETRY_DELAY={ASR_RETRY_DELAY}",
         "VOICE_RECORDER={VOICE_RECORDER}",
         "VOICE_INPUT={VOICE_INPUT}",
         "VOICE_MIN_RECORD_MS=350",
@@ -4193,7 +5051,6 @@ def asr_config_text(values: dict[str, str]) -> str:
         "VOICE_CHANNELS=1",
         "VOICE_OUTPUT_MODE={VOICE_OUTPUT_MODE}",
         "VOICE_TMUX_OUTPUT_MODE={VOICE_TMUX_OUTPUT_MODE}",
-        "VOICE_PAUSE_SEGMENT_MS={VOICE_PAUSE_SEGMENT_MS}",
         "VOICE_WECHAT_OUTPUT_MODE=paste",
         "VOICE_PASTE_BACKEND={VOICE_PASTE_BACKEND}",
         "VOICE_PASTE_SHORTCUT=ctrl_v",
@@ -4202,10 +5059,22 @@ def asr_config_text(values: dict[str, str]) -> str:
         "VOICE_NOTIFY_USE_MARKUP=0",
         "VOICE_NOTIFY_FONT_SIZE=22",
         "VOICE_NOTIFY_PADDING_LINES=1",
-        "VOICE_TMUX_CONTEXT=1",
+        "VOICE_TMUX_CONTEXT={VOICE_TMUX_CONTEXT}",
+        "VOICE_STREAM_PREVIEW={VOICE_STREAM_PREVIEW}",
+        "VOICE_STREAM_SEND_INTERVAL_MS={VOICE_STREAM_SEND_INTERVAL_MS}",
         "",
     ]
-    return "\n".join(line.format(**values) for line in lines)
+    emitted_keys = {
+        line.split("=", 1)[0]
+        for line in lines
+        if line and not line.startswith("#") and "=" in line
+    }
+    extra_lines = [
+        f"{key}={value}"
+        for key, value in sorted(merged_values.items())
+        if key not in emitted_keys
+    ]
+    return "\n".join(line.format(**merged_values) for line in lines + extra_lines)
 
 
 def audio_input_options() -> list[str]:
@@ -4540,12 +5409,12 @@ def powersaver_config_summary(config: dict[str, str]) -> str:
     )
     wwan = config.get(f"POWERSAVER_{profile}_WWAN_POLICY", config.get("POWERSAVER_WWAN_POLICY", "ondemand"))
     battery_screen = config.get(
-        f"POWERSAVER_{profile}_BATTERY_SCREEN_TIMEOUT_SEC",
-        config.get("POWERSAVER_BATTERY_SCREEN_TIMEOUT_SEC", config.get("POWERSAVER_SCREEN_TIMEOUT_SEC", "0")),
+        "POWERSAVER_BATTERY_SCREEN_TIMEOUT_SEC",
+        config.get(f"POWERSAVER_{profile}_BATTERY_SCREEN_TIMEOUT_SEC", config.get("POWERSAVER_SCREEN_TIMEOUT_SEC", "0")),
     )
     ac_screen = config.get(
-        f"POWERSAVER_{profile}_AC_SCREEN_TIMEOUT_SEC",
-        config.get("POWERSAVER_AC_SCREEN_TIMEOUT_SEC", config.get("POWERSAVER_SCREEN_TIMEOUT_SEC", "0")),
+        "POWERSAVER_AC_SCREEN_TIMEOUT_SEC",
+        config.get(f"POWERSAVER_{profile}_AC_SCREEN_TIMEOUT_SEC", config.get("POWERSAVER_SCREEN_TIMEOUT_SEC", "0")),
     )
     state = "enabled" if enabled.lower() in {"1", "yes", "true", "on", "enabled"} else "disabled"
     screen_label = "off" if battery_screen == "0" and ac_screen == "0" else f"B {battery_screen}s / AC {ac_screen}s"
@@ -4556,8 +5425,8 @@ def power_screen_timeout_summary(config: dict[str, str], power_state: str) -> st
     mode = config.get("POWERSAVER_MODE", "balanced")
     profile = mode.upper()
     fallback = config.get("POWERSAVER_SCREEN_TIMEOUT_SEC", "0")
-    battery = config.get(f"POWERSAVER_{profile}_BATTERY_SCREEN_TIMEOUT_SEC", config.get("POWERSAVER_BATTERY_SCREEN_TIMEOUT_SEC", fallback))
-    ac = config.get(f"POWERSAVER_{profile}_AC_SCREEN_TIMEOUT_SEC", config.get("POWERSAVER_AC_SCREEN_TIMEOUT_SEC", fallback))
+    battery = config.get("POWERSAVER_BATTERY_SCREEN_TIMEOUT_SEC", config.get(f"POWERSAVER_{profile}_BATTERY_SCREEN_TIMEOUT_SEC", fallback))
+    ac = config.get("POWERSAVER_AC_SCREEN_TIMEOUT_SEC", config.get(f"POWERSAVER_{profile}_AC_SCREEN_TIMEOUT_SEC", fallback))
     power_state = power_state.lower()
     if power_state == "ac":
         return screen_timeout_display_value(ac)
@@ -4855,16 +5724,35 @@ def resolve_hostnames(interface: str, neighbors: dict[str, dict[str, str]]) -> d
         name = names.get(ip)
         if not name and item.get("mac"):
             name = names_by_mac.get(item["mac"].lower(), "")
+        name = lan_hostname_or_empty(ip, name)
         if not name:
-            name = reverse_hostname(ip)
+            name = lan_hostname_or_empty(ip, reverse_hostname(ip))
         if not name:
-            name = ptr_hostname_from_interface_dns(interface, ip)
+            name = lan_hostname_or_empty(ip, ptr_hostname_from_interface_dns(interface, ip))
         if not name:
-            name = mdns_hostname(ip)
+            name = lan_hostname_or_empty(ip, mdns_hostname(ip))
         if not name:
-            name = netbios_hostname(ip)
+            name = lan_hostname_or_empty(ip, netbios_hostname(ip))
         result[ip] = name or "-"
     return result
+
+
+def lan_hostname_or_empty(ip: str, name: str | None) -> str:
+    name = str(name or "").strip().rstrip(".")
+    if not name:
+        return ""
+    short_name = name.split(".", 1)[0].lower()
+    if short_name in {"localhost", "localhost4", "localhost6"}:
+        return ""
+    if name.lower() in {"ip6-localhost", "ip6-loopback"}:
+        return ""
+    try:
+        address = ipaddress.ip_address(ip)
+    except ValueError:
+        return name
+    if address.is_loopback:
+        return ""
+    return name
 
 
 def hostnames_from_hosts_file() -> dict[str, str]:
@@ -5164,6 +6052,847 @@ def parse_netbios_node_status(data: bytes) -> str:
         return ""
     candidates.sort(key=lambda item: item[0])
     return candidates[0][1]
+
+
+def find_xiao_device() -> McuDeviceInfo:
+    tty = find_xiao_tty()
+    mode = "unknown"
+    product = ""
+    manufacturer = ""
+    serial = ""
+    usb_path = ""
+    notes = ""
+    if tty:
+        tty_path = Path("/sys/class/tty") / tty
+        usb_root = usb_device_root(tty_path)
+        if usb_root is not None:
+            usb_path = usb_root.name
+            mode = "bootloader" if usb_bootloader_hint(usb_root) else "sensor"
+            product = read_text(usb_root / "product")
+            manufacturer = read_text(usb_root / "manufacturer")
+            serial = read_text(usb_root / "serial")
+    else:
+        usb_root = find_xiao_usb_root()
+        if usb_root is not None:
+            usb_path = usb_root.name
+            product = read_text(usb_root / "product")
+            manufacturer = read_text(usb_root / "manufacturer")
+            serial = read_text(usb_root / "serial")
+            mode = "bootloader" if usb_bootloader_hint(usb_root) else "usb"
+            notes = "USB device present without ttyACM"
+    present = bool(tty or usb_path)
+    return McuDeviceInfo(
+        present=present,
+        mode=mode,
+        tty=tty,
+        product=product or "XIAO nRF52840 Sense Plus",
+        manufacturer=manufacturer or "Seeed",
+        serial=serial,
+        usb_path=usb_path,
+        notes=notes,
+    )
+
+
+def find_xiao_tty() -> str:
+    candidates = []
+    for tty_dir in Path("/sys/class/tty").glob("ttyACM*"):
+        usb_root = usb_device_root(tty_dir)
+        if usb_root is None:
+            continue
+        vendor = read_text(usb_root / "idVendor")
+        product = read_text(usb_root / "idProduct")
+        if vendor != XIAO_USB_VENDOR or product not in XIAO_USB_PRODUCT_IDS:
+            continue
+        candidates.append((tty_dir.name, usb_root))
+    if candidates:
+        candidates.sort(key=lambda item: 0 if item[1].name.endswith(".1") else 1)
+        return candidates[0][0]
+    return ""
+
+
+def find_xiao_usb_root() -> Path | None:
+    if not SYS_NET.exists():
+        return None
+    for path in Path("/sys/bus/usb/devices").iterdir():
+        if not path.is_dir():
+            continue
+        vendor = read_text(path / "idVendor")
+        product = read_text(path / "idProduct")
+        if vendor == XIAO_USB_VENDOR and product in XIAO_USB_PRODUCT_IDS:
+            return path
+        label = " ".join(
+            [
+                read_text(path / "manufacturer"),
+                read_text(path / "product"),
+            ]
+        ).lower()
+        if "seeed" in label and "xiao" in label:
+            return path
+    return None
+
+
+def xiao_usb_reset_targets() -> tuple[str, ...]:
+    device = find_xiao_usb_root()
+    if device is not None:
+        direct_parent = usb_reset_parent_name(device.name)
+        upper_parent = usb_reset_parent_name(direct_parent)
+        targets = [target for target in (direct_parent, upper_parent) if target]
+        if targets:
+            return tuple(dict.fromkeys(targets))
+    return ("1-1.4.2", "1-1.4")
+
+
+def usb_reset_parent_name(device_name: str) -> str:
+    if "." not in device_name:
+        return ""
+    return device_name.rsplit(".", 1)[0]
+
+
+def usb_device_product(device_name: str) -> str:
+    product = read_text(Path("/sys/bus/usb/devices") / device_name / "product")
+    return product or device_name
+
+
+def usb_hub_device_rows(hub_names: tuple[str, ...]) -> list[tuple[str, str, str, str, str]]:
+    rows: list[tuple[str, str, str, str, str]] = []
+    usb_root = Path("/sys/bus/usb/devices")
+    for hub_name in hub_names:
+        hub_path = usb_root / hub_name
+        if not hub_path.exists():
+            rows.append((hub_name, hub_name, "Not present", "-", "-"))
+            continue
+        hub_product = usb_device_product(hub_name)
+        children = direct_usb_children(hub_name)
+        if not children:
+            rows.append((hub_product, hub_name, "No devices", "-", "-"))
+            continue
+        for child in children:
+            child_path = usb_root / child
+            product = read_text(child_path / "product")
+            manufacturer = read_text(child_path / "manufacturer")
+            label = " ".join(part for part in (manufacturer, product) if part) or child
+            vendor = read_text(child_path / "idVendor")
+            product_id = read_text(child_path / "idProduct")
+            usb_id = f"{vendor}:{product_id}" if vendor and product_id else "-"
+            driver = usb_device_driver(child_path)
+            rows.append((hub_product, child, label, usb_id, driver or "-"))
+    return rows
+
+
+def direct_usb_children(hub_name: str) -> list[str]:
+    prefix = f"{hub_name}."
+    children: list[str] = []
+    for path in Path("/sys/bus/usb/devices").iterdir():
+        name = path.name
+        if not name.startswith(prefix):
+            continue
+        suffix = name[len(prefix) :]
+        if not suffix or "." in suffix or ":" in suffix:
+            continue
+        children.append(name)
+    return sorted(children, key=usb_device_sort_key)
+
+
+def usb_device_sort_key(device_name: str) -> tuple[int, ...]:
+    parts = re.split(r"[.-]", device_name)
+    values: list[int] = []
+    for part in parts:
+        if part.isdigit():
+            values.append(int(part))
+    return tuple(values)
+
+
+def usb_device_driver(device_path: Path) -> str:
+    drivers: set[str] = set()
+    for child in device_path.iterdir():
+        if ":" not in child.name:
+            continue
+        driver_link = child / "driver"
+        try:
+            drivers.add(driver_link.resolve().name)
+        except OSError:
+            continue
+    return ", ".join(sorted(drivers))
+
+
+def reset_usb_device(device_name: str, settle_seconds: float) -> None:
+    device_path = Path("/sys/bus/usb/devices") / device_name
+    unbind_path = Path("/sys/bus/usb/drivers/usb/unbind")
+    bind_path = Path("/sys/bus/usb/drivers/usb/bind")
+    if not device_path.exists():
+        raise OSError(f"{usb_device_product(device_name)} ({device_name}) 不存在。")
+    write_usb_driver_control(unbind_path, device_name)
+    time.sleep(settle_seconds)
+    write_usb_driver_control(bind_path, device_name)
+
+
+def write_usb_driver_control(path: Path, device_name: str) -> None:
+    try:
+        path.write_text(device_name, encoding="ascii")
+        return
+    except OSError:
+        pass
+    result = subprocess.run(
+        ["sudo", "tee", str(path)],
+        input=device_name,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise OSError(combine_output(result) or f"无法写入 {path}")
+
+
+def usb_bootloader_hint(path: Path) -> bool:
+    product_id = read_text(path / "idProduct")
+    if product_id in XIAO_BOOTLOADER_PRODUCT_IDS:
+        return True
+    label = " ".join(
+        [
+            read_text(path / "product"),
+            read_text(path / "manufacturer"),
+            read_text(path / "modalias"),
+        ]
+    ).lower()
+    if any(hint in label for hint in XIAO_BOOTLOADER_HINTS):
+        return True
+    try:
+        descendants = list(path.rglob("*"))
+    except OSError:
+        descendants = []
+    for item in descendants:
+        if item.name in {"bInterfaceClass", "bInterfaceSubClass", "product"}:
+            value = read_text(item).lower()
+            if value == "08" or any(hint in value for hint in XIAO_BOOTLOADER_HINTS):
+                return True
+    return False
+
+
+def touch_xiao_bootloader(tty_name: str) -> None:
+    dev = Path("/dev") / tty_name
+    if not dev.exists():
+        raise OSError(f"{dev} 不存在")
+    fd = os.open(dev, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    try:
+        attrs = termios.tcgetattr(fd)
+        attrs[0] = 0
+        attrs[1] = 0
+        attrs[2] = attrs[2] & ~termios.CBAUD
+        attrs[2] = attrs[2] | termios.B1200
+        attrs[3] = 0
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+        termios.tcflush(fd, termios.TCIOFLUSH)
+        time.sleep(0.25)
+    finally:
+        os.close(fd)
+
+
+def send_xiao_command(command: str) -> None:
+    device = find_xiao_device()
+    if not device.present:
+        raise OSError("没有检测到 XIAO 设备。")
+    if not device.tty:
+        raise OSError("当前没有可用的 ttyACM 串口。")
+    session = open_xiao_serial(device.tty)
+    if session is None:
+        raise OSError(f"无法打开 /dev/{device.tty}。")
+    try:
+        os.write(session.fd, command.encode("ascii") + b"\n")
+    finally:
+        session.close()
+
+
+def read_mcu_snapshot(state: McuTelemetryState) -> McuStateSnapshot:
+    device = find_xiao_device()
+    now = time.time()
+    if not device.present:
+        if state.serial_session is not None:
+            state.serial_session.close()
+            state.serial_session = None
+        state.last_state = "未连接"
+        state.last_event = "等待设备"
+        state.last_motion = "-"
+        state.last_error = ""
+        return McuStateSnapshot(
+            device=device,
+            state="未连接",
+            event="等待设备",
+            motion="-",
+            still_for=0.0,
+            g_force=0.0,
+            tilt_deg=0.0,
+            sample_rate_hz=0.0,
+            pose="-",
+            light_lux=None,
+            smoothed_light_lux=state.smoothed_light_lux,
+            suggested_backlight=state.suggested_backlight,
+            light_raw=None,
+            light_ready=False,
+            last_update=now,
+            raw_line="",
+            last_error="",
+            recent_rows=(),
+        )
+
+    if device.mode == "bootloader":
+        if state.serial_session is not None:
+            state.serial_session.close()
+            state.serial_session = None
+        state.last_state = "刷机模式"
+        state.last_event = "UF2 bootloader"
+        state.last_motion = "-"
+        state.last_error = ""
+        return McuStateSnapshot(
+            device=device,
+            state="刷机模式",
+            event="UF2 bootloader",
+            motion="-",
+            still_for=0.0,
+            g_force=0.0,
+            tilt_deg=0.0,
+            sample_rate_hz=0.0,
+            pose="-",
+            light_lux=None,
+            smoothed_light_lux=state.smoothed_light_lux,
+            suggested_backlight=state.suggested_backlight,
+            light_raw=None,
+            light_ready=False,
+            last_update=now,
+            raw_line="",
+            last_error="",
+            recent_rows=(),
+        )
+
+    sample = read_xiao_sample(device, state)
+    if sample is None:
+        if state.samples:
+            last_sample = state.samples[-1]
+            no_line_error = f"/dev/{device.tty} 已打开，但没有收到串口行。"
+            last_error = "" if state.last_error == no_line_error else state.last_error
+            return McuStateSnapshot(
+                device=device,
+                state=state.last_state or "已连接",
+                event=state.last_event or "等待样本",
+                motion=state.last_motion or "-",
+                still_for=max(0.0, now - state.stable_since) if state.stable_since is not None else 0.0,
+                g_force=vector_magnitude(last_sample.ax, last_sample.ay, last_sample.az),
+                tilt_deg=estimate_tilt_deg(last_sample.ax, last_sample.ay, last_sample.az),
+                sample_rate_hz=estimate_sample_rate(state.samples),
+                pose=last_sample.firmware_pose or "-",
+                light_lux=last_sample.light_lux,
+                smoothed_light_lux=state.smoothed_light_lux,
+                suggested_backlight=state.suggested_backlight,
+                light_raw=last_sample.light_raw,
+                light_ready=last_sample.light_ready,
+                last_update=last_sample.timestamp,
+                raw_line=format_sample_line(last_sample),
+                last_error=last_error,
+                mic_ready=last_sample.mic_ready,
+                mic_enabled=last_sample.mic_enabled,
+                mic_assist=last_sample.mic_assist,
+                mic_peak=last_sample.mic_peak,
+                mic_recent_peak=last_sample.mic_recent_peak,
+                recent_rows=recent_rows_from_samples(state.samples),
+            )
+        state.last_state = "已连接"
+        state.last_event = state.last_error or "等待传感器数据"
+        state.last_motion = "-"
+        return McuStateSnapshot(
+            device=device,
+            state="已连接",
+            event="等待传感器数据",
+            motion="-",
+            still_for=0.0,
+            g_force=0.0,
+            tilt_deg=0.0,
+            sample_rate_hz=0.0,
+            pose="-",
+            light_lux=None,
+            smoothed_light_lux=state.smoothed_light_lux,
+            suggested_backlight=state.suggested_backlight,
+            light_raw=None,
+            light_ready=False,
+            last_update=now,
+            raw_line="",
+            last_error=state.last_error,
+            recent_rows=(),
+        )
+
+    state.samples.append(sample)
+    state.samples = [item for item in state.samples if now - item.timestamp <= XIAO_SAMPLE_MAX_AGE_SECONDS]
+    sample_rate_hz = estimate_sample_rate(state.samples)
+    g_force = vector_magnitude(sample.ax, sample.ay, sample.az)
+    tilt_deg = estimate_tilt_deg(sample.ax, sample.ay, sample.az)
+    still_for = stable_duration(state, sample)
+    motion = mcu_motion_label(sample.firmware_motion)
+    event = mcu_event_label(sample.firmware_event)
+    current_state = mcu_state_label(sample.firmware_state)
+    update_light_smoothing(state, sample.light_lux)
+    state.last_state = current_state
+    state.last_event = event
+    state.last_motion = motion
+    state.last_error = ""
+    rows = recent_rows_from_samples(state.samples)
+    return McuStateSnapshot(
+        device=device,
+        state=current_state,
+        event=event,
+        motion=motion,
+        still_for=still_for,
+        g_force=g_force,
+        tilt_deg=tilt_deg,
+        sample_rate_hz=sample_rate_hz,
+        pose=sample.firmware_pose or "-",
+        light_lux=sample.light_lux,
+        smoothed_light_lux=state.smoothed_light_lux,
+        suggested_backlight=state.suggested_backlight,
+        light_raw=sample.light_raw,
+        light_ready=sample.light_ready,
+        last_update=now,
+        raw_line=format_sample_line(sample),
+        last_error="",
+        mic_ready=sample.mic_ready,
+        mic_enabled=sample.mic_enabled,
+        mic_assist=sample.mic_assist,
+        mic_peak=sample.mic_peak,
+        mic_recent_peak=sample.mic_recent_peak,
+        recent_rows=rows,
+    )
+
+
+def read_xiao_sample(device: McuDeviceInfo, state: McuTelemetryState) -> McuTelemetrySample | None:
+    if not device.tty:
+        state.last_error = "没有 ttyACM 串口。"
+        return None
+    session = state.serial_session
+    if session is None or session.tty_name != device.tty or session.fd < 0:
+        if session is not None:
+            session.close()
+        session = open_xiao_serial(device.tty)
+        state.serial_session = session
+    if session is None:
+        dev = Path("/dev") / device.tty
+        if not dev.exists():
+            state.last_error = f"{dev} 不存在。"
+        else:
+            state.last_error = f"无法打开 {dev}；检查 dialout 组或串口占用。"
+        return None
+    line = session.read_line(timeout=0.0)
+    if not line:
+        if not state.last_error:
+            state.last_error = f"/dev/{device.tty} 已打开，但没有收到串口行。"
+        return None
+    sample = parse_mcu_line(line)
+    if sample is None:
+        state.last_error = f"无法解析串口行: {line[:80]}"
+        return None
+    state.last_error = ""
+    return sample
+
+
+def open_xiao_serial(tty_name: str) -> McuSerialSession | None:
+    dev = Path("/dev") / tty_name
+    if not dev.exists():
+        return None
+    try:
+        fd = os.open(dev, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        attrs = termios.tcgetattr(fd)
+        attrs[0] = 0
+        attrs[1] = 0
+        attrs[2] = attrs[2] & ~termios.CBAUD
+        attrs[2] = attrs[2] | termios.B115200
+        attrs[3] = 0
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+        set_serial_modem_lines(fd, termios.TIOCM_DTR | termios.TIOCM_RTS)
+        try:
+            termios.tcflush(fd, termios.TCIFLUSH)
+        except OSError:
+            pass
+        time.sleep(0.15)
+        return McuSerialSession(tty_name=tty_name, fd=fd)
+    except OSError:
+        return None
+
+
+def set_serial_modem_lines(fd: int, mask: int) -> None:
+    try:
+        flags = array.array("i", [mask])
+        fcntl.ioctl(fd, termios.TIOCMBIS, flags, True)
+    except OSError:
+        pass
+
+
+def parse_mcu_line(line: str) -> McuTelemetrySample | None:
+    text = line.strip()
+    if not text:
+        return None
+    if text.startswith("{"):
+        try:
+            payload = json_module.loads(text)
+        except json_module.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            values = payload.get("accel") or payload.get("a") or payload
+            if isinstance(values, dict):
+                ax = float(values.get("x", values.get("ax", 0.0)))
+                ay = float(values.get("y", values.get("ay", 0.0)))
+                az = float(values.get("z", values.get("az", 0.0)))
+            elif isinstance(values, list) and len(values) >= 3:
+                ax, ay, az = (float(values[0]), float(values[1]), float(values[2]))
+            else:
+                return None
+            temp_value = payload.get("temp", payload.get("temperature"))
+            temperature = float(temp_value) if temp_value is not None else None
+            delta_value = payload.get("delta")
+            gyro = payload.get("gyro")
+            gx = None
+            gy = None
+            gz = None
+            if isinstance(gyro, dict):
+                gx = float(gyro.get("x", gyro.get("gx", 0.0)))
+                gy = float(gyro.get("y", gyro.get("gy", 0.0)))
+                gz = float(gyro.get("z", gyro.get("gz", 0.0)))
+            mic = payload.get("mic")
+            mic_peak = None
+            mic_recent_peak = False
+            if isinstance(mic, dict):
+                peak_value = mic.get("peak")
+                mic_peak = int(peak_value) if peak_value is not None else None
+                mic_recent_peak = bool(mic.get("recent_peak"))
+                mic_ready = bool(mic.get("ready"))
+                mic_enabled = bool(mic.get("enabled"))
+                mic_assist = bool(mic.get("assist")) if mic.get("assist") is not None else None
+            else:
+                mic_ready = False
+                mic_enabled = False
+                mic_assist = None
+            light = payload.get("light")
+            light_lux = None
+            light_raw = None
+            light_ready = False
+            if isinstance(light, dict):
+                lux_value = light.get("lux")
+                raw_value = light.get("raw")
+                valid = bool(light.get("valid", lux_value is not None))
+                light_lux = float(lux_value) if lux_value is not None and valid else None
+                light_raw = int(raw_value) if raw_value is not None else None
+                light_ready = bool(light.get("ready"))
+            else:
+                lux_value = payload.get("lux", payload.get("light_lux"))
+                light_lux = float(lux_value) if lux_value is not None else None
+                light_ready = light_lux is not None
+            return McuTelemetrySample(
+                time.time(),
+                ax,
+                ay,
+                az,
+                temperature,
+                light_lux=light_lux,
+                light_raw=light_raw,
+                light_ready=light_ready,
+                source="json",
+                firmware_state=str(payload.get("state") or ""),
+                firmware_event=str(payload.get("event") or ""),
+                firmware_motion=str(payload.get("motion") or ""),
+                firmware_pose=str(payload.get("pose") or ""),
+                firmware_delta=float(delta_value) if delta_value is not None else None,
+                mic_peak=mic_peak,
+                mic_recent_peak=mic_recent_peak,
+                mic_ready=mic_ready,
+                mic_enabled=mic_enabled,
+                mic_assist=mic_assist,
+                gx=gx,
+                gy=gy,
+                gz=gz,
+            )
+
+    parts = [part for part in re.split(r"[,\s]+", text) if part]
+    if len(parts) < 3:
+        return None
+    try:
+        ax = float(parts[0])
+        ay = float(parts[1])
+        az = float(parts[2])
+    except ValueError:
+        return None
+    temperature = None
+    if len(parts) >= 4:
+        try:
+            temperature = float(parts[3])
+        except ValueError:
+            temperature = None
+    return McuTelemetrySample(time.time(), ax, ay, az, temperature, source="csv")
+
+
+def vector_magnitude(ax: float, ay: float, az: float) -> float:
+    return math.sqrt(ax * ax + ay * ay + az * az)
+
+
+def estimate_tilt_deg(ax: float, ay: float, az: float) -> float:
+    denominator = math.sqrt(ay * ay + az * az)
+    if denominator <= 0:
+        return 0.0
+    return abs(math.degrees(math.atan2(ax, denominator)))
+
+
+def stable_duration(state: McuTelemetryState, sample: McuTelemetrySample) -> float:
+    if state.prev_sample is None:
+        state.stable_since = sample.timestamp
+        state.last_delta_g = 0.0
+        state.prev_sample = sample
+        return 0.0
+    delta = abs(sample.ax - state.prev_sample.ax) + abs(sample.ay - state.prev_sample.ay) + abs(sample.az - state.prev_sample.az)
+    state.last_delta_g = delta
+    if delta <= XIAO_STILL_G_FORCE:
+        if state.stable_since is None:
+            state.stable_since = sample.timestamp
+    else:
+        state.stable_since = sample.timestamp
+    state.prev_sample = sample
+    if state.stable_since is None:
+        return 0.0
+    return max(0.0, sample.timestamp - state.stable_since)
+
+
+def mcu_state_label(state: str) -> str:
+    return {
+        "held": "拿起",
+        "put_down": "放下",
+        "stand": "支架",
+    }.get(state, state or "-")
+
+
+def mcu_motion_label(motion: str) -> str:
+    return {
+        "moving": "移动中",
+        "still": "静止",
+    }.get(motion, motion or "-")
+
+
+def mcu_event_label(event: str) -> str:
+    return MCU_FIRMWARE_EVENT_LABELS.get(event, event or "-")
+
+
+def estimate_sample_rate(samples: list[McuTelemetrySample]) -> float:
+    if len(samples) < 2:
+        return 0.0
+    span = samples[-1].timestamp - samples[0].timestamp
+    if span <= 0:
+        return 0.0
+    return (len(samples) - 1) / span
+
+
+def format_sample_line(sample: McuTelemetrySample) -> str:
+    parts = [f"accel={sample.ax:.3f},{sample.ay:.3f},{sample.az:.3f}"]
+    if sample.gx is not None and sample.gy is not None and sample.gz is not None:
+        parts.append(f"gyro={sample.gx:.2f},{sample.gy:.2f},{sample.gz:.2f}")
+    if sample.firmware_delta is not None:
+        parts.append(f"delta={sample.firmware_delta:.3f}")
+    if sample.light_lux is not None:
+        parts.append(f"lux={sample.light_lux:.1f}")
+    if sample.mic_peak is not None:
+        parts.append(f"mic={sample.mic_peak}{'*' if sample.mic_recent_peak else ''}")
+    if sample.temperature is not None:
+        parts.append(f"t={sample.temperature:.1f}")
+    return ", ".join(parts)
+
+
+def recent_rows_from_samples(samples: list[McuTelemetrySample]) -> tuple[tuple[str, str, str, str], ...]:
+    rows: list[tuple[str, str, str, str]] = []
+    for sample in samples[-6:][::-1]:
+        g_force = vector_magnitude(sample.ax, sample.ay, sample.az)
+        rows.append(
+            (
+                time.strftime("%H:%M:%S", time.localtime(sample.timestamp)),
+                f"{sample.ax:.2f},{sample.ay:.2f},{sample.az:.2f} ({g_force:.2f}g)",
+                sample.firmware_event or sample.source,
+                format_sample_line(sample),
+            )
+        )
+    return tuple(rows)
+
+
+def mcu_recent_rows(snapshot: McuStateSnapshot) -> tuple[tuple[str, str, str, str], ...]:
+    return snapshot.recent_rows or ()
+
+
+def snapshot_to_telemetry_state(snapshot: McuStateSnapshot, state: McuTelemetryState) -> McuTelemetryState:
+    state.last_state = snapshot.state
+    state.last_event = snapshot.event
+    state.last_motion = snapshot.motion
+    state.last_error = snapshot.last_error
+    state.smoothed_light_lux = snapshot.smoothed_light_lux
+    state.suggested_backlight = snapshot.suggested_backlight
+    return state
+
+
+def mcu_snapshot_placeholder() -> McuStateSnapshot:
+    device = find_xiao_device()
+    return McuStateSnapshot(
+        device=device,
+        state="等待设备" if not device.present else "已连接",
+        event="等待传感器数据",
+        motion="-",
+        still_for=0.0,
+        g_force=0.0,
+        tilt_deg=0.0,
+        sample_rate_hz=0.0,
+        pose="-",
+        light_lux=None,
+        smoothed_light_lux=None,
+        suggested_backlight=None,
+        light_raw=None,
+        light_ready=False,
+        last_update=time.time(),
+        raw_line="",
+        last_error="",
+        recent_rows=(),
+    )
+
+
+def mcu_device_label(device: McuDeviceInfo) -> str:
+    if not device.present:
+        return "未检测到 XIAO"
+    parts = [device.manufacturer or "Seeed", device.product or "XIAO"]
+    if device.tty:
+        parts.append(device.tty)
+    if device.mode:
+        parts.append(device.mode)
+    return " / ".join(parts)
+
+
+def mcu_updated_label(snapshot: McuStateSnapshot) -> str:
+    age = max(0.0, time.time() - snapshot.last_update)
+    return f"{age:.1f}s ago"
+
+
+def format_mic_label(snapshot: McuStateSnapshot) -> str:
+    if snapshot.mic_assist is None:
+        return "-"
+    assist = "on" if snapshot.mic_assist else "off"
+    active = "active" if snapshot.mic_enabled else "idle"
+    parts = [f"assist {assist}", active]
+    if snapshot.mic_peak is not None:
+        recent = "*" if snapshot.mic_recent_peak else ""
+        parts.append(f"peak {snapshot.mic_peak}{recent}")
+    return " / ".join(parts)
+
+
+def format_pose_label(pose: str) -> str:
+    if not pose or pose == "-":
+        return "-"
+    label = MCU_POSE_LABELS.get(pose)
+    if label:
+        return label
+    return pose
+
+
+def format_light_label(snapshot: McuStateSnapshot) -> str:
+    lux = snapshot.light_lux
+    smoothed_lux = snapshot.smoothed_light_lux
+    raw = snapshot.light_raw
+    ready = snapshot.light_ready
+    actual_backlight = read_display_backlight_label()
+    if lux is not None:
+        suggested = snapshot.suggested_backlight
+        if suggested is None:
+            suggested = classify_light_level(smoothed_lux if smoothed_lux is not None else lux)[3]
+        level = light_level_by_backlight(suggested)
+        smooth_text = f"{smoothed_lux:.1f}" if smoothed_lux is not None else "-"
+        suffix = f" / 滤波 {smooth_text} lx / 建议 {level[1]} {suggested}/9 / 实际 {actual_backlight}"
+        if raw is not None:
+            return f"原始 {lux:.1f} lx (raw {raw}){suffix}"
+        return f"原始 {lux:.1f} lx{suffix}"
+    if ready:
+        return f"等待光照样本 / 实际 {actual_backlight}"
+    return "-"
+
+
+def classify_light_level(lux: float) -> tuple[str, str, float | None, int]:
+    for level in MCU_LIGHT_LEVELS:
+        limit = level[2]
+        if limit is None or lux < limit:
+            return level
+    return MCU_LIGHT_LEVELS[-1]
+
+
+def light_level_by_backlight(backlight: int) -> tuple[str, str, float | None, int]:
+    for level in MCU_LIGHT_LEVELS:
+        if level[3] == backlight:
+            return level
+    return MCU_LIGHT_LEVELS[-1]
+
+
+def update_light_smoothing(state: McuTelemetryState, lux: float | None) -> None:
+    if lux is None:
+        return
+    if state.smoothed_light_lux is None:
+        smoothed = lux
+    else:
+        smoothed = state.smoothed_light_lux + MCU_LIGHT_SMOOTHING_ALPHA * (lux - state.smoothed_light_lux)
+    target = classify_light_level(smoothed)[3]
+    current = state.suggested_backlight
+    if current is None:
+        suggested = target
+    elif target > current:
+        suggested = current + 1
+    elif target < current:
+        suggested = current - 1
+    else:
+        suggested = current
+    state.smoothed_light_lux = smoothed
+    state.suggested_backlight = max(1, min(9, suggested))
+
+
+def read_display_backlight_label() -> str:
+    try:
+        brightness = int(DISPLAY_BACKLIGHT_BRIGHTNESS_PATH.read_text(encoding="utf-8").strip())
+        max_brightness = int(DISPLAY_BACKLIGHT_MAX_PATH.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return "-"
+    if max_brightness > 0:
+        return f"{brightness}/{max_brightness}"
+    return str(brightness)
+
+
+def mcu_summary_text(snapshot: McuStateSnapshot) -> str:
+    if not snapshot.device.present:
+        return "XIAO 未连接。"
+    if snapshot.device.mode == "bootloader":
+        return "当前在 UF2/bootloader 模式。"
+    if snapshot.last_error:
+        return snapshot.last_error
+    if snapshot.state == "等待数据" or snapshot.event == "等待传感器数据":
+        return "设备已连接，但还没有收到姿态数据。"
+    return f"当前状态: {snapshot.state} / {snapshot.motion}"
+
+
+def mcu_action_text(snapshot: McuStateSnapshot) -> str:
+    if not snapshot.device.present:
+        return "插上 XIAO 后这里会显示姿态状态。"
+    if snapshot.device.mode == "bootloader":
+        return "可以直接刷机。"
+    if snapshot.last_error:
+        return "先确认 /dev/ttyACM0 权限、会话组和固件串口输出。"
+    if snapshot.state == "等待数据" or snapshot.event == "等待传感器数据":
+        return "设备已连接，但还没有收到姿态数据。"
+    if snapshot.state == "拿起":
+        return "拿起状态，可唤醒屏幕。"
+    if snapshot.state == "放下":
+        return "放下状态，可启动熄屏倒计时。"
+    if snapshot.state == "支架":
+        return "支架状态，可按配置屏蔽自动熄屏。"
+    return "等待更多样本。"
+
+
+def mcu_hint_text(snapshot: McuStateSnapshot) -> str:
+    if not snapshot.device.present:
+        return "建议先确认串口输出格式，再决定是否自动锁屏。"
+    if snapshot.last_error:
+        return "当前用户会话若未包含 dialout，注销重登后再试；固件也需要持续输出 JSON 或 CSV 加速度行。"
+    if snapshot.device.tty:
+        return ""
+    return "当前没有 ttyACM，只有 USB 设备描述符。"
 
 
 def main() -> int:

@@ -115,18 +115,33 @@ install_service() {
     ensure_config_key "${config_file}" "POWERSAVER_ECO_AC_SCREEN_TIMEOUT_SEC" "0"
     ensure_config_key "${config_file}" "POWERSAVER_ECO_UNKNOWN_POWER_ACTION" "restore"
     ensure_config_key "${config_file}" "POWERSAVER_ECO_WWAN_POLICY" "ondemand"
+    ensure_config_key "${config_file}" "POWERSAVER_ECO_SCREEN_MODE" "default"
+    ensure_config_key "${config_file}" "POWERSAVER_ECO_AUTO_BRIGHTNESS" "0"
+    ensure_config_key "${config_file}" "POWERSAVER_ECO_STAND_MODE" "0"
+    ensure_config_key "${config_file}" "POWERSAVER_ECO_AUTO_BATTERY_PUTDOWN_TIMEOUT_SEC" "30"
+    ensure_config_key "${config_file}" "POWERSAVER_ECO_AUTO_AC_PUTDOWN_TIMEOUT_SEC" "60"
     ensure_config_key "${config_file}" "POWERSAVER_BALANCED_BATTERY_CPU_FREQ" "1500,1500"
     ensure_config_key "${config_file}" "POWERSAVER_BALANCED_AC_CPU_FREQ" "restore"
     ensure_config_key "${config_file}" "POWERSAVER_BALANCED_BATTERY_SCREEN_TIMEOUT_SEC" "0"
     ensure_config_key "${config_file}" "POWERSAVER_BALANCED_AC_SCREEN_TIMEOUT_SEC" "0"
     ensure_config_key "${config_file}" "POWERSAVER_BALANCED_UNKNOWN_POWER_ACTION" "restore"
     ensure_config_key "${config_file}" "POWERSAVER_BALANCED_WWAN_POLICY" "ondemand"
+    ensure_config_key "${config_file}" "POWERSAVER_BALANCED_SCREEN_MODE" "default"
+    ensure_config_key "${config_file}" "POWERSAVER_BALANCED_AUTO_BRIGHTNESS" "0"
+    ensure_config_key "${config_file}" "POWERSAVER_BALANCED_STAND_MODE" "0"
+    ensure_config_key "${config_file}" "POWERSAVER_BALANCED_AUTO_BATTERY_PUTDOWN_TIMEOUT_SEC" "60"
+    ensure_config_key "${config_file}" "POWERSAVER_BALANCED_AUTO_AC_PUTDOWN_TIMEOUT_SEC" "120"
     ensure_config_key "${config_file}" "POWERSAVER_PERFORMANCE_BATTERY_CPU_FREQ" "1500,2400"
     ensure_config_key "${config_file}" "POWERSAVER_PERFORMANCE_AC_CPU_FREQ" "restore"
     ensure_config_key "${config_file}" "POWERSAVER_PERFORMANCE_BATTERY_SCREEN_TIMEOUT_SEC" "0"
     ensure_config_key "${config_file}" "POWERSAVER_PERFORMANCE_AC_SCREEN_TIMEOUT_SEC" "0"
     ensure_config_key "${config_file}" "POWERSAVER_PERFORMANCE_UNKNOWN_POWER_ACTION" "restore"
     ensure_config_key "${config_file}" "POWERSAVER_PERFORMANCE_WWAN_POLICY" "ondemand"
+    ensure_config_key "${config_file}" "POWERSAVER_PERFORMANCE_SCREEN_MODE" "default"
+    ensure_config_key "${config_file}" "POWERSAVER_PERFORMANCE_AUTO_BRIGHTNESS" "0"
+    ensure_config_key "${config_file}" "POWERSAVER_PERFORMANCE_STAND_MODE" "0"
+    ensure_config_key "${config_file}" "POWERSAVER_PERFORMANCE_AUTO_BATTERY_PUTDOWN_TIMEOUT_SEC" "120"
+    ensure_config_key "${config_file}" "POWERSAVER_PERFORMANCE_AUTO_AC_PUTDOWN_TIMEOUT_SEC" "300"
     ensure_config_key "${config_file}" "POWERSAVER_BATTERY_SCREEN_TIMEOUT_SEC" "0"
     ensure_config_key "${config_file}" "POWERSAVER_AC_SCREEN_TIMEOUT_SEC" "0"
   fi
@@ -134,6 +149,17 @@ install_service() {
   sudo systemctl daemon-reload
   if [[ "${START_SERVICE}" -eq 1 ]]; then
     sudo systemctl enable --now uconsole-helper.service
+  fi
+
+  local sudoers_file="/etc/sudoers.d/uconsole-helper-service-write-config"
+  local sudoers_line="${USER} ALL=(root) NOPASSWD: ${bin_file} write-config"
+  if [[ ! -f "${sudoers_file}" ]] || ! sudo grep -Fxq "${sudoers_line}" "${sudoers_file}"; then
+    local tmp_sudoers
+    tmp_sudoers="$(mktemp)"
+    printf '%s\n' "${sudoers_line}" > "${tmp_sudoers}"
+    sudo visudo -cf "${tmp_sudoers}" >/dev/null
+    sudo install -m 0440 "${tmp_sudoers}" "${sudoers_file}"
+    rm -f "${tmp_sudoers}"
   fi
 
   echo "Installed uConsole Helper background service:"
@@ -261,6 +287,9 @@ install_mapper() {
   fi
   if [[ -f "${config_dir}/config.toml" ]]; then
     perl -0pi -e 's#/usr/local/bin/uconsole-mapper-display-control#/usr/local/bin/uconsole-helper-mapper-display-control#g' "${config_dir}/config.toml"
+    perl -0pi -e 's#lock_command = "rm -f \${XDG_RUNTIME_DIR:-/tmp}/uconsole-helper-auto-screen-off && sudo -n /usr/local/bin/uconsole-helper-mapper-display-control off"#lock_command = "sudo -n /usr/local/bin/uconsole-helper-mapper-display-control off"#g' "${config_dir}/config.toml"
+    perl -0pi -e 's#lock_command = "mkdir -p \${XDG_RUNTIME_DIR:-/tmp} && rm -f \${XDG_RUNTIME_DIR:-/tmp}/uconsole-helper-auto-screen-off && date \+%s > \${XDG_RUNTIME_DIR:-/tmp}/uconsole-helper-manual-screen-off && sudo -n /usr/local/bin/uconsole-helper-mapper-display-control off"#lock_command = "sudo -n /usr/local/bin/uconsole-helper-mapper-display-control off"#g' "${config_dir}/config.toml"
+    perl -0pi -e 's#unlock_command = "rm -f \${XDG_RUNTIME_DIR:-/tmp}/uconsole-helper-manual-screen-off \${XDG_RUNTIME_DIR:-/tmp}/uconsole-helper-auto-screen-off && sudo -n /usr/local/bin/uconsole-helper-mapper-display-control on"#unlock_command = "sudo -n /usr/local/bin/uconsole-helper-mapper-display-control on"#g' "${config_dir}/config.toml"
   fi
 
   if [[ ! -x "${python_bin}" ]]; then
@@ -317,6 +346,13 @@ install_mapper() {
   install -m 0755 "${APP_DIR}/scripts/mapper/uconsole-paste.sh" "${bin_dir}/uconsole-paste"
   install -m 0755 "${APP_DIR}/scripts/mapper/uconsole-voice-ptt.sh" "${bin_dir}/uconsole-voice-ptt"
   install -m 0755 "${APP_DIR}/scripts/mapper/uconsole-voice-stream.py" "${bin_dir}/uconsole-voice-stream"
+  if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists gtk+-3.0 gtk-layer-shell-0; then
+    cc "${APP_DIR}/scripts/mapper/uconsole-asr-popup.c" -o "${bin_dir}/uconsole-asr-popup" $(pkg-config --cflags --libs gtk+-3.0 gtk-layer-shell-0)
+    chmod 0755 "${bin_dir}/uconsole-asr-popup"
+  else
+    echo "gtk+-3.0 and gtk-layer-shell development files are required to build uconsole-asr-popup" >&2
+    exit 1
+  fi
   install -m 0644 "${APP_DIR}/scripts/mapper/fcitx-uconsole-voice-commit.lua" "${fcitx_lua_dir}/uconsole_voice_commit.lua"
   install -m 0644 "${APP_DIR}/services/user/uconsole-helper-mapper.service" "${systemd_dir}/uconsole-helper-mapper.service"
   install -m 0644 "${APP_DIR}/services/user/uconsole-helper-idle.service" "${systemd_dir}/uconsole-helper-idle.service"
@@ -345,6 +381,21 @@ install_mapper() {
   if [[ ! -f "${config_dir}/voice.env" ]]; then
     install -m 0644 "${APP_DIR}/config/mapper/voice.env.example" "${config_dir}/voice.env"
   fi
+  if grep -Eq '^ASR_TIMEOUT=(30|60)$' "${config_dir}/voice.env"; then
+    perl -0pi -e 's/^ASR_TIMEOUT=(30|60)$/ASR_TIMEOUT=15/m' "${config_dir}/voice.env"
+  fi
+  if ! grep -Eq '^ASR_REQUEST_ATTEMPT_TIMEOUT=' "${config_dir}/voice.env"; then
+    printf 'ASR_REQUEST_ATTEMPT_TIMEOUT=8\n' >> "${config_dir}/voice.env"
+  fi
+  if ! grep -Eq '^ASR_CONNECT_TIMEOUT=' "${config_dir}/voice.env"; then
+    printf 'ASR_CONNECT_TIMEOUT=2\n' >> "${config_dir}/voice.env"
+  fi
+  if ! grep -Eq '^ASR_RETRY_COUNT=' "${config_dir}/voice.env"; then
+    printf 'ASR_RETRY_COUNT=3\n' >> "${config_dir}/voice.env"
+  fi
+  if ! grep -Eq '^ASR_RETRY_DELAY=' "${config_dir}/voice.env"; then
+    printf 'ASR_RETRY_DELAY=0.35\n' >> "${config_dir}/voice.env"
+  fi
   if [[ ! -f "${config_dir}/voice-glossary.txt" ]]; then
     install -m 0644 "${APP_DIR}/config/mapper/voice-glossary.txt.example" "${config_dir}/voice-glossary.txt"
   fi
@@ -372,6 +423,7 @@ install_mapper() {
     systemctl --user restart uconsole-helper-mapper.service
     systemctl --user enable --now uconsole-helper-idle.service
     systemctl --user restart uconsole-helper-idle.service
+    systemctl --user disable --now uconsole-helper-asr-preview.service >/dev/null 2>&1 || true
   fi
 
   echo "Installed uConsole input mapper:"
