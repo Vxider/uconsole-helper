@@ -8,13 +8,44 @@ export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUN
 
 IME_WAS_ACTIVE=0
 
+hydrate_session_env() {
+  local session_env=
+  local key sep value
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    return 0
+  fi
+  session_env=$(systemctl --user show-environment 2>/dev/null || true)
+  while IFS= read -r line; do
+    key=
+    sep=
+    value=
+    key=${line%%=*}
+    sep=${line#*=}
+    if [[ -n "${key}" && "${line}" == *"="* ]]; then
+      value=${line#*=}
+      case "${key}" in
+        XDG_RUNTIME_DIR|WAYLAND_DISPLAY|DISPLAY|DBUS_SESSION_BUS_ADDRESS|XAUTHORITY)
+          export "${key}=${value}"
+          ;;
+      esac
+    fi
+  done <<<"${session_env}"
+  export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+  export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
+  export DISPLAY="${DISPLAY:-:0}"
+  export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR}/bus}"
+  export XAUTHORITY="${XAUTHORITY:-${HOME}/.Xauthority}"
+}
+
+hydrate_session_env
+
 usage() {
   cat <<'EOF'
 Usage:
   uconsole-voice-ptt start
   uconsole-voice-ptt stop
   uconsole-voice-ptt cancel
-  uconsole-voice-ptt learn
 
 Configuration is read from:
   $VOICE_PTT_CONFIG
@@ -23,8 +54,7 @@ Configuration is read from:
 Supported variables:
   ASR_URL            required, ASR endpoint
   ASR_LANGUAGE       optional multipart field
-  ASR_AUTH_TOKEN     required for FlashAI ASR, bearer token with asr:transcribe and asr:learn
-  ASR_FINALIZE_URL   optional finalize endpoint; defaults from ASR_URL
+  ASR_AUTH_TOKEN     required for FlashAI ASR, bearer token with asr:transcribe
   ASR_PROMPT         optional short ASR prompt hint
   ASR_PROMPT_FIELD   multipart field for ASR prompt, default: prompt
   ASR_PROMPT_GLOSSARY_FIELD
@@ -36,6 +66,13 @@ Supported variables:
                          off | on | auto, default: auto
   ASR_NO_PROXY       1 disables proxy for ASR requests, default: 1
   ASR_TIMEOUT        ASR request timeout in seconds, default: 60; 0 disables
+  ASR_REQUEST_ATTEMPT_TIMEOUT / ASR_CONNECT_TIMEOUT / ASR_RETRY_COUNT / ASR_RETRY_DELAY
+                      HTTP finalize/upload retry knobs used by the stream client
+  ASR_PREVIEW_WS_URL Qwen ASR streaming websocket URL; derived from ASR_URL when empty
+  ASR_FINALIZE_TEXT_URL
+                      endpoint for finalizing streaming text; derived from ASR_URL when empty
+  ASR_PREVIEW_FINAL_WAIT_SECONDS
+                      seconds to wait for Qwen streaming final after stop, default: 2.5
   VOICE_OUTPUT_MODE      type | type_enter | clipboard | paste | fcitx_commit, default: type
   VOICE_TMUX_OUTPUT_MODE output mode used when a tmux/terminal window is focused, default: type
   VOICE_WECHAT_OUTPUT_MODE
@@ -58,17 +95,12 @@ Supported variables:
   VOICE_STATE_DIR        default: ${XDG_STATE_HOME:-~/.local/state}/uconsole-helper-mapper
   VOICE_KEEP_AUDIO       1 keeps recorded audio after stop, default: 0
   VOICE_STREAM_PREVIEW   1 shows a WeChat-style recognition preview popup, default: 1
+  VOICE_QWEN_ASR_STREAMING
+                      1 uses Qwen ASR websocket streaming for preview/final, default: 1
   VOICE_NOTIFY_WHILE_PREVIEW
                         1 keeps the system recording notification even when preview is enabled, default: 0
   VOICE_STREAM_SEND_INTERVAL_MS
                         local recorder read interval, default: 250
-  VOICE_PAUSE_SEGMENT_MS
-                        silence duration before automatic final-ASR upload, default: 1600
-  VOICE_MIN_SEGMENT_MS   minimum auto-upload segment duration, default: 1000
-  VOICE_AUTO_SEGMENT_RMS_THRESHOLD
-                        initial local speech RMS threshold, default: 0.006
-  VOICE_AUTO_SEGMENT_NOISE_MARGIN
-                        local speech threshold margin over noise floor, default: 0.004
   VOICE_NOTIFY_USE_MARKUP
                          1 enables Pango markup for notifications, default: 0
   VOICE_NOTIFY_FONT_SIZE notification font size when markup is enabled, default: 22
@@ -79,20 +111,6 @@ Supported variables:
                         minimum lines sent from the active tmux pane, default: 30
   VOICE_TMUX_CONTEXT_MAX_CHARS
                         max chars sent from tmux context, default: 1200
-  VOICE_LEARN_MAX_AGE_SECONDS
-                        max age for the last ASR state used by learn, default: 600
-  VOICE_LEARN_MAX_EDIT_RATIO
-                        max allowed correction edit ratio, default: 0.38
-  VOICE_LEARN_REPLACE_INPUT
-                        1 replaces the last inserted ASR text after correction, default: 1
-  VOICE_LEARN_REPLACE_MAX_CHARS
-                        max chars deleted when replacing ASR text, default: 300
-  VOICE_LEARN_DIALOG_FONT_SIZE
-                        correction dialog font size, default: 22
-  VOICE_LEARN_DIALOG_COMMAND
-                        custom correction dialog command, default: ~/.local/bin/uconsole-asr-correction-dialog
-  VOICE_LEARN_DIALOG_WIDTH / VOICE_LEARN_DIALOG_HEIGHT
-                        correction dialog size, defaults: 820 / 220
 EOF
 }
 
@@ -116,24 +134,162 @@ show_status() {
   fi
 }
 
-close_status() {
+close_notification() {
+  local notify_id=${1:-}
+
+  [[ -n "${notify_id}" ]] || return 0
   if command -v dunstify >/dev/null 2>&1; then
-    dunstify -C "${VOICE_NOTIFY_ID}" >/dev/null 2>&1 || true
+    dunstify -C "${notify_id}" >/dev/null 2>&1 || true
   fi
+}
+
+close_recording_notification() {
+  local notification_pid_file="${VOICE_STATE_DIR}/voice-recording-notification.id"
+  local notification_id=
+
+  if [[ -f "${notification_pid_file}" ]]; then
+    notification_id=$(cat "${notification_pid_file}" 2>/dev/null || true)
+  fi
+  close_notification "${notification_id}"
+  close_notification "${VOICE_RECORDING_NOTIFY_ID}"
+  rm -f "${notification_pid_file}" >/dev/null 2>&1 || true
+}
+
+close_recording_popup() {
+  local popup_pid_file="${VOICE_STATE_DIR}/voice-recording-popup.pid"
+  local popup_text_file="${VOICE_STATE_DIR}/voice-recording-popup.txt"
+  local popup_pid=
+
+  if [[ -f "${popup_pid_file}" ]]; then
+    popup_pid=$(cat "${popup_pid_file}" 2>/dev/null || true)
+  fi
+  if [[ -n "${popup_pid}" ]]; then
+    terminate_process_group "${popup_pid}" TERM
+    wait_for_exit "${popup_pid}" 2 || true
+    terminate_process_group "${popup_pid}" KILL
+    wait_for_exit "${popup_pid}" 2 || true
+  fi
+  close_recording_popup_instances
+  rm -f "${popup_pid_file}" >/dev/null 2>&1 || true
+  rm -f "${popup_text_file}" >/dev/null 2>&1 || true
+}
+
+show_recording_popup_message_then_close() {
+  local message=$1
+  local delay_seconds=${2:-2}
+
+  write_recording_popup_text "${message}"
+  sleep "${delay_seconds}" || true
+  close_recording_status
+}
+
+focus_recording_popup() {
+  local spec="title:uconsole voice"
+
+  [[ -x "${WLRCTL}" ]] || return 0
+  "${WLRCTL}" window focus "${spec}" >/dev/null 2>&1 || true
+  "${WLRCTL}" toplevel focus "${spec}" >/dev/null 2>&1 || true
+  "${WLRCTL}" toplevel activate "${spec}" >/dev/null 2>&1 || true
+}
+
+launch_recording_popup() {
+  local body="录音中..."
+  local popup_pid_file="${VOICE_STATE_DIR}/voice-recording-popup.pid"
+  local popup_text_file="${VOICE_STATE_DIR}/voice-recording-popup.txt"
+  local popup_pid=
+  local session_launcher="/usr/local/bin/uconsole-launch-in-session"
+  local popup_helper="${HOME}/.local/bin/uconsole-asr-popup"
+  local launcher=()
+  local popup_cmd=
+
+  if [[ -x "${session_launcher}" ]]; then
+    launcher=("${session_launcher}")
+  fi
+
+  close_recording_popup || true
+  rm -f "${popup_text_file}" >/dev/null 2>&1 || true
+  write_recording_popup_text "${body}"
+
+  if [[ -x "${popup_helper}" ]]; then
+    popup_cmd="${popup_helper}"
+    log_ptt "recording popup launch cmd=${popup_cmd} launcher=${launcher[*]:-none}"
+    setsid "${launcher[@]}" "${popup_helper}" "${popup_text_file}" >/dev/null 2>&1 &
+    popup_pid=$!
+    printf '%s\n' "${popup_pid}" >"${popup_pid_file}" || true
+    log_ptt "recording popup started pid=${popup_pid}"
+    (sleep 0.2; focus_recording_popup; sleep 0.5; focus_recording_popup) >/dev/null 2>&1 &
+    return 0
+  fi
+
+  if command -v kdialog >/dev/null 2>&1; then
+    popup_cmd=$(command -v kdialog || printf '%s' kdialog)
+    log_ptt "recording popup launch cmd=${popup_cmd} launcher=${launcher[*]:-none}"
+    setsid "${launcher[@]}" kdialog \
+      --title "uconsole voice" \
+      --msgbox "${body}" \
+      >/dev/null 2>&1 &
+    popup_pid=$!
+    printf '%s\n' "${popup_pid}" >"${popup_pid_file}" || true
+    log_ptt "recording popup started pid=${popup_pid}"
+    (sleep 0.2; focus_recording_popup) >/dev/null 2>&1 &
+    return 0
+  fi
+
+  if command -v zenity >/dev/null 2>&1; then
+    popup_cmd=$(command -v zenity || printf '%s' zenity)
+    log_ptt "recording popup launch cmd=${popup_cmd} launcher=${launcher[*]:-none}"
+    setsid "${launcher[@]}" zenity \
+      --info \
+      --no-wrap \
+      --title="uconsole voice" \
+      --text="${body}" \
+      --width=520 \
+      >/dev/null 2>&1 &
+    popup_pid=$!
+    printf '%s\n' "${popup_pid}" >"${popup_pid_file}" || true
+    log_ptt "recording popup started pid=${popup_pid}"
+    (sleep 0.2; focus_recording_popup) >/dev/null 2>&1 &
+    return 0
+  fi
+
+  log_ptt "recording popup unavailable"
+  return 1
+}
+
+close_status() {
+  close_notification "${VOICE_NOTIFY_ID}"
+  close_recording_notification
+  close_recording_popup
+}
+
+close_recording_status() {
+  close_recording_notification
+  close_recording_popup
 }
 
 show_recording_status() {
   local body="录音中..."
 
+  if launch_recording_popup >/dev/null 2>&1; then
+    return
+  fi
+  log_ptt "recording popup failed; using notification only"
+
   if command -v dunstify >/dev/null 2>&1; then
-    dunstify \
+    local notification_id=
+    notification_id=$(dunstify \
       -a "uconsole-voice" \
-      -r "${VOICE_NOTIFY_ID}" \
-      -u low \
+      -r "${VOICE_RECORDING_NOTIFY_ID}" \
+      -p \
+      -u critical \
       -t 0 \
       -h "int:value:20" \
       "$(format_status_text "uconsole voice")" \
-      "$(format_status_body "${body}")" >/dev/null 2>&1 || true
+      "$(format_status_body "${body}")" 2>/dev/null || true)
+    if [[ -n "${notification_id}" ]]; then
+      printf '%s\n' "${notification_id}" >"${VOICE_STATE_DIR}/voice-recording-notification.id" || true
+      log_ptt "recording notification started id=${notification_id}"
+    fi
     return
   fi
   if command -v notify-send >/dev/null 2>&1; then
@@ -302,27 +458,6 @@ normalize_transcript() {
   tr '\r\n' '  ' | sed 's/[[:space:]]\+/ /g' | trim
 }
 
-normalize_learn_text() {
-  perl -CS -pe 's/\e\[[0-9;?]*[ -\/]*[@-~]//g; s/\r//g' | sed 's/[[:space:]]\+$//'
-}
-
-derive_asr_finalize_url() {
-  local request_id=$1
-  [[ -n "${request_id}" ]] || return 1
-  if [[ -n "${ASR_FINALIZE_URL}" ]]; then
-    printf '%s\n' "${ASR_FINALIZE_URL//\{requestId\}/${request_id}}"
-    return 0
-  fi
-  case "${ASR_URL}" in
-    */api/asr/transcriptions)
-      printf '%s\n' "${ASR_URL%/api/asr/transcriptions}/api/asr/transcription-events/${request_id}/finalize"
-      ;;
-    *)
-      return 1
-      ;;
-  esac
-}
-
 sanitize_asr_context() {
   perl -CS -0pe 's/[^\p{L}\p{N}\s]+/ /g; s/\s+/ /g; s/^ //; s/ $//'
 }
@@ -348,6 +483,62 @@ terminate_process_group() {
   [[ -n "${pid}" ]] || return 0
   kill -"${signal_name}" -- "-${pid}" >/dev/null 2>&1 || true
   kill -"${signal_name}" "${pid}" >/dev/null 2>&1 || true
+}
+
+terminate_matching_processes() {
+  local pattern=$1
+  local signal_name=${2:-TERM}
+  local timeout=${3:-2}
+  local pid=
+  local pids=()
+
+  while IFS= read -r pid; do
+    [[ -n "${pid}" ]] || continue
+    [[ "${pid}" != "$$" && "${pid}" != "${BASHPID}" && "${pid}" != "${PPID}" ]] || continue
+    pids+=("${pid}")
+  done < <(pgrep -f "${pattern}" 2>/dev/null || true)
+
+  (( ${#pids[@]} > 0 )) || return 0
+  for pid in "${pids[@]}"; do
+    terminate_process_group "${pid}" "${signal_name}"
+  done
+  for pid in "${pids[@]}"; do
+    wait_for_exit "${pid}" "${timeout}" || true
+  done
+}
+
+regex_escape() {
+  printf '%s' "$1" | sed 's/[][\\.^$*+?{}()|]/\\&/g'
+}
+
+close_recording_popup_instances() {
+  local popup_text_file="${VOICE_STATE_DIR}/voice-recording-popup.txt"
+  local escaped_text_file
+
+  escaped_text_file=$(regex_escape "${popup_text_file}")
+  terminate_matching_processes "uconsole-asr-popup .*${escaped_text_file}" TERM 2
+  terminate_matching_processes "uconsole-asr-popup .*${escaped_text_file}" KILL 1
+}
+
+write_recording_popup_text() {
+  local message=$1
+  local popup_text_file="${VOICE_STATE_DIR}/voice-recording-popup.txt"
+  local tmp_file="${popup_text_file}.$$"
+
+  mkdir -p "${VOICE_STATE_DIR}" >/dev/null 2>&1 || true
+  printf '# %s\n' "${message}" >"${tmp_file}" || return 0
+  mv -f "${tmp_file}" "${popup_text_file}" >/dev/null 2>&1 || true
+}
+
+stop_orphan_recording_processes() {
+  local state_dir_pattern
+
+  state_dir_pattern=$(regex_escape "${VOICE_STATE_DIR}")
+  terminate_matching_processes "uconsole-voice-stream.*${state_dir_pattern}" INT 2
+  terminate_matching_processes "uconsole-voice-stream.*${state_dir_pattern}" TERM 2
+  terminate_matching_processes "uconsole-voice-stream.*${state_dir_pattern}" KILL 1
+  terminate_matching_processes "pw-record --rate ${VOICE_SAMPLE_RATE} --channels ${VOICE_CHANNELS}" TERM 2
+  terminate_matching_processes "pw-record --rate ${VOICE_SAMPLE_RATE} --channels ${VOICE_CHANNELS}" KILL 1
 }
 
 stop_existing_recording_session() {
@@ -604,73 +795,12 @@ build_whisper_context() {
   printf '%s\n' "${tmux_context}"
 }
 
-current_tmux_target_json() {
-  [[ "${VOICE_TMUX_CONTEXT}" == "1" ]] || return 1
-  local session_name window_id pane_id pane_index pane_command
-  IFS=$'\t' read -r session_name window_id < <(resolve_tmux_window_target) || return 1
-  IFS=$'\t' read -r pane_id pane_index pane_command < <(
-    tmux list-panes -t "${window_id}" -F '#{?pane_active,#{pane_id}'$'\t''#{pane_index}'$'\t''#{pane_current_command},}' 2>/dev/null \
-      | awk 'NF { print; exit }'
-  ) || true
-  [[ -n "${pane_id}" ]] || return 1
-  jq -n \
-    --arg sessionName "${session_name:-}" \
-    --arg windowId "${window_id:-}" \
-    --arg paneId "${pane_id:-}" \
-    --arg paneIndex "${pane_index:-}" \
-    --arg paneCommand "${pane_command:-}" \
-    '{sessionName:$sessionName, windowId:$windowId, paneId:$paneId, paneIndex:$paneIndex, paneCommand:$paneCommand}'
-}
-
-capture_tmux_pane_text_for_learn() {
-  local pane_id=${1:-}
-  [[ -n "${pane_id}" ]] || return 1
-  tmux capture-pane -p -J -S "-${VOICE_LEARN_CAPTURE_LINES}" -t "${pane_id}" 2>/dev/null | normalize_learn_text
-}
-
-save_last_asr_state() {
-  local request_id=$1
-  local inserted_text=$2
-  local raw_text=$3
-  local corrected_text=$4
-  local before_text=$5
-  local after_text=$6
-  [[ -n "${request_id}" ]] || return 0
-  local target_json pane_id session_name window_id pane_command
-  target_json=$(current_tmux_target_json || true)
-  if [[ -z "${target_json}" ]]; then
-    pane_id=
-    session_name=
-    window_id=
-    pane_command=
-    log_ptt "save_last_asr_state: no tmux target requestId=${request_id} insertedChars=${#inserted_text}"
-  else
-    pane_id=$(jq -r '.paneId // empty' <<<"${target_json}")
-    session_name=$(jq -r '.sessionName // empty' <<<"${target_json}")
-    window_id=$(jq -r '.windowId // empty' <<<"${target_json}")
-    pane_command=$(jq -r '.paneCommand // empty' <<<"${target_json}")
-  fi
-  mkdir -p "${VOICE_STATE_DIR}"
-  jq -n \
-    --arg requestId "${request_id}" \
-    --arg insertedText "${inserted_text}" \
-    --arg rawText "${raw_text}" \
-    --arg correctedText "${corrected_text}" \
-    --arg paneId "${pane_id}" \
-    --arg sessionName "${session_name}" \
-    --arg windowId "${window_id}" \
-    --arg paneCommand "${pane_command}" \
-    --arg beforePaneText "${before_text}" \
-    --arg afterPaneText "${after_text}" \
-    --argjson createdAt "$(date +%s)" \
-    '{requestId:$requestId, insertedText:$insertedText, rawText:$rawText, correctedText:$correctedText, paneId:$paneId, sessionName:$sessionName, windowId:$windowId, paneCommand:$paneCommand, beforePaneText:$beforePaneText, afterPaneText:$afterPaneText, createdAt:$createdAt}' \
-    >"${LAST_ASR_STATE_FILE}"
-  log_ptt "saved last ASR state requestId=${request_id} pane=${pane_id} insertedChars=${#inserted_text}"
-}
-
 start_recording() {
   mkdir -p "${VOICE_STATE_DIR}"
+  log_ptt "start_recording begin"
+  close_recording_popup || true
   stop_existing_recording_session
+  stop_orphan_recording_processes
 
   if [[ -z "${ASR_URL}" ]]; then
     echo "ASR_URL is required" >&2
@@ -682,7 +812,10 @@ start_recording() {
     show_status "uconsole voice" "未配置 ASR Token" "0" "1200"
     exit 1
   fi
+  show_recording_status || log_ptt "show_recording_status returned nonzero"
+
   local context_text prompt_glossary_json
+  log_ptt "building ASR context"
   context_text=$(build_whisper_context || true)
   prompt_glossary_json=$(build_prompt_glossary_json || true)
 
@@ -693,6 +826,19 @@ start_recording() {
   rm -f "${stream_stop_file}" "${stream_result_file}"
   stream_log_file="${VOICE_STATE_DIR}/voice-ptt.log"
 
+  local stream_python=""
+  local repo_root
+  local asr_python_candidate
+  repo_root=$(cd -- "${SCRIPT_DIR}/../.." && pwd)
+  for asr_python_candidate in     "${repo_root}/.venv-asr/bin/python"     "${HOME}/WorkSpace/uconsole-helper/.venv-asr/bin/python"
+  do
+    if [[ -x "${asr_python_candidate}" ]]; then
+      stream_python="${asr_python_candidate}"
+      break
+    fi
+  done
+  log_ptt "launching ASR stream client=${stream_client} python=${stream_python:-direct}"
+
   STREAM_RESULT_FILE="${stream_result_file}" \
     STREAM_STOP_FILE="${stream_stop_file}" \
     VOICE_STREAM_LOG_FILE="${stream_log_file}" \
@@ -700,6 +846,14 @@ start_recording() {
     ASR_LANGUAGE="${ASR_LANGUAGE}" \
     ASR_AUTH_TOKEN="${ASR_AUTH_TOKEN}" \
     ASR_TIMEOUT="${ASR_TIMEOUT}" \
+    ASR_REQUEST_ATTEMPT_TIMEOUT="${ASR_REQUEST_ATTEMPT_TIMEOUT}" \
+    ASR_CONNECT_TIMEOUT="${ASR_CONNECT_TIMEOUT}" \
+    ASR_RETRY_COUNT="${ASR_RETRY_COUNT}" \
+    ASR_RETRY_DELAY="${ASR_RETRY_DELAY}" \
+    ASR_PREVIEW_WS_URL="${ASR_PREVIEW_WS_URL}" \
+    ASR_FINALIZE_TEXT_URL="${ASR_FINALIZE_TEXT_URL}" \
+    ASR_PREVIEW_FINAL_WAIT_SECONDS="${ASR_PREVIEW_FINAL_WAIT_SECONDS}" \
+    ASR_PREVIEW_WS_TIMEOUT="${ASR_PREVIEW_WS_TIMEOUT}" \
     ASR_PROMPT="${ASR_PROMPT}" \
     ASR_PROMPT_FIELD="${ASR_PROMPT_FIELD}" \
     ASR_PROMPT_GLOSSARY="${prompt_glossary_json}" \
@@ -714,16 +868,17 @@ start_recording() {
     VOICE_STATE_DIR="${VOICE_STATE_DIR}" \
     VOICE_KEEP_AUDIO="${VOICE_KEEP_AUDIO}" \
     VOICE_NOTIFY_ID="${VOICE_NOTIFY_ID}" \
+    VOICE_RECORDING_NOTIFY_ID="${VOICE_RECORDING_NOTIFY_ID}" \
+    VOICE_RECORDING_POPUP_TEXT_FILE="${VOICE_STATE_DIR}/voice-recording-popup.txt" \
+    VOICE_RECORDING_POPUP_PID_FILE="${VOICE_STATE_DIR}/voice-recording-popup.pid" \
     VOICE_STREAM_PREVIEW="${VOICE_STREAM_PREVIEW}" \
+    VOICE_QWEN_ASR_STREAMING="${VOICE_QWEN_ASR_STREAMING}" \
     VOICE_STREAM_SEND_INTERVAL_MS="${VOICE_STREAM_SEND_INTERVAL_MS}" \
     VOICE_MAX_RECORD_MS="${VOICE_MAX_RECORD_MS}" \
-    VOICE_PAUSE_SEGMENT_MS="${VOICE_PAUSE_SEGMENT_MS}" \
-    VOICE_MIN_SEGMENT_MS="${VOICE_MIN_SEGMENT_MS}" \
-    VOICE_AUTO_SEGMENT_RMS_THRESHOLD="${VOICE_AUTO_SEGMENT_RMS_THRESHOLD}" \
-    VOICE_AUTO_SEGMENT_NOISE_MARGIN="${VOICE_AUTO_SEGMENT_NOISE_MARGIN}" \
-    setsid "${stream_client}" >/dev/null 2>&1 &
+    setsid ${stream_python:+"${stream_python}"} "${stream_client}" >/dev/null 2>&1 &
 
   local recorder_pid=$!
+  log_ptt "ASR stream launched pid=${recorder_pid}"
   cat >"${STATE_FILE}" <<EOF
 RECORDER_PID=${recorder_pid}
 STREAM_PID=${recorder_pid}
@@ -732,6 +887,7 @@ STREAM_STOP_FILE=$(printf '%q' "${stream_stop_file}")
 RECORDER_NAME=stream
 STARTED_AT_MS=$(date +%s%3N)
 EOF
+  log_ptt "recording state written pid=${recorder_pid} state=${STATE_FILE}"
 
   if (( VOICE_MAX_RECORD_MS > 0 )); then
     local watchdog_sleep_s=$(((VOICE_MAX_RECORD_MS + 999) / 1000))
@@ -754,40 +910,7 @@ EOF
     printf 'WATCHDOG_PID=%s\n' "${watchdog_pid}" >>"${STATE_FILE}"
   fi
 
-  show_recording_status
-}
-
-record_stream_asr_event() {
-  local request_id=$1
-  local text=$2
-  local correction_mode=$3
-  [[ -n "${request_id}" && -n "${text}" ]] || return 0
-  [[ -n "${ASR_URL}" ]] || return 0
-  [[ -n "${ASR_AUTH_TOKEN}" ]] || return 0
-
-  local event_url
-  case "${ASR_URL}" in
-    */api/asr/transcriptions)
-      event_url="${ASR_URL%/api/asr/transcriptions}/api/asr/transcription-events"
-      ;;
-    *)
-      return 0
-      ;;
-  esac
-
-  run_whisper_curl \
-    -fsS \
-    --max-time "${ASR_TIMEOUT}" \
-    -X POST \
-    -H "Authorization: Bearer ${ASR_AUTH_TOKEN}" \
-    -H "Content-Type: application/json" \
-    --data "$(jq -n \
-      --arg requestId "${request_id}" \
-      --arg rawText "${text}" \
-      --arg insertedText "${text}" \
-      --arg correctionMode "${correction_mode:-off}" \
-      '{requestId:$requestId, rawText:$rawText, insertedText:$insertedText, correctedText:"", correctionMode:$correctionMode, correctionApplied:false}')" \
-    "${event_url}" >/dev/null 2>&1 || true
+  log_ptt "recording started pid=${recorder_pid}"
 }
 
 inject_text() {
@@ -849,6 +972,7 @@ inject_text() {
 
 stop_recording() {
   if [[ ! -f "${STATE_FILE}" ]]; then
+    close_recording_status
     exit 0
   fi
 
@@ -858,6 +982,7 @@ stop_recording() {
   # shellcheck disable=SC1090
   source "${STATE_FILE}"
   rm -f "${STATE_FILE}"
+  close_recording_status
 
   if [[ -n "${WATCHDOG_PID:-}" && "${WATCHDOG_PID}" != "$$" ]]; then
     kill "${WATCHDOG_PID}" >/dev/null 2>&1 || true
@@ -899,16 +1024,22 @@ stop_recording() {
 
   if (( duration_ms < VOICE_MIN_RECORD_MS )); then
     if [[ "${suppress_asr_status}" != "1" ]]; then
-      show_status "uconsole voice" "录音太短，已取消" "0" "800"
+      show_recording_popup_message_then_close "录音太短，已取消" 2
+    else
+      close_recording_status
     fi
     rm -f "${STREAM_RESULT_FILE:-}" "${STREAM_STOP_FILE:-}"
     exit 0
   fi
 
+  close_recording_status
+
   if [[ ! -s "${STREAM_RESULT_FILE:-}" ]]; then
     echo "ASR result is empty" >&2
     if [[ "${suppress_asr_status}" != "1" ]]; then
-      show_status "uconsole voice" "语音识别失败" "0" "1000"
+      show_recording_popup_message_then_close "语音识别失败" 2
+    else
+      close_recording_status
     fi
     rm -f "${STREAM_RESULT_FILE:-}" "${STREAM_STOP_FILE:-}"
     exit 1
@@ -920,9 +1051,6 @@ stop_recording() {
   }
 
   local context_text=
-  local correction_mode=${ASR_CORRECTION_MODE}
-  local before_pane_text=
-  before_pane_text=$(capture_tmux_pane_text_for_learn "$(current_tmux_target_json 2>/dev/null | jq -r '.paneId // empty' 2>/dev/null || true)" || true)
   context_text=$(build_whisper_context || true)
 
   local stream_status stream_error
@@ -930,21 +1058,22 @@ stop_recording() {
   stream_error=$(jq -r '.error // empty' "${STREAM_RESULT_FILE}")
   if [[ "${stream_status}" == "error" ]]; then
     if [[ "${suppress_asr_status}" != "1" ]]; then
-      show_status "uconsole voice" "${stream_error:-语音识别失败}" "0" "1200"
+      show_recording_popup_message_then_close "${stream_error:-语音识别失败}" 2
+    else
+      close_recording_status
     fi
     rm -f "${STREAM_RESULT_FILE:-}" "${STREAM_STOP_FILE:-}"
     exit 1
   fi
 
-  local text request_id raw_text corrected_text
+  local text
   text=$(jq -r '.text // empty' "${STREAM_RESULT_FILE}" | normalize_transcript)
-  request_id=$(jq -r '.requestId // empty' "${STREAM_RESULT_FILE}" | normalize_transcript)
-  raw_text=$(jq -r '.rawText // .text // empty' "${STREAM_RESULT_FILE}" | normalize_transcript)
-  corrected_text=$(jq -r '.correctedText // empty' "${STREAM_RESULT_FILE}" | normalize_transcript)
 
   if [[ -z "${text}" ]]; then
     if [[ "${suppress_asr_status}" != "1" ]]; then
-      show_status "uconsole voice" "未识别到文本" "0" "1000"
+      show_recording_popup_message_then_close "未识别到文本" 2
+    else
+      close_recording_status
     fi
     rm -f "${STREAM_RESULT_FILE:-}" "${STREAM_STOP_FILE:-}"
     exit 1
@@ -958,177 +1087,23 @@ stop_recording() {
     exit 1
   fi
 
-  local after_pane_text=
-  after_pane_text=$(capture_tmux_pane_text_for_learn "$(current_tmux_target_json 2>/dev/null | jq -r '.paneId // empty' 2>/dev/null || true)" || true)
-  if [[ -n "${request_id}" ]]; then
-    record_stream_asr_event "${request_id}" "${text}" "${correction_mode}"
-    save_last_asr_state "${request_id}" "${text}" "${raw_text}" "${corrected_text}" "${before_pane_text}" "${after_pane_text}"
-  else
-    log_ptt "skip save_last_asr_state: ASR response missing requestId insertedChars=${#text}"
-  fi
-
   if [[ "${suppress_asr_status}" != "1" ]]; then
     close_status
   fi
   rm -f "${STREAM_RESULT_FILE:-}" "${STREAM_STOP_FILE:-}"
 }
 
-open_asr_correction_editor() {
-  local initial_text=$1
-  local title=${2:-"修正语音输入"}
-
-  log_ptt "open ASR correction editor chars=${#initial_text}"
-
-  local custom_editor="${VOICE_LEARN_DIALOG_COMMAND:-${HOME}/.local/bin/uconsole-asr-correction-dialog}"
-  if [[ -x "${custom_editor}" ]]; then
-    QT_QPA_PLATFORM=${QT_QPA_PLATFORM:-wayland} "${custom_editor}" "${initial_text}" "${title}"
-    return $?
-  fi
-  if command -v uconsole-asr-correction-dialog >/dev/null 2>&1; then
-    QT_QPA_PLATFORM=${QT_QPA_PLATFORM:-wayland} uconsole-asr-correction-dialog "${initial_text}" "${title}"
-    return $?
-  fi
-
-  if command -v kdialog >/dev/null 2>&1; then
-    QT_QPA_PLATFORM=${QT_QPA_PLATFORM:-wayland} kdialog --title "${title}" --inputbox "修正上次语音识别文本" "${initial_text}"
-    return $?
-  fi
-
-  if command -v zenity >/dev/null 2>&1; then
-    zenity --entry \
-      --title="${title}" \
-      --text="修正上次语音识别文本，按回车确认" \
-      --entry-text="${initial_text}"
-    return $?
-  fi
-
-  echo "zenity or kdialog is required for ASR correction editor" >&2
-  return 127
-}
-
-compute_edit_ratio() {
-  python3 - "$1" "$2" <<'PYRATIO'
-import difflib, sys
-old = sys.argv[1].strip()
-new = sys.argv[2].strip()
-print(1.0 - difflib.SequenceMatcher(None, old, new).ratio())
-PYRATIO
-}
-
-replace_last_inserted_text() {
-  local old_text=$1
-  local new_text=$2
-  [[ "${VOICE_LEARN_REPLACE_INPUT}" == "1" ]] || return 0
-  [[ "${old_text}" != "${new_text}" ]] || return 0
-  command -v wtype >/dev/null 2>&1 || return 1
-
-  local count=${#old_text}
-  if (( count < 1 || count > VOICE_LEARN_REPLACE_MAX_CHARS )); then
-    log_ptt "skip replace_last_inserted_text: old text length out of range chars=${count}"
-    return 1
-  fi
-
-  suspend_ime_for_injection
-  local i
-  for ((i = 0; i < count; i++)); do
-    wtype -k BackSpace
-  done
-  wtype "${new_text}"
-  restore_ime_after_injection
-}
-
-learn_last_asr() {
-  if [[ -f "${STATE_FILE}" ]]; then
-    cancel_recording "已取消短按录音" || true
-  fi
-  command -v jq >/dev/null 2>&1 || { echo "jq is required" >&2; exit 1; }
-  command -v curl >/dev/null 2>&1 || { echo "curl is required" >&2; exit 1; }
-  if [[ -z "${ASR_AUTH_TOKEN}" ]]; then
-    show_status "uconsole voice" "未配置 ASR Token" "0" "1200"
-    exit 1
-  fi
-  if [[ ! -s "${LAST_ASR_STATE_FILE}" ]]; then
-    show_status "uconsole voice" "没有可学习的语音输入" "0" "1000"
-    exit 1
-  fi
-
-  local request_id inserted_text created_at now age final_text finalize_url edit_ratio
-  request_id=$(jq -r '.requestId // empty' "${LAST_ASR_STATE_FILE}")
-  inserted_text=$(jq -r '.insertedText // empty' "${LAST_ASR_STATE_FILE}")
-  created_at=$(jq -r '.createdAt // 0' "${LAST_ASR_STATE_FILE}")
-  now=$(date +%s)
-  age=$((now - created_at))
-
-  if [[ -z "${request_id}" || -z "${inserted_text}" ]]; then
-    show_status "uconsole voice" "语音输入状态不完整，未学习" "0" "1000"
-    exit 1
-  fi
-  if (( age < 0 || age > VOICE_LEARN_MAX_AGE_SECONDS )); then
-    show_status "uconsole voice" "语音输入已过期，未学习" "0" "1000"
-    exit 1
-  fi
-
-  log_ptt "learn_last_asr: requestId=${request_id} insertedChars=${#inserted_text}"
-  final_text=$(open_asr_correction_editor "${inserted_text}" || true)
-  final_text=$(printf '%s' "${final_text}" | normalize_transcript)
-  if [[ -z "${final_text}" ]]; then
-    show_status "uconsole voice" "已取消学习" "0" "900"
-    exit 0
-  fi
-  if [[ "${final_text}" == "${inserted_text}" ]]; then
-    show_status "uconsole voice" "文本未修改，未学习" "0" "900"
-    exit 0
-  fi
-
-  edit_ratio=$(compute_edit_ratio "${inserted_text}" "${final_text}")
-  if ! python3 - "${edit_ratio}" "${VOICE_LEARN_MAX_EDIT_RATIO}" <<'PYCHECK'
-import sys
-ratio = float(sys.argv[1])
-limit = float(sys.argv[2])
-raise SystemExit(0 if ratio <= limit else 1)
-PYCHECK
-  then
-    log_ptt "skip learn_last_asr: edit ratio too large ratio=${edit_ratio} limit=${VOICE_LEARN_MAX_EDIT_RATIO}"
-    show_status "uconsole voice" "差异过大，未学习" "0" "1200"
-    exit 1
-  fi
-
-  finalize_url=$(derive_asr_finalize_url "${request_id}" || true)
-  if [[ -z "${finalize_url}" ]]; then
-    show_status "uconsole voice" "无法生成学习接口" "0" "1200"
-    exit 1
-  fi
-  run_whisper_curl \
-    -fsS \
-    --max-time "${ASR_TIMEOUT}" \
-    -X POST \
-    -H "Authorization: Bearer ${ASR_AUTH_TOKEN}" \
-    -H "Content-Type: application/json" \
-    --data "$(jq -n --arg finalText "${final_text}" '{finalText: $finalText}')" \
-    "${finalize_url}" >/dev/null
-
-  if ! replace_last_inserted_text "${inserted_text}" "${final_text}"; then
-    show_status "uconsole voice" "已学习，未改写输入框" "80" "1200"
-    exit 0
-  fi
-
-  jq --arg finalText "${final_text}" --argjson finalizedAt "$(date +%s)" \
-    '.finalText=$finalText | .finalizedAt=$finalizedAt' \
-    "${LAST_ASR_STATE_FILE}" >"${LAST_ASR_STATE_FILE}.tmp" \
-    && mv "${LAST_ASR_STATE_FILE}.tmp" "${LAST_ASR_STATE_FILE}"
-  log_ptt "learned ASR correction requestId=${request_id} oldChars=${#inserted_text} finalChars=${#final_text} editRatio=${edit_ratio}"
-  show_status "uconsole voice" "已学习并改写输入" "100" "900"
-}
-
 cancel_recording() {
   local message=${1:-"已取消"}
   if [[ ! -f "${STATE_FILE}" ]]; then
+    close_recording_status
     exit 0
   fi
 
   # shellcheck disable=SC1090
   source "${STATE_FILE}"
   rm -f "${STATE_FILE}"
+  close_recording_status
 
   if [[ -n "${STREAM_STOP_FILE:-}" ]]; then
     : >"${STREAM_STOP_FILE}" || true
@@ -1154,6 +1129,7 @@ if [[ "${ACTION}" == "-h" || "${ACTION}" == "--help" || -z "${ACTION}" ]]; then
   usage
   exit 0
 fi
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 CONFIG_FILE=${VOICE_PTT_CONFIG:-"${HOME}/.config/uconsole-helper-mapper/voice.env"}
 if [[ -f "${CONFIG_FILE}" ]]; then
@@ -1180,11 +1156,8 @@ VOICE_PASTE_DELAY=${VOICE_PASTE_DELAY:-0.08}
 VOICE_FCITX_COMMIT_FILE=${VOICE_FCITX_COMMIT_FILE:-"${VOICE_STATE_DIR}/fcitx-voice-commit.txt"}
 VOICE_FCITX_COMMIT_TRIGGER=${VOICE_FCITX_COMMIT_TRIGGER:-";uv"}
 VOICE_KEEP_AUDIO=${VOICE_KEEP_AUDIO:-0}
-VOICE_PAUSE_SEGMENT_MS=${VOICE_PAUSE_SEGMENT_MS:-1600}
-VOICE_MIN_SEGMENT_MS=${VOICE_MIN_SEGMENT_MS:-1000}
-VOICE_AUTO_SEGMENT_RMS_THRESHOLD=${VOICE_AUTO_SEGMENT_RMS_THRESHOLD:-0.006}
-VOICE_AUTO_SEGMENT_NOISE_MARGIN=${VOICE_AUTO_SEGMENT_NOISE_MARGIN:-0.004}
 VOICE_NOTIFY_ID=${VOICE_NOTIFY_ID:-991199}
+VOICE_RECORDING_NOTIFY_ID=${VOICE_RECORDING_NOTIFY_ID:-991200}
 VOICE_NOTIFY_USE_MARKUP=${VOICE_NOTIFY_USE_MARKUP:-0}
 VOICE_NOTIFY_FONT_SIZE=${VOICE_NOTIFY_FONT_SIZE:-22}
 VOICE_NOTIFY_PADDING_LINES=${VOICE_NOTIFY_PADDING_LINES:-1}
@@ -1200,25 +1173,24 @@ ASR_PROMPT=${ASR_PROMPT:-}
 ASR_PROMPT_FIELD=${ASR_PROMPT_FIELD:-prompt}
 ASR_PROMPT_GLOSSARY_FIELD=${ASR_PROMPT_GLOSSARY_FIELD:-promptGlossary}
 ASR_CONTEXT_FIELD=${ASR_CONTEXT_FIELD:-contextText}
-ASR_FINALIZE_URL=${ASR_FINALIZE_URL:-}
 ASR_CORRECTION_MODE=${ASR_CORRECTION_MODE:-}
 if [[ -z "${ASR_CORRECTION_MODE}" ]]; then
   ASR_CORRECTION_MODE=auto
 fi
 ASR_NO_PROXY=${ASR_NO_PROXY:-1}
 ASR_TIMEOUT=${ASR_TIMEOUT:-60}
+ASR_REQUEST_ATTEMPT_TIMEOUT=${ASR_REQUEST_ATTEMPT_TIMEOUT:-8}
+ASR_CONNECT_TIMEOUT=${ASR_CONNECT_TIMEOUT:-2}
+ASR_RETRY_COUNT=${ASR_RETRY_COUNT:-3}
+ASR_RETRY_DELAY=${ASR_RETRY_DELAY:-0.35}
+ASR_PREVIEW_WS_URL=${ASR_PREVIEW_WS_URL:-}
+ASR_FINALIZE_TEXT_URL=${ASR_FINALIZE_TEXT_URL:-}
+ASR_PREVIEW_FINAL_WAIT_SECONDS=${ASR_PREVIEW_FINAL_WAIT_SECONDS:-2.5}
+ASR_PREVIEW_WS_TIMEOUT=${ASR_PREVIEW_WS_TIMEOUT:-2}
 VOICE_STREAM_PREVIEW=${VOICE_STREAM_PREVIEW:-1}
+VOICE_QWEN_ASR_STREAMING=${VOICE_QWEN_ASR_STREAMING:-1}
 VOICE_NOTIFY_WHILE_PREVIEW=${VOICE_NOTIFY_WHILE_PREVIEW:-0}
-VOICE_STREAM_SEND_INTERVAL_MS=${VOICE_STREAM_SEND_INTERVAL_MS:-250}
-VOICE_LEARN_MAX_AGE_SECONDS=${VOICE_LEARN_MAX_AGE_SECONDS:-600}
-VOICE_LEARN_MAX_EDIT_RATIO=${VOICE_LEARN_MAX_EDIT_RATIO:-0.38}
-VOICE_LEARN_CAPTURE_LINES=${VOICE_LEARN_CAPTURE_LINES:-120}
-VOICE_LEARN_REPLACE_INPUT=${VOICE_LEARN_REPLACE_INPUT:-1}
-VOICE_LEARN_REPLACE_MAX_CHARS=${VOICE_LEARN_REPLACE_MAX_CHARS:-300}
-VOICE_LEARN_DIALOG_FONT_SIZE=${VOICE_LEARN_DIALOG_FONT_SIZE:-22}
-VOICE_LEARN_DIALOG_WIDTH=${VOICE_LEARN_DIALOG_WIDTH:-820}
-VOICE_LEARN_DIALOG_HEIGHT=${VOICE_LEARN_DIALOG_HEIGHT:-220}
-LAST_ASR_STATE_FILE=${LAST_ASR_STATE_FILE:-"${VOICE_STATE_DIR}/voice-last-asr.json"}
+VOICE_STREAM_SEND_INTERVAL_MS=${VOICE_STREAM_SEND_INTERVAL_MS:-100}
 
 case "${ACTION}" in
   start)
@@ -1229,9 +1201,6 @@ case "${ACTION}" in
     ;;
   cancel)
     cancel_recording
-    ;;
-  learn)
-    learn_last_asr
     ;;
   *)
     echo "unknown action: ${ACTION}" >&2

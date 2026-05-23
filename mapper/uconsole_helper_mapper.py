@@ -25,11 +25,19 @@ LOGGER = logging.getLogger("uconsole-helper-mapper")
 DEFAULT_CONFIG_PATH = Path("~/.config/uconsole-helper-mapper/config.toml").expanduser()
 DEFAULT_BACKLIGHT_POWER = Path("/sys/class/backlight/backlight@0/bl_power")
 DEFAULT_KEYBOARD_STATE_SCRIPT = Path("~/WorkSpace/uconsole-keyboard/tools/keyboard_state.sh").expanduser()
+LOCK_POPUP_HELPER = Path("~/.local/bin/uconsole-asr-popup").expanduser()
+LOCK_POPUP_TEXT = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "uconsole-helper-lock-popup.txt"
+LOCK_UNLOCK_KEY = ecodes.BTN_NORTH
+LOCK_UNLOCK_HOLD_SECONDS = 1.0
+LOCK_SCREEN_TIMEOUT_SECONDS = 5.0
+LOCK_UI_POLL_SECONDS = 0.15
 IGNORED_DEVICE_SUBSTRINGS = (
     "uconsole-virtual-mouse",
     "uconsole-virtual-keyboard",
     "input-remapper",
 )
+LISTENER_RETRY_SECONDS = 10.0
+LISTENER_LOG_SECONDS = 60.0
 
 
 def expand_path(value: str) -> str:
@@ -121,6 +129,7 @@ class KeyboardBacklightController:
     def __init__(self, script: str | None) -> None:
         self.script = script
         self.saved_level: int | None = None
+        self.current_level: int | None = None
         self.task: asyncio.Task[None] | None = None
 
     def lock(self) -> None:
@@ -153,11 +162,9 @@ class KeyboardBacklightController:
             self._set_level(0)
 
     def _unlock_sync(self) -> None:
-        if self.saved_level is None:
-            return
-        level = self.saved_level
+        if self.saved_level is not None:
+            self._set_level(self.saved_level)
         self.saved_level = None
-        self._set_level(level)
 
     def _read_level(self) -> int | None:
         if not self.script:
@@ -180,10 +187,13 @@ class KeyboardBacklightController:
         if not match:
             LOGGER.warning("keyboard backlight read returned unexpected output: %s", result.stdout.strip())
             return None
-        return int(match.group(1))
+        self.current_level = int(match.group(1))
+        return self.current_level
 
     def _set_level(self, level: int) -> None:
         if not self.script:
+            return
+        if self.current_level == level:
             return
         try:
             result = subprocess.run(
@@ -198,6 +208,8 @@ class KeyboardBacklightController:
             return
         if result.returncode != 0:
             LOGGER.warning("keyboard backlight set %s failed: %s", level, result.stderr.strip())
+            return
+        self.current_level = level
 
 
 class LockController:
@@ -213,7 +225,12 @@ class LockController:
         self.keyboard_backlight = keyboard_backlight
         self.virtual_keys = virtual_keys
         self.locked = False
+        self.lock_reason = ""
+        self.lock_activity_at = time.monotonic()
+        self.manual_unlock_pending_until = 0.0
         self.listeners: list[Any] = []
+        self.listener_retry_after: dict[int, float] = {}
+        self.listener_log_after: dict[int, float] = {}
 
     def add_listener(self, listener: Any) -> None:
         self.listeners.append(listener)
@@ -227,27 +244,35 @@ class LockController:
     def handle_lock_key(self, value: int) -> bool:
         if value != 1:
             return True
-
-        self.toggle_locked(reason="lock key")
+        if self.locked:
+            self.force_unlock(reason="lock key wake")
+        else:
+            self.run_lock_command()
         return True
 
     def toggle_locked(self, *, reason: str) -> bool:
         return self.set_locked(not self.locked, run_command=True, reason=reason)
 
     def force_unlock(self, *, reason: str) -> bool:
+        if "wake" in reason or "lock key" in reason or "power button" in reason:
+            self.manual_unlock_pending_until = time.monotonic() + 3.0
         if not self.locked:
             LOGGER.info("keyboard lock already disabled; force unlock actions (%s)", reason)
             self.run_unlock_command()
-            self.keyboard_backlight.unlock()
             self._notify_listeners()
             return False
         return self.set_locked(False, run_command=True, reason=reason)
+
+    def note_lock_activity(self) -> None:
+        self.lock_activity_at = time.monotonic()
 
     def set_locked(self, locked: bool, *, run_command: bool, reason: str) -> bool:
         if self.locked == locked:
             return False
 
         self.locked = locked
+        self.lock_reason = reason if locked else ""
+        self.note_lock_activity()
         LOGGER.info(
             "keyboard lock %s%s",
             "enabled" if self.locked else "disabled",
@@ -258,26 +283,54 @@ class LockController:
         if self.locked:
             if run_command:
                 self.run_lock_command()
-            self.keyboard_backlight.lock()
         else:
             if run_command:
                 self.run_unlock_command()
-            self.keyboard_backlight.unlock()
         return True
 
     def _notify_listeners(self) -> None:
+        now = time.monotonic()
         for listener in list(self.listeners):
+            key = id(listener)
+            if now < self.listener_retry_after.get(key, 0.0):
+                continue
             try:
                 listener()
+                self.listener_retry_after.pop(key, None)
+                self.listener_log_after.pop(key, None)
             except OSError as exc:
-                LOGGER.warning("lock listener failed: %s", exc)
+                self.listener_retry_after[key] = now + LISTENER_RETRY_SECONDS
+                if now >= self.listener_log_after.get(key, 0.0):
+                    LOGGER.warning("lock listener failed; retrying in %.0fs: %s", LISTENER_RETRY_SECONDS, exc)
+                    self.listener_log_after[key] = now + LISTENER_LOG_SECONDS
 
     def run_lock_command(self) -> None:
         self._run_lock_state_command(self.config.lock_command)
 
+    def request_lock_screen(self, *, reason: str) -> None:
+        self.lock_reason = reason
+        self.note_lock_activity()
+        self.run_lock_command()
+
     def run_unlock_command(self) -> None:
         self._run_lock_state_command(self.config.unlock_command)
         self.emit_wakeup()
+
+    def wake_screen(self) -> None:
+        self.note_lock_activity()
+        self.run_unlock_command()
+
+    def update_lock_progress(self, fraction: float) -> None:
+        for listener in list(self.listeners):
+            callback = getattr(listener, "update_lock_progress", None)
+            if callback is None:
+                callback = getattr(getattr(listener, "__self__", None), "update_lock_progress", None)
+            if callback is None:
+                continue
+            try:
+                callback(fraction)
+            except OSError:
+                pass
 
     def emit_wakeup(self) -> None:
         if self.virtual_keys is None:
@@ -367,9 +420,9 @@ def load_config(path: Path) -> Config:
         keyboard_enabled=bool(keyboard.get("enabled", False)),
         keyboard_grab=bool(keyboard.get("grab", True)),
         keyboard_patterns=list(keyboard.get("device_name_patterns", ["ClockworkPI uConsole Keyboard"])),
-        keyboard_debounce_ms=int(keyboard.get("debounce_ms", 250)),
-        keyboard_repeat_rate=int(keyboard.get("repeat_rate", 30)),
-        keyboard_repeat_delay_ms=int(keyboard.get("repeat_delay_ms", 300)),
+        keyboard_debounce_ms=int(keyboard.get("debounce_ms", 50)),
+        keyboard_repeat_rate=int(keyboard.get("repeat_rate", 20)),
+        keyboard_repeat_delay_ms=int(keyboard.get("repeat_delay_ms", 600)),
         keyboard_bindings=keyboard_bindings,
         lock_enabled=bool(lock.get("enabled", False)),
         lock_key=code_from_name(lock.get("key", "KEY_COFFEE")),
@@ -559,6 +612,8 @@ class GamepadWatcher:
         self.release_trigger_bindings: set[int] = set()
         self.repeat_tasks: dict[int, asyncio.Task[None]] = {}
         self.grabbed_for_lock = False
+        self.unlock_hold_task: asyncio.Task[None] | None = None
+        self.suppress_unlock_key_until_release = False
         self.lock_controller.add_listener(self._sync_lock_grab)
 
     async def run(self) -> None:
@@ -572,7 +627,10 @@ class GamepadWatcher:
                     continue
                 if event.type != ecodes.EV_KEY:
                     continue
+                if self._suppress_unlock_release(event.code, event.value):
+                    continue
                 if self.lock_controller.locked:
+                    self._handle_locked_key(event.code, event.value)
                     continue
                 self._handle_key(event.code, event.value)
         except OSError as exc:
@@ -587,6 +645,8 @@ class GamepadWatcher:
                 task.cancel()
             for task in self.repeat_tasks.values():
                 task.cancel()
+            if self.unlock_hold_task is not None:
+                self.unlock_hold_task.cancel()
             self.device.close()
 
     def _sync_lock_grab(self) -> None:
@@ -613,6 +673,55 @@ class GamepadWatcher:
         for task in self.repeat_tasks.values():
             task.cancel()
         self.repeat_tasks.clear()
+        if self.unlock_hold_task is not None:
+            self.unlock_hold_task.cancel()
+            self.unlock_hold_task = None
+        self.suppress_unlock_key_until_release = False
+
+    def _suppress_unlock_release(self, code: int, value: int) -> bool:
+        if not self.suppress_unlock_key_until_release or code != LOCK_UNLOCK_KEY:
+            return False
+        if value == 0:
+            self.suppress_unlock_key_until_release = False
+        return True
+
+    def _handle_locked_key(self, code: int, value: int) -> None:
+        if value == 1:
+            self.lock_controller.wake_screen()
+        if code != LOCK_UNLOCK_KEY:
+            return
+        if value == 1:
+            self.lock_controller.note_lock_activity()
+            self.lock_controller.update_lock_progress(0.0)
+            if self.unlock_hold_task is not None:
+                self.unlock_hold_task.cancel()
+            self.unlock_hold_task = asyncio.create_task(self._unlock_after_hold())
+            return
+        if value == 2:
+            self.lock_controller.note_lock_activity()
+            return
+        if value == 0:
+            self.lock_controller.note_lock_activity()
+            if self.unlock_hold_task is not None:
+                self.unlock_hold_task.cancel()
+                self.unlock_hold_task = None
+            self.lock_controller.update_lock_progress(0.0)
+
+    async def _unlock_after_hold(self) -> None:
+        started = time.monotonic()
+        try:
+            while True:
+                elapsed = time.monotonic() - started
+                progress = min(1.0, elapsed / LOCK_UNLOCK_HOLD_SECONDS)
+                self.lock_controller.update_lock_progress(progress)
+                if progress >= 1.0:
+                    break
+                await asyncio.sleep(0.1)
+        except asyncio.CancelledError:
+            return
+        self.unlock_hold_task = None
+        self.suppress_unlock_key_until_release = True
+        self.lock_controller.force_unlock(reason="gamebutton Y hold")
 
     async def _fire_hold(self, index: int, binding: Binding) -> None:
         try:
@@ -624,7 +733,9 @@ class GamepadWatcher:
         if not binding.buttons.issubset(self.pressed):
             return
         self.hold_fired_buttons.add(binding.buttons)
-        if binding.press_command is None and binding.release_command is None:
+        if binding.press_command is not None or binding.release_command is not None:
+            self.runner.run_phase(binding, "press", self.config.gamepad_debounce_ms)
+        else:
             self._trigger_binding(binding)
 
     def _trigger_binding(self, binding: Binding) -> None:
@@ -659,12 +770,15 @@ class GamepadWatcher:
         for index, binding in enumerate(self.config.gamepad_bindings):
             matched = binding.buttons.issubset(self.pressed)
             was_active = index in self.active_bindings
+            if matched and was_active:
+                continue
             if matched and not was_active:
                 self.active_bindings.add(index)
                 if binding.press_command is not None or binding.release_command is not None:
-                    self.runner.run_phase(binding, "press", self.config.gamepad_debounce_ms)
                     if binding.hold_ms > 0:
                         self.hold_tasks[index] = asyncio.create_task(self._fire_hold(index, binding))
+                    else:
+                        self.runner.run_phase(binding, "press", self.config.gamepad_debounce_ms)
                 elif binding.hold_ms > 0:
                     self.hold_tasks[index] = asyncio.create_task(self._fire_hold(index, binding))
                 elif self._has_hold_variant(index, binding):
@@ -823,11 +937,11 @@ class PowerButtonWatcher:
 
         if not self.hold_fired:
             if self.unlock_on_release or (self.screen_off_reader is not None and self.screen_off_reader() is True):
-                LOGGER.info("power button short press: screen is off; unlock display")
-                self.lock_controller.force_unlock(reason="power button short press while screen off")
+                LOGGER.info("power button short press: screen is off; wake display and unlock keyboard")
+                self.lock_controller.force_unlock(reason="power button wake")
             else:
-                LOGGER.info("power button short press: toggle display lock")
-                self.lock_controller.toggle_locked(reason="power button short press")
+                LOGGER.info("power button short press: display off")
+                self.lock_controller.request_lock_screen(reason="power button short press")
         self.down_at = None
         self.unlock_on_release = False
 
@@ -1055,6 +1169,8 @@ class KeyboardWatcher:
             return
 
         if self.lock_controller.locked:
+            if value == 1:
+                self.lock_controller.wake_screen()
             return
 
         if not self.grab_active:
@@ -1114,6 +1230,8 @@ class KeyboardWatcher:
             return
 
         if self.lock_controller.locked:
+            if value == 1:
+                self.lock_controller.wake_screen()
             return
 
         is_pressed = value != 0
@@ -1299,6 +1417,11 @@ class MapperDaemon:
         self.session_watch_pending: dict[str, tuple[frozenset[int], float]] = {}
         self.backlight_power_path = DEFAULT_BACKLIGHT_POWER
         self.last_backlight_off: bool | None = None
+        self.lock_popup_process: subprocess.Popen[Any] | None = None
+        self.lock_screen_off_sent = False
+        self.lock_progress = 0.0
+        self.lock_progress_visible = False
+        self.lock_controller.add_listener(self._sync_lock_popup)
 
     async def shutdown(self) -> None:
         for entry in list(self.tasks.values()):
@@ -1310,10 +1433,12 @@ class MapperDaemon:
             self.virtual_mouse.close()
         if self.virtual_power_button is not None:
             self.virtual_power_button.close()
+        self._close_lock_popup()
         self.keyboard_backlight.cancel()
 
     async def run(self) -> None:
         backlight_task = asyncio.create_task(self._monitor_backlight_lock_state())
+        lock_ui_task = asyncio.create_task(self._monitor_lock_ui())
         try:
             while True:
                 self._prune_tasks()
@@ -1323,12 +1448,87 @@ class MapperDaemon:
                 await asyncio.sleep(self.config.rescan_seconds)
         finally:
             backlight_task.cancel()
-            await asyncio.gather(backlight_task, return_exceptions=True)
+            lock_ui_task.cancel()
+            await asyncio.gather(backlight_task, lock_ui_task, return_exceptions=True)
+
+    async def _monitor_lock_ui(self) -> None:
+        while True:
+            self._sync_lock_popup()
+            self._check_lock_screen_timeout()
+            await asyncio.sleep(0.5)
+
+    def _sync_lock_popup(self) -> None:
+        if self.lock_controller.locked and self.last_backlight_off is not True and not self.lock_screen_off_sent:
+            self._show_lock_popup()
+            return
+        self._close_lock_popup()
+
+    def _show_lock_popup(self) -> None:
+        if not LOCK_POPUP_HELPER.exists():
+            return
+        if self.lock_popup_process is not None and self.lock_popup_process.poll() is None:
+            return
+        try:
+            self.lock_progress = 0.0
+            self.lock_progress_visible = False
+            self._write_lock_popup_text()
+            self.lock_popup_process = subprocess.Popen(
+                [str(LOCK_POPUP_HELPER), str(LOCK_POPUP_TEXT)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            LOGGER.debug("lock popup failed: %s", exc)
+
+    def _write_lock_popup_text(self) -> None:
+        text = "# Locked\nhold Y to unlock\n"
+        if self.lock_progress_visible:
+            text += f"@progress={self.lock_progress:.3f}\n"
+        tmp_path = LOCK_POPUP_TEXT.with_suffix(f"{LOCK_POPUP_TEXT.suffix}.{os.getpid()}.tmp")
+        tmp_path.write_text(text, encoding="utf-8")
+        tmp_path.replace(LOCK_POPUP_TEXT)
+
+    def update_lock_progress(self, fraction: float) -> None:
+        self.lock_progress = max(0.0, min(1.0, fraction))
+        self.lock_progress_visible = self.lock_progress > 0.0
+        if self.lock_controller.locked and not self.lock_screen_off_sent:
+            try:
+                self._write_lock_popup_text()
+            except OSError as exc:
+                LOGGER.debug("lock popup progress update failed: %s", exc)
+
+    def _close_lock_popup(self) -> None:
+        process = self.lock_popup_process
+        self.lock_popup_process = None
+        if process is not None and process.poll() is None:
+            process.terminate()
+        try:
+            LOCK_POPUP_TEXT.unlink()
+        except OSError:
+            pass
+
+    def _check_lock_screen_timeout(self) -> None:
+        if not self.lock_controller.locked:
+            self.lock_screen_off_sent = False
+            self.lock_progress = 0.0
+            self.lock_progress_visible = False
+            return
+        if self.last_backlight_off is not False:
+            return
+        if self.lock_screen_off_sent:
+            return
+        if time.monotonic() - self.lock_controller.lock_activity_at < LOCK_SCREEN_TIMEOUT_SECONDS:
+            return
+        LOGGER.info("locked screen idle timeout: display off")
+        self.lock_controller.run_lock_command()
+        self.lock_screen_off_sent = True
 
     async def _monitor_backlight_lock_state(self) -> None:
         while True:
             self._check_backlight_lock_state()
-            await asyncio.sleep(self.config.rescan_seconds)
+            await asyncio.sleep(LOCK_UI_POLL_SECONDS)
 
     def _check_backlight_lock_state(self) -> None:
         if not self.config.lock_enabled:
@@ -1342,6 +1542,9 @@ class MapperDaemon:
         self.last_backlight_off = screen_off
 
         if screen_off:
+            self.lock_screen_off_sent = True
+            if previous is not True:
+                self.keyboard_backlight.lock()
             self.lock_controller.set_locked(
                 True,
                 run_command=False,
@@ -1349,7 +1552,21 @@ class MapperDaemon:
             )
             return
 
+        if previous is True and screen_off is False:
+            self.keyboard_backlight.unlock()
+
         if previous is not None and self.lock_controller.locked:
+            self.lock_screen_off_sent = False
+            if previous is True and screen_off is False:
+                if time.monotonic() <= self.lock_controller.manual_unlock_pending_until:
+                    self.lock_controller.manual_unlock_pending_until = 0.0
+                    self.lock_controller.force_unlock(reason="manual wake")
+                    return
+                self.lock_controller.note_lock_activity()
+                self.lock_progress = 0.0
+                self.lock_progress_visible = False
+                self._write_lock_popup_text()
+                self._sync_lock_popup()
             LOGGER.debug("screen is on while mapper lock remains active")
 
     def _read_backlight_off(self) -> bool | None:

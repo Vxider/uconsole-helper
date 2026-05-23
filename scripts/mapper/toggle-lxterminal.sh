@@ -14,6 +14,8 @@ WATCH_TOKEN_FILE="${STATE_DIR}/quickterm-focus-watch.token"
 INVOKE_GUARD_FILE="/tmp/quickterm-toggle-${UID}.last"
 MIN_TOGGLE_INTERVAL_MS="${MIN_TOGGLE_INTERVAL_MS:-900}"
 AUTO_HIDE_ON_FOCUS_LOSS="${AUTO_HIDE_ON_FOCUS_LOSS:-yes}"
+AUTO_HIDE_FOCUS_WHITELIST="${AUTO_HIDE_FOCUS_WHITELIST:-title:uconsole voice}"
+IFS=',' read -r -a FOCUS_LOSS_WHITELIST_SPECS <<<"$AUTO_HIDE_FOCUS_WHITELIST"
 WINDOW_SPECS=(
   "app_id:lxterminal"
   "app_id:${APP_CLASS}"
@@ -67,6 +69,19 @@ window_is_active() {
   return 1
 }
 
+whitelisted_window_is_active() {
+  local spec
+
+  for spec in "${FOCUS_LOSS_WHITELIST_SPECS[@]}"; do
+    [[ -n "$spec" ]] || continue
+    if window_is_active "$spec"; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
 minimize_window() {
   local spec="${1}"
 
@@ -90,6 +105,8 @@ watch_focus_loss() {
     if spec="$(find_window_spec)"; then
       if window_is_active "$spec"; then
         seen_active=1
+      elif whitelisted_window_is_active; then
+        :
       elif [[ "$seen_active" -eq 1 ]]; then
         minimize_window "$spec"
         exit 0

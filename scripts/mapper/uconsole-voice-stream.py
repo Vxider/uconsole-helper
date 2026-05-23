@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import audioop
+import base64
+import hashlib
 import json
 import os
+import shlex
 import signal
+import socket
+import ssl
+import struct
 import subprocess
-import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import wave
 from pathlib import Path
@@ -22,6 +27,13 @@ def env_int(name: str, fallback: int) -> int:
         return fallback
     return value if value > 0 else fallback
 
+
+
+def env_bool(name: str, fallback: bool = False) -> bool:
+    value = str(os.environ.get(name, "")).strip().lower()
+    if not value:
+        return fallback
+    return value in {"1", "yes", "true", "on", "enabled"}
 
 def env_float(name: str, fallback: float) -> float:
     try:
@@ -91,6 +103,29 @@ def resolve_transcription_url() -> str:
     raise RuntimeError("ASR_URL is required for final ASR transcription")
 
 
+def resolve_finalize_text_url() -> str:
+    explicit = str(os.environ.get("ASR_FINALIZE_TEXT_URL", "")).strip()
+    if explicit:
+        return explicit
+    transcription_url = resolve_transcription_url()
+    parsed = urllib.parse.urlparse(transcription_url)
+    if parsed.path.rstrip("/").endswith("/api/asr/transcriptions"):
+        path = parsed.path.rstrip("/") + "/finalize-text"
+    else:
+        path = "/api/asr/transcriptions/finalize-text"
+    return urllib.parse.urlunparse(parsed._replace(path=path, params="", query="", fragment=""))
+
+
+def resolve_asr_preview_ws_url() -> str:
+    explicit = str(os.environ.get("ASR_PREVIEW_WS_URL", "")).strip()
+    if explicit:
+        return explicit
+    transcription_url = resolve_transcription_url()
+    parsed = urllib.parse.urlparse(transcription_url)
+    scheme = "wss" if parsed.scheme == "https" else "ws"
+    return urllib.parse.urlunparse(parsed._replace(scheme=scheme, path="/api/asr-preview/ws", params="", query="", fragment=""))
+
+
 def append_log(message: str) -> None:
     log_file = Path(os.environ.get("VOICE_STREAM_LOG_FILE", ""))
     if not log_file:
@@ -103,11 +138,18 @@ def append_log(message: str) -> None:
         pass
 
 
-def notify_text(value: str, *, progress: int = 50) -> None:
+def notify_text(value: str, *, progress: int = 50, notify_id: str | None = None) -> None:
     text = normalize_text(value)
     if not text:
         return
-    notify_id = os.environ.get("VOICE_NOTIFY_ID", "991199")
+    popup_text_file = os.environ.get("VOICE_RECORDING_POPUP_TEXT_FILE", "").strip()
+    if popup_text_file:
+        try:
+            Path(popup_text_file).write_text(f"# {text}\n", encoding="utf-8")
+            return
+        except Exception as exc:
+            append_log(f"recording popup update failed: {type(exc).__name__}: {exc}")
+    notify_id = notify_id or os.environ.get("VOICE_NOTIFY_ID", "991199")
     if shutil_which("dunstify"):
         subprocess.run(
             [
@@ -137,7 +179,6 @@ def notify_text(value: str, *, progress: int = 50) -> None:
             stderr=subprocess.DEVNULL,
             check=False,
         )
-
 
 def build_multipart_form(fields: dict[str, str], file_field: str, file_path: Path, content_type: str) -> tuple[bytes, str]:
     boundary = f"----uconsoleVoiceAsr{int(time.time() * 1000)}{os.getpid()}"
@@ -190,6 +231,225 @@ def shutil_which(name: str) -> str | None:
     return None
 
 
+class QwenAsrStreamingPreview:
+    def __init__(self, *, sample_rate: int, channels: int) -> None:
+        self.enabled = env_bool("VOICE_QWEN_ASR_STREAMING", True)
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.timeout = max(0.2, env_float("ASR_PREVIEW_WS_TIMEOUT", 2.0))
+        self.final_wait_seconds = max(0.1, env_float("ASR_PREVIEW_FINAL_WAIT_SECONDS", 2.5))
+        self.sock: socket.socket | ssl.SSLSocket | None = None
+        self.connected = False
+        self.last_text = ""
+        self.final_text = ""
+        self.done = False
+        if not self.enabled:
+            return
+        if self.channels != 1:
+            append_log("qwen ASR streaming disabled: VOICE_CHANNELS must be 1")
+            self.enabled = False
+            return
+        try:
+            self.connect(resolve_asr_preview_ws_url())
+            self.send_json({"type": "start", "sampleRate": self.sample_rate, "channels": self.channels, "format": "s16le"})
+            append_log("qwen ASR streaming preview connected")
+        except Exception as exc:
+            append_log(f"qwen ASR streaming preview unavailable: {type(exc).__name__}: {exc}")
+            self.close()
+            self.enabled = False
+
+    def connect(self, url: str) -> None:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in {"ws", "wss"}:
+            raise RuntimeError(f"unsupported ASR preview websocket scheme: {parsed.scheme}")
+        if not parsed.hostname:
+            raise RuntimeError("ASR preview websocket host is required")
+        port = parsed.port or (443 if parsed.scheme == "wss" else 80)
+        raw_sock = socket.create_connection((parsed.hostname, port), timeout=self.timeout)
+        if parsed.scheme == "wss":
+            sock: socket.socket | ssl.SSLSocket = ssl.create_default_context().wrap_socket(raw_sock, server_hostname=parsed.hostname)
+        else:
+            sock = raw_sock
+        sock.settimeout(self.timeout)
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        host = parsed.hostname if parsed.port is None else f"{parsed.hostname}:{port}"
+        headers = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            "\r\n"
+        )
+        sock.sendall(headers.encode("ascii"))
+        response = bytearray()
+        while b"\r\n\r\n" not in response:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            response.extend(chunk)
+            if len(response) > 8192:
+                break
+        head = bytes(response).split(b"\r\n\r\n", 1)[0].decode("iso-8859-1", "replace")
+        if " 101 " not in head.split("\r\n", 1)[0]:
+            raise RuntimeError(f"websocket upgrade failed: {head.splitlines()[0] if head else 'empty response'}")
+        accept_expected = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()).decode("ascii")
+        if accept_expected.lower() not in head.lower():
+            raise RuntimeError("websocket upgrade failed: invalid Sec-WebSocket-Accept")
+        self.sock = sock
+        self.connected = True
+
+    def send_frame(self, opcode: int, payload: bytes) -> None:
+        if self.sock is None or not self.connected:
+            return
+        length = len(payload)
+        if length < 126:
+            header = struct.pack("!BB", 0x80 | opcode, 0x80 | length)
+        elif length <= 0xFFFF:
+            header = struct.pack("!BBH", 0x80 | opcode, 0x80 | 126, length)
+        else:
+            header = struct.pack("!BBQ", 0x80 | opcode, 0x80 | 127, length)
+        mask = os.urandom(4)
+        masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+        self.sock.sendall(header + mask + masked)
+
+    def recv_exact(self, size: int) -> bytes:
+        if self.sock is None:
+            return b""
+        chunks = bytearray()
+        while len(chunks) < size:
+            chunk = self.sock.recv(size - len(chunks))
+            if not chunk:
+                raise RuntimeError("websocket closed")
+            chunks.extend(chunk)
+        return bytes(chunks)
+
+    def recv_frame(self, timeout: float) -> tuple[int, bytes] | None:
+        if self.sock is None:
+            return None
+        old_timeout = self.sock.gettimeout()
+        self.sock.settimeout(timeout)
+        try:
+            first = self.recv_exact(2)
+            if not first:
+                return None
+            b1, b2 = first
+            opcode = b1 & 0x0F
+            masked = bool(b2 & 0x80)
+            length = b2 & 0x7F
+            if length == 126:
+                length = struct.unpack("!H", self.recv_exact(2))[0]
+            elif length == 127:
+                length = struct.unpack("!Q", self.recv_exact(8))[0]
+            mask = self.recv_exact(4) if masked else b""
+            payload = self.recv_exact(length) if length else b""
+            if masked and payload:
+                payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+            return opcode, payload
+        except socket.timeout:
+            return None
+        finally:
+            try:
+                self.sock.settimeout(old_timeout)
+            except Exception:
+                pass
+
+    def send_json(self, payload: dict[str, object]) -> None:
+        self.send_frame(1, json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+
+    def process_message(self, payload: bytes) -> str:
+        try:
+            message = json.loads(payload.decode("utf-8", "replace"))
+        except Exception:
+            return ""
+        if not isinstance(message, dict):
+            return ""
+        data = message.get("data")
+        if isinstance(data, dict):
+            candidates = [data.get("text"), data.get("finalText"), data.get("partial"), data.get("rawText")]
+        else:
+            candidates = [message.get("text"), message.get("finalText"), message.get("partial"), message.get("rawText")]
+        text = ""
+        for candidate in candidates:
+            text = normalize_text(str(candidate or ""))
+            if text:
+                break
+        event_type = normalize_text(str(message.get("type") or message.get("event") or "")).lower()
+        is_final = bool(message.get("final") or message.get("isFinal") or message.get("done") or event_type in {"final", "segment", "done"})
+        if text:
+            self.last_text = text
+            if is_final:
+                self.final_text = text
+        if event_type in {"done", "end", "closed"} or bool(message.get("done")):
+            self.done = True
+        if message.get("error"):
+            append_log(f"qwen ASR streaming error: {message.get('error')}")
+        return text
+
+    def drain(self, total_timeout: float, idle_timeout: float = 0.02) -> str:
+        if not self.connected:
+            return ""
+        deadline = time.monotonic() + max(0.0, total_timeout)
+        latest = ""
+        while time.monotonic() < deadline and not self.done:
+            timeout = min(max(0.001, deadline - time.monotonic()), idle_timeout)
+            frame = self.recv_frame(timeout)
+            if frame is None:
+                if latest:
+                    break
+                continue
+            opcode, payload = frame
+            if opcode == 1:
+                text = self.process_message(payload)
+                if text:
+                    latest = text
+            elif opcode == 8:
+                self.done = True
+                break
+            elif opcode == 9:
+                self.send_frame(10, payload)
+        return latest
+
+    def accept_pcm(self, pcm: bytes) -> str:
+        if not self.enabled or not self.connected or not pcm:
+            return ""
+        try:
+            self.send_frame(2, pcm)
+            text = self.drain(0.001)
+            return text
+        except Exception as exc:
+            append_log(f"qwen ASR streaming failed: {type(exc).__name__}: {exc}")
+            self.close()
+            self.enabled = False
+            return ""
+
+    def finish(self) -> str:
+        if not self.enabled or not self.connected:
+            return normalize_text(self.final_text or self.last_text)
+        try:
+            self.send_json({"type": "stop"})
+            self.drain(self.final_wait_seconds, idle_timeout=0.1)
+        except Exception as exc:
+            append_log(f"qwen ASR streaming final wait failed: {type(exc).__name__}: {exc}")
+        finally:
+            self.close()
+        return normalize_text(self.final_text or self.last_text)
+
+    def close(self) -> None:
+        sock = self.sock
+        self.sock = None
+        self.connected = False
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+
 class SegmentingTranscriptionSession:
     def __init__(self) -> None:
         self.state_dir = Path(os.environ["VOICE_STATE_DIR"])
@@ -197,21 +457,23 @@ class SegmentingTranscriptionSession:
         self.stop_file = Path(os.environ["STREAM_STOP_FILE"])
         self.sample_rate = env_int("VOICE_SAMPLE_RATE", 16000)
         self.channels = env_int("VOICE_CHANNELS", 1)
-        self.chunk_ms = env_int("VOICE_STREAM_SEND_INTERVAL_MS", 200)
+        self.chunk_ms = env_int("VOICE_STREAM_SEND_INTERVAL_MS", 100)
         self.max_record_ms = env_int("VOICE_MAX_RECORD_MS", 60000)
-        self.pause_ms = env_int("VOICE_PAUSE_SEGMENT_MS", 1600)
-        self.min_segment_ms = env_int("VOICE_MIN_SEGMENT_MS", 1000)
-        self.rms_threshold = env_float("VOICE_AUTO_SEGMENT_RMS_THRESHOLD", 0.006)
-        self.noise_margin = env_float("VOICE_AUTO_SEGMENT_NOISE_MARGIN", 0.004)
         self.timeout = max(1.0, float(os.environ.get("ASR_TIMEOUT", "60") or 60))
+        self.request_attempt_timeout = max(1.0, env_float("ASR_REQUEST_ATTEMPT_TIMEOUT", min(8.0, self.timeout)))
+        self.connect_timeout = max(0.2, env_float("ASR_CONNECT_TIMEOUT", min(2.0, self.request_attempt_timeout)))
+        self.retry_count = max(1, env_int("ASR_RETRY_COUNT", 3))
+        self.retry_delay = max(0.0, env_float("ASR_RETRY_DELAY", 0.35))
         self.stop_requested = False
         self.request_id = f"uconsole_final_{int(time.time() * 1000)}_{os.getpid()}"
         self.segment_index = 0
         self.final_text = ""
         self.raw_text = ""
         self.corrected_text = ""
+        self.qwen_preview_text = ""
         self.last_request_id = self.request_id
         self.pending_segment = bytearray()
+        self.qwen_preview = QwenAsrStreamingPreview(sample_rate=self.sample_rate, channels=self.channels)
         signal.signal(signal.SIGTERM, self._signal_stop)
         signal.signal(signal.SIGINT, self._signal_stop)
 
@@ -222,16 +484,18 @@ class SegmentingTranscriptionSession:
         except Exception:
             pass
 
-    def recorder_command(self) -> list[str]:
-        input_name = os.environ.get("VOICE_INPUT", "default")
+    def recorder_commands(self) -> list[list[str]]:
         recorder = os.environ.get("VOICE_RECORDER", "auto")
         if recorder == "auto":
-            if shutil_which("pw-record"):
-                recorder = "pw-record"
-            elif shutil_which("arecord"):
-                recorder = "arecord"
-            else:
-                recorder = "ffmpeg"
+            return [
+                self.recorder_command_for(candidate)
+                for candidate in ("arecord", "pw-record", "ffmpeg")
+                if shutil_which(candidate)
+            ]
+        return [self.recorder_command_for(recorder)]
+
+    def recorder_command_for(self, recorder: str) -> list[str]:
+        input_name = os.environ.get("VOICE_INPUT", "default")
         if recorder == "pw-record":
             command = [
                 "pw-record",
@@ -283,13 +547,19 @@ class SegmentingTranscriptionSession:
             ]
         raise RuntimeError(f"unsupported VOICE_RECORDER: {recorder}")
 
+    def recorder_command(self) -> list[str]:
+        commands = self.recorder_commands()
+        if not commands:
+            raise RuntimeError("pw-record, arecord, or ffmpeg is required for voice input")
+        return commands[0]
+
     def write_result(self, *, status: str, error: str = "") -> None:
         payload = {
             "status": status,
             "requestId": self.last_request_id,
             "text": normalize_text(self.final_text),
             "rawText": normalize_text(self.raw_text or self.final_text),
-            "streamText": "",
+            "streamText": normalize_text(self.qwen_preview_text),
             "correctedText": normalize_text(self.corrected_text),
             "error": error,
         }
@@ -326,13 +596,112 @@ class SegmentingTranscriptionSession:
             wav_file.writeframes(pcm)
         return path
 
+    def check_asr_connectivity(self, url: str) -> None:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in {"http", "https"}:
+            return
+        if not parsed.hostname:
+            return
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        try:
+            with socket.create_connection((parsed.hostname, port), timeout=self.connect_timeout):
+                return
+        except OSError as exc:
+            raise RuntimeError(
+                f"ASR endpoint unreachable before upload: {parsed.hostname}:{port} "
+                f"connectTimeout={self.connect_timeout:g}s"
+            ) from exc
+
+    def post_transcription_request(self, request: urllib.request.Request) -> str:
+        last_error: Exception | None = None
+        for attempt in range(1, self.retry_count + 1):
+            try:
+                self.check_asr_connectivity(request.full_url)
+                append_log(
+                    f"final ASR request attempt={attempt}/{self.retry_count} "
+                    f"connectTimeout={self.connect_timeout:g}s requestTimeout={self.request_attempt_timeout:g}s"
+                )
+                with urllib.request.urlopen(request, timeout=self.request_attempt_timeout) as response:
+                    return response.read().decode("utf-8", "replace")
+            except urllib.error.HTTPError:
+                raise
+            except Exception as exc:
+                last_error = exc
+                append_log(f"final ASR request attempt failed attempt={attempt}/{self.retry_count}: {type(exc).__name__}: {exc}")
+                if attempt < self.retry_count and self.retry_delay > 0:
+                    time.sleep(self.retry_delay)
+        if last_error is not None:
+            raise RuntimeError(f"final transcription failed after {self.retry_count} attempts: {last_error}") from last_error
+        raise RuntimeError("final transcription failed without an error")
+
+    def post_json_request(self, url: str, payload: dict[str, object]) -> str:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=body,
+            headers={
+                "Authorization": f"Bearer {os.environ.get('ASR_AUTH_TOKEN', '').strip()}",
+                "Content-Type": "application/json; charset=utf-8",
+                "Content-Length": str(len(body)),
+            },
+            method="POST",
+        )
+        last_error: Exception | None = None
+        for attempt in range(1, self.retry_count + 1):
+            try:
+                self.check_asr_connectivity(url)
+                append_log(
+                    f"streaming final text request attempt={attempt}/{self.retry_count} "
+                    f"connectTimeout={self.connect_timeout:g}s requestTimeout={self.request_attempt_timeout:g}s"
+                )
+                with urllib.request.urlopen(request, timeout=self.request_attempt_timeout) as response:
+                    return response.read().decode("utf-8", "replace")
+            except urllib.error.HTTPError:
+                raise
+            except Exception as exc:
+                last_error = exc
+                append_log(f"streaming final text request attempt failed attempt={attempt}/{self.retry_count}: {type(exc).__name__}: {exc}")
+                if attempt < self.retry_count and self.retry_delay > 0:
+                    time.sleep(self.retry_delay)
+        if last_error is not None:
+            raise RuntimeError(f"streaming final text failed after {self.retry_count} attempts: {last_error}") from last_error
+        raise RuntimeError("streaming final text failed without an error")
+
+    def finalize_streaming_text(self, raw_text: str) -> str:
+        text = normalize_text(raw_text)
+        if not text:
+            return ""
+        payload: dict[str, object] = self.build_fields(self.request_id)
+        payload["rawText"] = text
+        try:
+            raw = self.post_json_request(resolve_finalize_text_url(), payload)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")
+            raise RuntimeError(f"streaming final text failed: HTTP {exc.code} {detail}") from exc
+        final_text, raw_text_result, corrected_text, _applied, response_request_id = extract_transcription_fields(json.loads(raw) if raw else {})
+        if is_placeholder_text(final_text):
+            return ""
+        self.final_text = final_text or text
+        self.raw_text = raw_text_result or text
+        self.corrected_text = corrected_text
+        self.last_request_id = response_request_id or self.request_id
+        append_log(
+            f"streaming final text finalized requestId={self.last_request_id} "
+            f"chars={len(self.final_text)} rawChars={len(self.raw_text)}"
+        )
+        return self.final_text
+
     def transcribe_segment(self, pcm: bytes, *, final_segment: bool = False) -> str:
         if len(pcm) < int(self.sample_rate * self.channels * 2 * 0.25):
             return ""
         self.segment_index += 1
-        request_id = f"{self.request_id}_{self.segment_index}"
+        request_id = self.request_id if final_segment else f"{self.request_id}_{self.segment_index}"
         audio_path = self.write_wav(pcm, request_id)
         try:
+            append_log(
+                f"final ASR upload started requestId={request_id} bytes={len(pcm)} "
+                f"durationMs={int(len(pcm) / max(1, self.sample_rate * self.channels * 2) * 1000)}"
+            )
             body, boundary = build_multipart_form(self.build_fields(request_id), "file", audio_path, "audio/wav")
             request = urllib.request.Request(
                 resolve_transcription_url(),
@@ -345,8 +714,7 @@ class SegmentingTranscriptionSession:
                 method="POST",
             )
             try:
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                    raw = response.read().decode("utf-8", "replace")
+                raw = self.post_transcription_request(request)
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", "replace")
                 raise RuntimeError(f"final transcription failed: HTTP {exc.code} {detail}") from exc
@@ -360,15 +728,21 @@ class SegmentingTranscriptionSession:
                 raw_text = strip_trailing_sentence_punctuation(raw_text or text)
                 corrected_text = strip_trailing_sentence_punctuation(corrected_text)
             if text:
-                self.final_text = append_transcript(self.final_text, text)
-                self.raw_text = append_transcript(self.raw_text, raw_text or text)
-                self.corrected_text = append_transcript(self.corrected_text, corrected_text)
+                if final_segment:
+                    self.final_text = text
+                    self.raw_text = raw_text or text
+                    self.corrected_text = corrected_text
+                else:
+                    self.final_text = append_transcript(self.final_text, text)
+                    self.raw_text = append_transcript(self.raw_text, raw_text or text)
+                    self.corrected_text = append_transcript(self.corrected_text, corrected_text)
                 self.last_request_id = response_request_id or request_id
-                notify_text(self.final_text, progress=80 if final_segment else 50)
                 append_log(
-                    f"segment transcribed requestId={request_id} final={int(final_segment)} "
+                    f"server ASR transcribed requestId={request_id} final={int(final_segment)} "
                     f"chars={len(text)} totalChars={len(self.final_text)}"
                 )
+            else:
+                append_log(f"server ASR returned empty requestId={request_id}")
             return text
         except Exception:
             raise
@@ -379,109 +753,108 @@ class SegmentingTranscriptionSession:
                 except FileNotFoundError:
                     pass
 
-    def should_segment(
-        self,
-        *,
-        now: float,
-        segment_started_at: float,
-        last_speech_at: float,
-        has_speech: bool,
-        rms: float,
-        noise_floor: float,
-    ) -> tuple[bool, bool, float]:
-        threshold = max(0.004, min(self.rms_threshold, noise_floor + self.noise_margin)) if noise_floor > 0 else self.rms_threshold
-        is_speech = rms >= threshold
-        if is_speech:
-            return False, True, noise_floor
-        if not has_speech:
-            next_floor = rms if noise_floor <= 0 else (noise_floor * 0.92) + (rms * 0.08)
-            return False, False, next_floor
-        segment_ms = (now - segment_started_at) * 1000
-        silence_ms = (now - last_speech_at) * 1000
-        return segment_ms >= self.min_segment_ms and silence_ms >= self.pause_ms, False, noise_floor
-
-    def process_segment(self, segment: bytearray, *, force: bool = False) -> None:
-        if segment:
-            self.pending_segment.extend(segment)
-            segment.clear()
-        if not self.pending_segment:
-            return
-        pcm = bytes(self.pending_segment)
-        if force or len(pcm) >= int(self.sample_rate * self.channels * 2 * self.min_segment_ms / 1000):
-            try:
-                self.transcribe_segment(pcm, final_segment=force)
-            except Exception as exc:
-                if not force:
-                    append_log(f"buffer auto segment transcription retry: {type(exc).__name__}: {exc}")
-                    return
-                raise
-            self.pending_segment.clear()
-
     def run(self) -> int:
         if not os.environ.get("ASR_AUTH_TOKEN", "").strip():
             raise RuntimeError("ASR_AUTH_TOKEN is required for FlashAI ASR")
-        if not (shutil_which("pw-record") or shutil_which("arecord") or shutil_which("ffmpeg")):
+        recorder_commands = self.recorder_commands()
+        if not recorder_commands:
             raise RuntimeError("pw-record, arecord, or ffmpeg is required for voice input")
-        recorder = subprocess.Popen(self.recorder_command(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         frame_bytes = max(320, int(self.sample_rate * self.chunk_ms / 1000) * 2 * self.channels)
-        segment = bytearray()
-        segment_started_at = time.monotonic()
-        last_speech_at = segment_started_at
-        has_speech = False
-        noise_floor = 0.0
-        segment_had_speech = False
+        recording = bytearray()
         append_log(
-            f"segmenting ASR started requestId={self.request_id} frameBytes={frame_bytes} "
-            f"pauseMs={self.pause_ms} rmsThreshold={self.rms_threshold}"
+            f"stream ASR started requestId={self.request_id} frameBytes={frame_bytes} "
+            "mode=qwen-streaming-final-local-fallback"
         )
+        recorder: subprocess.Popen[bytes] | None = None
         try:
             deadline = time.monotonic() + (self.max_record_ms / 1000) if self.max_record_ms > 0 else None
-            while not self.stop_requested and not self.stop_file.exists():
-                if deadline is not None and time.monotonic() >= deadline:
-                    append_log(f"segmenting ASR max record reached requestId={self.request_id} maxMs={self.max_record_ms}")
+            for command_index, command in enumerate(recorder_commands, start=1):
+                if self.stop_requested or self.stop_file.exists():
                     break
-                assert recorder.stdout is not None
-                data = recorder.stdout.read(frame_bytes)
-                if not data:
-                    break
-                segment.extend(data)
-                rms = audioop.rms(data, 2) / 32768.0 if data else 0.0
-                now = time.monotonic()
-                should_upload, is_speech, noise_floor = self.should_segment(
-                    now=now,
-                    segment_started_at=segment_started_at,
-                    last_speech_at=last_speech_at,
-                    has_speech=has_speech,
-                    rms=rms,
-                    noise_floor=noise_floor,
+                append_log(
+                    "stream recorder starting "
+                    f"attempt={command_index}/{len(recorder_commands)} "
+                    f"cmd={shlex.join(command)}"
                 )
-                if is_speech:
-                    has_speech = True
-                    segment_had_speech = True
-                    last_speech_at = now
-                if should_upload:
-                    self.process_segment(segment)
-                    segment_started_at = time.monotonic()
-                    last_speech_at = segment_started_at
-                    has_speech = False
-                    noise_floor = 0.0
-                    segment_had_speech = False
+                recorder = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                while not self.stop_requested and not self.stop_file.exists():
+                    if deadline is not None and time.monotonic() >= deadline:
+                        append_log(f"stream ASR max record reached requestId={self.request_id} maxMs={self.max_record_ms}")
+                        break
+                    assert recorder.stdout is not None
+                    data = recorder.stdout.read(frame_bytes)
+                    if not data:
+                        return_code = recorder.poll()
+                        stderr_text = ""
+                        try:
+                            if recorder.stderr is not None:
+                                stderr_text = recorder.stderr.read(4000).decode("utf-8", "replace").strip()
+                        except Exception:
+                            stderr_text = ""
+                        append_log(
+                            "stream recorder ended without audio "
+                            f"attempt={command_index}/{len(recorder_commands)} "
+                            f"returnCode={return_code} stderr={stderr_text[:500]}"
+                        )
+                        break
+                    recording.extend(data)
+                    qwen_preview_text = self.qwen_preview.accept_pcm(data)
+                    if qwen_preview_text:
+                        self.qwen_preview_text = qwen_preview_text
+                        notify_text(qwen_preview_text, progress=35, notify_id=os.environ.get("VOICE_RECORDING_NOTIFY_ID", "991200"))
+                try:
+                    if recorder.poll() is None:
+                        recorder.terminate()
+                        recorder.wait(timeout=2)
+                except Exception:
+                    try:
+                        recorder.kill()
+                    except Exception:
+                        pass
+                recorder = None
+                if recording or self.stop_requested or self.stop_file.exists():
+                    break
             self.stop_requested = True
-            if segment_had_speech:
-                self.process_segment(segment, force=True)
-            else:
-                segment.clear()
+            qwen_text = self.qwen_preview.finish()
+            if qwen_text:
+                self.qwen_preview_text = qwen_text
+            preferred_text = normalize_text(qwen_text)
+            if preferred_text:
+                try:
+                    finalized_text = self.finalize_streaming_text(preferred_text)
+                    if not finalized_text:
+                        self.final_text = preferred_text
+                        self.raw_text = preferred_text
+                        self.corrected_text = ""
+                        append_log(
+                            f"streaming final text returned empty; using preview result fallback "
+                            f"requestId={self.request_id} chars={len(preferred_text)}"
+                        )
+                except Exception as exc:
+                    self.final_text = preferred_text
+                    self.raw_text = preferred_text
+                    self.corrected_text = ""
+                    append_log(
+                        f"streaming final text failed; using preview result fallback "
+                        f"requestId={self.request_id} chars={len(preferred_text)} error={type(exc).__name__}: {exc}"
+                    )
+            elif recording:
+                self.transcribe_segment(bytes(recording), final_segment=True)
             self.write_result(status="ok" if self.final_text else "empty")
-            append_log(f"segmenting ASR finished requestId={self.request_id} finalChars={len(self.final_text)}")
+            append_log(
+                f"stream ASR finished requestId={self.request_id} bytes={len(recording)} "
+                f"finalChars={len(self.final_text)}"
+            )
             return 0
         finally:
             try:
-                if recorder.poll() is None:
+                if recorder is not None and recorder.poll() is None:
                     recorder.terminate()
                     recorder.wait(timeout=2)
             except Exception:
                 try:
-                    recorder.kill()
+                    if recorder is not None:
+                        recorder.kill()
                 except Exception:
                     pass
 
@@ -491,7 +864,7 @@ def main() -> int:
     try:
         return session.run()
     except Exception as exc:
-        append_log(f"segmenting ASR failed: {type(exc).__name__}: {exc}")
+        append_log(f"stream ASR failed: {type(exc).__name__}: {exc}")
         try:
             session.write_result(status="error", error=str(exc))
         except Exception:

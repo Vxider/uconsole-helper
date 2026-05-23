@@ -13,6 +13,8 @@ SESSION_LAUNCHER="/usr/local/bin/uconsole-launch-in-session"
 STATE_DIR="${XDG_RUNTIME_DIR}/uconsole-helper-mapper"
 WATCH_TOKEN_FILE="${STATE_DIR}/flashai-focus-watch.token"
 AUTO_HIDE_ON_FOCUS_LOSS="${AUTO_HIDE_ON_FOCUS_LOSS:-yes}"
+AUTO_HIDE_FOCUS_WHITELIST="${AUTO_HIDE_FOCUS_WHITELIST:-title:uconsole voice}"
+IFS=',' read -r -a FOCUS_LOSS_WHITELIST_SPECS <<<"${AUTO_HIDE_FOCUS_WHITELIST}"
 WINDOW_SPECS=(
   "app_id:crx_${APP_ID}"
   "app_id:chrome-${APP_ID}-${PROFILE}"
@@ -43,6 +45,19 @@ window_is_active() {
 
   for state in "state:active" "state:activated" "state:focused"; do
     if "${WLRCTL}" window find "${spec}" "${state}" >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+whitelisted_window_is_active() {
+  local spec
+
+  for spec in "${FOCUS_LOSS_WHITELIST_SPECS[@]}"; do
+    [[ -n "${spec}" ]] || continue
+    if window_is_active "${spec}"; then
       return 0
     fi
   done
@@ -83,6 +98,8 @@ watch_focus_loss() {
     if spec="$(find_window_spec)"; then
       if window_is_active "${spec}"; then
         seen_active=1
+      elif whitelisted_window_is_active; then
+        :
       elif [[ "${seen_active}" -eq 1 ]]; then
         minimize_window "${spec}"
         exit 0
