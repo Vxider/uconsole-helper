@@ -20,6 +20,7 @@ CONFIG_FILE = Path(os.environ.get("UCONSOLE_HELPER_CONFIG", "/etc/uconsole-helpe
 POWER_SUPPLY_DIR = Path("/sys/class/power_supply")
 DISPLAY_CONTROL = "/usr/local/bin/uconsole-helper-mapper-display-control"
 KEYBOARD_BACKLIGHT_SCRIPT = Path("~/WorkSpace/uconsole-keyboard/tools/keyboard_state.sh").expanduser()
+MCU_SHARED_SAMPLE_FILE = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "uconsole-helper-mcu-latest.json"
 POLL_SECONDS = 1
 CONFIG_POLL_SECONDS = 15
 DISPLAY_STATUS_POLL_SECONDS = 30
@@ -32,7 +33,6 @@ AUTO_PICKUP_MOVE_MIN_SECONDS = 0.6
 AUTO_PICKUP_SETTLE_SECONDS = 0.4
 AUTO_PICKUP_MOVE_EXPIRE_SECONDS = 3.0
 AUTO_PICKUP_WAKE_ENABLED = False
-LIGHT_SMOOTHING_ALPHA = 0.35
 LIGHT_LEVELS = (
     (2.0, 1),
     (5.0, 2),
@@ -55,6 +55,7 @@ class McuSerialReader:
         self.fd: int | None = None
         self.path: Path | None = None
         self.buffer = ""
+        self.last_shared_sample_mtime = 0.0
 
     def close(self) -> None:
         if self.fd is not None:
@@ -79,8 +80,11 @@ class McuSerialReader:
             self.fd = open_mcu_fd(dev)
             self.path = dev if self.fd is not None else None
         if self.fd is None:
-            return None
-        return read_mcu_sample_from_fd(self.fd, self)
+            return read_shared_mcu_sample(self)
+        sample = read_mcu_sample_from_fd(self.fd, self)
+        if sample is not None:
+            return sample
+        return read_shared_mcu_sample(self)
 
     def write_command(self, command: str) -> None:
         if self.fd is None:
@@ -535,10 +539,42 @@ def read_mcu_sample_from_fd(fd: int, reader: McuSerialReader) -> dict[str, objec
                 continue
             if "accel" in payload:
                 payload["_received_at"] = time.time()
+                write_shared_mcu_sample(payload)
                 return payload
     except OSError:
         reader.close()
     return None
+
+
+def read_shared_mcu_sample(reader: McuSerialReader) -> dict[str, object] | None:
+    try:
+        stat = MCU_SHARED_SAMPLE_FILE.stat()
+    except OSError:
+        return None
+    now = time.time()
+    if now - stat.st_mtime > AUTO_MCU_STALE_SECONDS:
+        return None
+    if stat.st_mtime <= reader.last_shared_sample_mtime:
+        return None
+    try:
+        payload = json.loads(MCU_SHARED_SAMPLE_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or "accel" not in payload:
+        return None
+    reader.last_shared_sample_mtime = stat.st_mtime
+    payload["_received_at"] = now
+    return payload
+
+
+def write_shared_mcu_sample(payload: dict[str, object]) -> None:
+    try:
+        MCU_SHARED_SAMPLE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = MCU_SHARED_SAMPLE_FILE.with_suffix(f"{MCU_SHARED_SAMPLE_FILE.suffix}.{os.getpid()}.tmp")
+        tmp_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        tmp_path.replace(MCU_SHARED_SAMPLE_FILE)
+    except OSError:
+        return
 
 
 def lux_from_sample(sample: dict[str, object]) -> float | None:
@@ -591,12 +627,8 @@ def classify_light_level(lux: float) -> int:
 def update_light_smoothing(smoothed_lux: float | None, current_backlight: int | None, lux: float | None) -> tuple[float | None, int | None]:
     if lux is None:
         return smoothed_lux, current_backlight
-    if smoothed_lux is None:
-        smoothed = lux
-    else:
-        smoothed = smoothed_lux + LIGHT_SMOOTHING_ALPHA * (lux - smoothed_lux)
-    target = classify_light_level(smoothed)
-    return smoothed, target
+    target = classify_light_level(lux)
+    return lux, target
 
 
 def start_swayidle(timeout_sec: int) -> subprocess.Popen[str] | None:
@@ -740,8 +772,9 @@ def maybe_apply_auto_brightness(
         delta = abs(suggested - state.current_backlight)
         is_extreme = suggested in {1, 9}
         if delta == 1 and not is_extreme:
-            state.pending_backlight = suggested
-            return
+            if state.pending_backlight != suggested:
+                state.pending_backlight = suggested
+                return
         if delta > 1 and not is_extreme:
             suggested = state.current_backlight + (1 if suggested > state.current_backlight else -1)
         state.pending_backlight = None

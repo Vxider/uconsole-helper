@@ -46,6 +46,7 @@ MAPPER_CONFIG = Path.home() / ".config/uconsole-helper-mapper/config.toml"
 MAPPER_DESKTOP_KEYBINDS_CONFIG = Path.home() / ".config/uconsole-helper-mapper/desktop-keybinds.toml"
 MAPPER_ASR_CONFIG = Path.home() / ".config/uconsole-helper-mapper/voice.env"
 MAPPER_GLOSSARY_FILE = Path.home() / ".config/uconsole-helper-mapper/voice-glossary.txt"
+MCU_SHARED_SAMPLE_FILE = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "uconsole-helper-mcu-latest.json"
 BATTERY_CALIBRATE_PATH = Path("/sys/class/power_supply/axp20x-battery/calibrate")
 DISPLAY_BACKLIGHT_BRIGHTNESS_PATH = Path("/sys/class/backlight/backlight@0/brightness")
 DISPLAY_BACKLIGHT_MAX_PATH = Path("/sys/class/backlight/backlight@0/max_brightness")
@@ -69,7 +70,6 @@ XIAO_PUTDOWN_WINDOW_SECONDS = 3.8
 XIAO_SAMPLE_MAX_AGE_SECONDS = 45.0
 XIAO_STATUS_REQUEST_SECONDS = 5.0
 XIAO_STATUS_STALE_SECONDS = 35.0
-MCU_LIGHT_SMOOTHING_ALPHA = 0.35
 MCU_EVENT_LABELS = ("拿起", "放下", "支架")
 MCU_FIRMWARE_EVENT_LABELS = {
     "ready": "",
@@ -6486,8 +6486,28 @@ def read_xiao_sample(device: McuDeviceInfo, state: McuTelemetryState) -> McuTele
     if sample is None:
         state.last_error = f"无法解析串口行: {line[:80]}"
         return None
+    write_shared_mcu_line(line)
     state.last_error = ""
     return sample
+
+
+def write_shared_mcu_line(line: str) -> None:
+    text = line.strip()
+    if not text.startswith("{"):
+        return
+    try:
+        payload = json_module.loads(text)
+    except json_module.JSONDecodeError:
+        return
+    if not isinstance(payload, dict) or "accel" not in payload:
+        return
+    try:
+        MCU_SHARED_SAMPLE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = MCU_SHARED_SAMPLE_FILE.with_suffix(f"{MCU_SHARED_SAMPLE_FILE.suffix}.{os.getpid()}.tmp")
+        tmp_path.write_text(json_module.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        tmp_path.replace(MCU_SHARED_SAMPLE_FILE)
+    except OSError:
+        return
 
 
 def open_xiao_serial(tty_name: str) -> McuSerialSession | None:
@@ -6826,13 +6846,11 @@ def light_level_by_backlight(backlight: int) -> tuple[str, str, float | None, in
 def update_light_smoothing(state: McuTelemetryState, lux: float | None) -> None:
     if lux is None:
         return
-    if state.smoothed_light_lux is None:
-        smoothed = lux
-    else:
-        smoothed = state.smoothed_light_lux + MCU_LIGHT_SMOOTHING_ALPHA * (lux - state.smoothed_light_lux)
-    target = classify_light_level(smoothed)[3]
+    target = classify_light_level(lux)[3]
     current = state.suggested_backlight
     if current is None:
+        suggested = target
+    elif target in {1, 9}:
         suggested = target
     elif target > current:
         suggested = current + 1
@@ -6840,7 +6858,7 @@ def update_light_smoothing(state: McuTelemetryState, lux: float | None) -> None:
         suggested = current - 1
     else:
         suggested = current
-    state.smoothed_light_lux = smoothed
+    state.smoothed_light_lux = lux
     state.suggested_backlight = max(1, min(9, suggested))
 
 
