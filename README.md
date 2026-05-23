@@ -44,7 +44,7 @@ Optional integrations:
 - `nmcli` for NetworkManager interface state
 - `mmcli` for cellular modem signal
 - `tailscale` for Tailscale device status
-- `avahi-resolve` for mDNS hostname lookup
+- `avahi-utils` for `avahi-resolve-address` / `avahi-resolve` mDNS hostname lookup
 - `python3-evdev`, `/dev/uinput`, `wtype`, `wl-clipboard`, `curl`, `jq`, and
   `swayidle` for the input mapper, ASR push-to-talk path, and idle display
   timeout

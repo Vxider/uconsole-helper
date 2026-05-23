@@ -99,7 +99,6 @@ class AutoBrightnessState:
     def __init__(self) -> None:
         self.smoothed_lux: float | None = None
         self.current_backlight: int | None = None
-        self.pending_backlight: int | None = None
 
 
 class HostInputMonitor:
@@ -628,7 +627,11 @@ def update_light_smoothing(smoothed_lux: float | None, current_backlight: int | 
     if lux is None:
         return smoothed_lux, current_backlight
     target = classify_light_level(lux)
-    return lux, target
+    if smoothed_lux is None:
+        smoothed_lux = lux
+    else:
+        smoothed_lux = (smoothed_lux * 0.35) + (lux * 0.65)
+    return smoothed_lux, classify_light_level(smoothed_lux)
 
 
 def start_swayidle(timeout_sec: int) -> subprocess.Popen[str] | None:
@@ -766,25 +769,18 @@ def maybe_apply_auto_brightness(
         lux_from_sample(sample),
     )
     if suggested is None or suggested == state.current_backlight:
-        state.pending_backlight = None
         return
     if state.current_backlight is not None:
         delta = abs(suggested - state.current_backlight)
         is_extreme = suggested in {1, 9}
-        if delta == 1 and not is_extreme:
-            if state.pending_backlight != suggested:
-                state.pending_backlight = suggested
-                return
         if delta > 1 and not is_extreme:
-            suggested = state.current_backlight + (1 if suggested > state.current_backlight else -1)
-        state.pending_backlight = None
+            step = 2 if delta >= 3 else 1
+            suggested = state.current_backlight + (step if suggested > state.current_backlight else -step)
     display_brightness(suggested)
     keyboard_level = keyboard_backlight_level(suggested)
     current_keyboard_level = read_keyboard_backlight()
-    if current_keyboard_level != 0:
+    if current_keyboard_level != keyboard_level:
         set_keyboard_backlight(keyboard_level)
-    else:
-        keyboard_level = 0
     print(f"auto brightness: screen={suggested} keyboard={keyboard_level}", flush=True)
     state.current_backlight = suggested
 

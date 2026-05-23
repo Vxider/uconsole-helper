@@ -86,7 +86,13 @@ def status() -> int:
     if PID_FILE.exists():
         try:
             pid = int(PID_FILE.read_text(encoding="utf-8").strip())
+            if Path(f"/proc/{pid}").exists():
+                print(f"running pid={pid}")
+                return 0
             os.kill(pid, 0)
+        except PermissionError:
+            print(f"running pid={pid}")
+            return 0
         except Exception:
             print("stopped")
             return 0

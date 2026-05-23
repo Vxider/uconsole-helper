@@ -39,6 +39,7 @@ APP_DIR = Path(__file__).resolve().parent
 HELPER = APP_DIR / "uconsole_helper_dhcp.py"
 SYS_NET = Path("/sys/class/net")
 LEASE_FILE = Path("/tmp/uconsole-helper/dhcp/dnsmasq.leases")
+DHCP_CONFIG_FILE = Path("/tmp/uconsole-helper/dhcp/dnsmasq.conf")
 SYSTEM_SERVICE = "uconsole-helper.service"
 SERVICE_CONFIG = Path("/etc/uconsole-helper/uconsole-helper.conf")
 MAPPER_USER_SERVICE = "uconsole-helper-mapper.service"
@@ -279,6 +280,7 @@ class UConsoleHelperWindow(Gtk.Window):
         self.scan_cancel = threading.Event()
         self.dashboard_refresh_running = False
         self.dhcp_running = False
+        self.dhcp_interface = ""
         self.tailscale_reconnecting = False
         self.mcu_refresh_running = False
         self.mcu_monitor_stop = threading.Event()
@@ -301,6 +303,7 @@ class UConsoleHelperWindow(Gtk.Window):
         self.mcu_mic_assist_updating = False
 
         self.message_label = Gtk.Label(label="", xalign=0)
+        self.dhcp_card: Gtk.Widget | None = None
         self.entries = {key: Gtk.Entry() for key in DEFAULTS}
         self.pool_prefix_labels: dict[str, Gtk.Label] = {}
         self.pool_suffix_entries: dict[str, Gtk.Entry] = {}
@@ -316,7 +319,6 @@ class UConsoleHelperWindow(Gtk.Window):
         self.scan_store = Gtk.ListStore(str, str, str, str)
         self.interface_status_store = Gtk.ListStore(str, str, str, str, str, str, str)
         self.interface_tree: Gtk.TreeView | None = None
-        self.interface_pin_tree: Gtk.TreeView | None = None
         self.tailscale_store = Gtk.ListStore(str, str, str, str, str, str, str, str, str, str)
         self.tailscale_summary_label = Gtk.Label(label="", xalign=0)
         self.tailscale_summary_label.get_style_context().add_class("muted")
@@ -361,13 +363,13 @@ class UConsoleHelperWindow(Gtk.Window):
         self._build_ui()
         self.refresh_dashboard()
         self.refresh_dhcp_defaults()
+        self.refresh_status()
         self.refresh_interface_status()
         self.refresh_tailscale_status()
         self.refresh_power_status()
         self.refresh_mcu_status()
         self.refresh_mapper_status()
         self.load_asr_config_controls()
-        self.refresh_status()
         GLib.timeout_add_seconds(5, self.auto_refresh_visible_status)
         self.mcu_monitor_thread = threading.Thread(target=self._mcu_monitor_worker, daemon=True)
         self.mcu_monitor_thread.start()
@@ -405,7 +407,11 @@ class UConsoleHelperWindow(Gtk.Window):
         self.dashboard_tab.get_style_context().add_class("tab-button")
         tabs.pack_start(self.dashboard_tab, False, False, 0)
 
-        self.lan_tab = underlined_button("LAN", "L")
+        self.lan_tab_label = Gtk.Label()
+        self.lan_tab_label.set_use_markup(True)
+        self.lan_tab_label.set_markup(lan_tab_markup(False))
+        self.lan_tab = Gtk.Button()
+        self.lan_tab.add(self.lan_tab_label)
         self.lan_tab.connect("clicked", lambda _button: self.set_tab("lan"))
         self.lan_tab.get_style_context().add_class("tab-button")
         tabs.pack_start(self.lan_tab, False, False, 0)
@@ -547,6 +553,7 @@ class UConsoleHelperWindow(Gtk.Window):
 
     def _build_dhcp_config_card(self) -> Gtk.Widget:
         config_card = card_box()
+        self.dhcp_card = config_card
 
         grid = Gtk.Grid(column_spacing=12, row_spacing=10)
         config_card.pack_start(grid, False, False, 0)
@@ -568,23 +575,10 @@ class UConsoleHelperWindow(Gtk.Window):
         interface_card = card_box()
         page.pack_start(interface_card, False, False, 0)
 
-        interface_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
-        self.interface_pin_tree = Gtk.TreeView(model=self.interface_status_store)
-        self.interface_pin_tree.set_headers_visible(True)
-        self.interface_pin_tree.get_selection().set_mode(Gtk.SelectionMode.SINGLE)
-        pin_renderer = Gtk.CellRendererText()
-        pin_column = Gtk.TreeViewColumn("设备", pin_renderer, text=0, foreground=6)
-        pin_column.set_sizing(Gtk.TreeViewColumnSizing.FIXED)
-        pin_column.set_fixed_width(120)
-        pin_column.set_resizable(True)
-        self.interface_pin_tree.append_column(pin_column)
-        self.interface_pin_tree.set_hexpand(False)
-        self.interface_pin_tree.set_vexpand(False)
-
         self.interface_tree = Gtk.TreeView(model=self.interface_status_store)
         self.interface_tree.set_headers_visible(True)
         self.interface_tree.get_selection().set_mode(Gtk.SelectionMode.SINGLE)
-        for index, title in enumerate(["类型", "状态", "连接", "信号", "地址"], start=1):
+        for index, title in enumerate(["设备", "类型", "状态", "连接", "信号", "地址"]):
             renderer = Gtk.CellRendererText()
             column = Gtk.TreeViewColumn(title, renderer, text=index, foreground=6)
             column.set_resizable(True)
@@ -592,11 +586,7 @@ class UConsoleHelperWindow(Gtk.Window):
 
         self.interface_tree.set_hexpand(True)
         self.interface_tree.set_vexpand(False)
-        self.interface_pin_tree.get_selection().connect("changed", self.on_interface_pin_selection_changed)
-        self.interface_tree.get_selection().connect("changed", self.on_interface_scroll_selection_changed)
-        interface_box.pack_start(fixed_table_scroll(self.interface_pin_tree, width=128), False, False, 0)
-        interface_box.pack_start(table_scroll(self.interface_tree, vexpand=False), True, True, 0)
-        interface_card.pack_start(interface_box, False, False, 0)
+        interface_card.pack_start(table_scroll(self.interface_tree, vexpand=False), False, False, 0)
 
         dhcp_card = self._build_dhcp_config_card()
         page.pack_start(dhcp_card, False, False, 4)
@@ -1251,6 +1241,10 @@ class UConsoleHelperWindow(Gtk.Window):
                 border-radius: 8px;
                 padding: 5px;
             }
+            .card.dhcp-running {
+                background: #142a25;
+                border-color: #39e58a;
+            }
             .dashboard-card {
                 padding: 3px;
             }
@@ -1294,6 +1288,11 @@ class UConsoleHelperWindow(Gtk.Window):
             .context-action.action-busy {
                 background: #342a1d;
                 border-color: #d68a24;
+            }
+            .context-action.action-danger {
+                background: #8f2d2d;
+                border-color: #e85b5b;
+                color: #ffffff;
             }
             .context-action.action-success {
                 background: #1f8f55;
@@ -1405,6 +1404,7 @@ class UConsoleHelperWindow(Gtk.Window):
     def update_header(self) -> None:
         page = self.stack.get_visible_child_name() or "dashboard"
         self.tailscale_tab_label.set_markup(tailscale_tab_markup())
+        self.lan_tab_label.set_markup(lan_tab_markup(self.dhcp_running))
         self.power_tab_label.set_markup(power_tab_markup())
         toggle_style_class(self.mcu_tab, "tab-active", page == "mcu")
         self.mapper_tab_label.set_markup(mapper_tab_markup())
@@ -1418,12 +1418,12 @@ class UConsoleHelperWindow(Gtk.Window):
         self.tailscale_reconnect_button.set_visible(page in {"lan", "tailscale", "power", "mapper"})
         self.tailscale_reconnect_button.set_sensitive(page != "tailscale" or not self.tailscale_reconnecting)
         reconnect_context = self.tailscale_reconnect_button.get_style_context()
-        for class_name in ("action-ready", "action-active", "action-busy"):
+        for class_name in ("action-ready", "action-active", "action-busy", "action-danger"):
             reconnect_context.remove_class(class_name)
         if page == "lan":
             if self.dhcp_running:
                 set_underlined_button_label(self.tailscale_reconnect_button, "Disable", "E")
-                reconnect_context.add_class("action-active")
+                reconnect_context.add_class("action-danger")
             else:
                 set_underlined_button_label(self.tailscale_reconnect_button, "DHCP", "D")
                 reconnect_context.add_class("action-ready")
@@ -1467,6 +1467,12 @@ class UConsoleHelperWindow(Gtk.Window):
             action_context.add_class("action-ready")
         else:
             self.context_action_button.hide()
+        self.update_dhcp_card_state()
+
+    def update_dhcp_card_state(self) -> None:
+        if self.dhcp_card is None:
+            return
+        toggle_style_class(self.dhcp_card, "dhcp-running", self.dhcp_running)
 
     def on_dashboard_size_allocate(self, _widget: Gtk.Widget, allocation: Gdk.Rectangle) -> None:
         if allocation.width >= 860 and allocation.height < 520:
@@ -1557,7 +1563,7 @@ class UConsoleHelperWindow(Gtk.Window):
             self.refresh_dashboard()
         elif page == "lan":
             self.refresh_dhcp_defaults()
-            self.refresh_interface_status()
+            self.refresh_status()
         elif page == "tailscale":
             self.refresh_tailscale_status()
         elif page == "power":
@@ -1781,26 +1787,6 @@ class UConsoleHelperWindow(Gtk.Window):
         self.dhcp_defaults = dhcp_defaults()
         self.set_dhcp_config_values(self.dhcp_defaults)
 
-    def on_interface_pin_selection_changed(self, selection: Gtk.TreeSelection) -> None:
-        self.sync_interface_selection(selection, self.interface_tree)
-
-    def on_interface_scroll_selection_changed(self, selection: Gtk.TreeSelection) -> None:
-        self.sync_interface_selection(selection, self.interface_pin_tree)
-
-    def sync_interface_selection(self, source_selection: Gtk.TreeSelection, target_tree: Gtk.TreeView | None) -> None:
-        if target_tree is None:
-            return
-        model, tree_iter = source_selection.get_selected()
-        if tree_iter is None:
-            return
-        path = model.get_path(tree_iter)
-        target_selection = target_tree.get_selection()
-        target_model, target_iter = target_selection.get_selected()
-        if target_iter is not None and target_model.get_path(target_iter) == path:
-            return
-        target_selection.select_path(path)
-        target_tree.scroll_to_cell(path, None, False, 0.0, 0.0)
-
     def refresh_interface_status(self) -> None:
         selected_name = self.selected_scan_interface_name()
         self.interface_status_store.clear()
@@ -1827,6 +1813,9 @@ class UConsoleHelperWindow(Gtk.Window):
             signal = signal_with_bars(signal)
 
             state = display_nm_state(device["state"])
+            if self.dhcp_running and device["device"] == self.dhcp_interface:
+                state = "DHCP Server"
+                connection = "dnsmasq"
             row_color = interface_row_color(state, signal)
             self.interface_status_store.append(
                 [
@@ -2530,11 +2519,18 @@ class UConsoleHelperWindow(Gtk.Window):
         result = run_helper("status")
         if result.returncode == 0 and "running" in result.stdout:
             self.dhcp_running = True
+            self.dhcp_interface = running_dhcp_interface()
+        elif dnsmasq_running():
+            self.dhcp_running = True
+            self.dhcp_interface = running_dhcp_interface()
         elif result.returncode == 0:
             self.dhcp_running = False
+            self.dhcp_interface = ""
         else:
             self.dhcp_running = False
+            self.dhcp_interface = ""
         self.update_header()
+        self.refresh_interface_status()
 
     def start_server(self) -> None:
         try:
@@ -2572,9 +2568,12 @@ class UConsoleHelperWindow(Gtk.Window):
         output = combine_output(result)
         if result.returncode == 0:
             self.dhcp_running = True
+            self.dhcp_interface = config["interface"]
             self.message_label.set_text(f"DHCP Server 已在 {config['interface']} 上启动。")
+            self.refresh_interface_status()
         else:
             self.dhcp_running = False
+            self.dhcp_interface = ""
             self.message_label.set_text("启动失败。")
             self.show_error("启动失败", output or "命令执行失败。")
         self.update_header()
@@ -2588,7 +2587,9 @@ class UConsoleHelperWindow(Gtk.Window):
         output = combine_output(result)
         if result.returncode == 0:
             self.dhcp_running = False
+            self.dhcp_interface = ""
             self.message_label.set_text("DHCP Server 已停止。")
+            self.refresh_interface_status()
         else:
             self.message_label.set_text("停止失败。")
             self.show_error("停止失败", output or "命令执行失败。")
@@ -2638,7 +2639,19 @@ class UConsoleHelperWindow(Gtk.Window):
         name = self.selected_scan_interface_name()
         if not name:
             return None
+        if self.dhcp_running and name == self.dhcp_interface:
+            network = self.selected_scan_network(name)
+            status = "DHCP Server"
+            if network is not None:
+                status = f"{status}, {network}"
+            return InterfaceInfo(name=name, supported=network is not None, status=status, reason="" if network else "没有可扫描 IPv4 网段")
         return scan_interface_info(name, "")
+
+    def selected_scan_network(self, name: str) -> ipaddress.IPv4Network | None:
+        network = interface_ipv4_network(name)
+        if network is None and self.dhcp_running and name == self.dhcp_interface:
+            network = running_dhcp_network(name)
+        return network
 
     def selected_dhcp_interface(self) -> InterfaceInfo | None:
         name = self.selected_scan_interface_name()
@@ -2647,10 +2660,9 @@ class UConsoleHelperWindow(Gtk.Window):
         return dhcp_interface_info(name)
 
     def selected_scan_interface_name(self) -> str:
-        tree = self.interface_pin_tree or self.interface_tree
-        if tree is None:
+        if self.interface_tree is None:
             return ""
-        model, tree_iter = tree.get_selection().get_selected()
+        model, tree_iter = self.interface_tree.get_selection().get_selected()
         if tree_iter is None:
             return ""
         return str(model[tree_iter][0])
@@ -2661,9 +2673,6 @@ class UConsoleHelperWindow(Gtk.Window):
         for row in self.interface_status_store:
             if row[0] == name:
                 path = self.interface_status_store.get_path(row.iter)
-                if self.interface_pin_tree is not None:
-                    self.interface_pin_tree.get_selection().select_iter(row.iter)
-                    self.interface_pin_tree.scroll_to_cell(path, None, False, 0.0, 0.0)
                 self.interface_tree.get_selection().select_iter(row.iter)
                 self.interface_tree.scroll_to_cell(path, None, False, 0.0, 0.0)
                 return
@@ -2680,7 +2689,7 @@ class UConsoleHelperWindow(Gtk.Window):
             self.show_error("配置错误", f"{selected.name} 当前无法扫描。\n{detail}")
             return
 
-        network = interface_ipv4_network(selected.name)
+        network = self.selected_scan_network(selected.name)
         if network is None:
             self.show_error("没有 IPv4 地址", f"{selected.name} 当前没有可扫描的 IPv4 网段。")
             return
@@ -2803,16 +2812,6 @@ def table_scroll(content: Gtk.Widget, vexpand: bool) -> Gtk.ScrolledWindow:
     scroll.set_hexpand(True)
     scroll.set_vexpand(vexpand)
     scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC if vexpand else Gtk.PolicyType.NEVER)
-    scroll.add(content)
-    return scroll
-
-
-def fixed_table_scroll(content: Gtk.Widget, width: int) -> Gtk.ScrolledWindow:
-    scroll = Gtk.ScrolledWindow()
-    scroll.set_hexpand(False)
-    scroll.set_vexpand(False)
-    scroll.set_size_request(width, -1)
-    scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.NEVER)
     scroll.add(content)
     return scroll
 
@@ -3444,8 +3443,57 @@ def display_nm_state(state: str) -> str:
     return state
 
 
+def running_dhcp_interface() -> str:
+    text = read_text(DHCP_CONFIG_FILE)
+    for line in text.splitlines():
+        if line.startswith("interface="):
+            return line.split("=", 1)[1].strip()
+    return ""
+
+
+def dnsmasq_running() -> bool:
+    result = subprocess.run(
+        ["pgrep", "-f", f"dnsmasq --conf-file={DHCP_CONFIG_FILE}"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
+def running_dhcp_network(interface: str) -> ipaddress.IPv4Network | None:
+    text = read_text(DHCP_CONFIG_FILE)
+    config_interface = ""
+    netmask = ""
+    pool_start = ""
+    for line in text.splitlines():
+        if line.startswith("interface="):
+            config_interface = line.split("=", 1)[1].strip()
+        elif line.startswith("dhcp-range="):
+            parts = line.split("=", 1)[1].split(",")
+            if len(parts) >= 3:
+                pool_start = parts[0].strip()
+                netmask = parts[2].strip()
+
+    if not netmask or config_interface != interface:
+        return None
+
+    server_ip = interface_ipv4_address(interface)
+    if not server_ip or server_ip == "-":
+        server_ip = pool_start
+    try:
+        network = ipaddress.IPv4Network(f"{server_ip}/{netmask}", strict=False)
+    except ValueError:
+        return None
+    if network.prefixlen <= 30:
+        return network
+    return None
+
+
 def interface_row_color(state: str, signal: str) -> str:
     normalized = state.lower()
+    if "dhcp server" in normalized:
+        return "#61d6d6"
     if "不可用" in state or "unavailable" in normalized or "failed" in normalized:
         return "#ff6b5f"
     if "未连接" in state or "disconnect" in normalized:
@@ -3795,6 +3843,13 @@ def tailscale_tab_markup() -> str:
     status = tailscale_status()
     color = tailscale_status_color(status)
     return f'<span foreground="{color}">●</span> {underlined_markup("TS", "T")}'
+
+
+def lan_tab_markup(dhcp_running: bool) -> str:
+    label = underlined_markup("LAN", "L")
+    if not dhcp_running:
+        return label
+    return f'<span foreground="#34c759">●</span> {label}'
 
 
 def tailscale_status_color(status: dict[str, object]) -> str:
@@ -5642,6 +5697,7 @@ def scan_lan(
     if cancel_event is not None and cancel_event.is_set():
         return []
     neighbors = read_neighbors(interface)
+    merge_dhcp_leases(neighbors, network)
     hostnames = resolve_hostnames(interface, neighbors)
     rows: list[dict[str, str]] = []
     for ip in sorted(neighbors, key=lambda item: ipaddress.IPv4Address(item)):
@@ -5655,6 +5711,20 @@ def scan_lan(
             }
         )
     return rows
+
+
+def merge_dhcp_leases(neighbors: dict[str, dict[str, str]], network: ipaddress.IPv4Network) -> None:
+    for lease in read_dhcp_leases():
+        try:
+            address = ipaddress.IPv4Address(lease["ip"])
+        except ValueError:
+            continue
+        if address not in network:
+            continue
+        item = neighbors.setdefault(lease["ip"], {})
+        if not item.get("mac") or item.get("mac") == "-":
+            item["mac"] = lease["mac"]
+        item.setdefault("state", "LEASED")
 
 
 def ping_hosts(interface: str, addresses: list[str], cancel_event: threading.Event | None = None) -> None:
@@ -5730,7 +5800,7 @@ def resolve_hostnames(interface: str, neighbors: dict[str, dict[str, str]]) -> d
         if not name:
             name = lan_hostname_or_empty(ip, ptr_hostname_from_interface_dns(interface, ip))
         if not name:
-            name = lan_hostname_or_empty(ip, mdns_hostname(ip))
+            name = lan_hostname_or_empty(ip, mdns_hostname(interface, ip))
         if not name:
             name = lan_hostname_or_empty(ip, netbios_hostname(ip))
         result[ip] = name or "-"
@@ -5973,7 +6043,7 @@ def read_dns_name(data: bytes, offset: int) -> tuple[str, int]:
     return ".".join(labels), next_offset
 
 
-def mdns_hostname(ip: str) -> str:
+def mdns_hostname(interface: str, ip: str) -> str:
     for command in (
         ["avahi-resolve-address", ip],
         ["avahi-resolve", "-a", ip],
@@ -5985,7 +6055,45 @@ def mdns_hostname(ip: str) -> str:
             continue
         parts = result.stdout.split()
         if len(parts) >= 2:
-            return parts[1].removesuffix(".local")
+            name = lan_hostname_or_empty(ip, parts[1].removesuffix(".local"))
+            if name:
+                return name
+    return mdns_hostname_from_browse(interface, ip)
+
+
+def mdns_hostname_from_browse(interface: str, ip: str) -> str:
+    if shutil.which("avahi-browse") is None:
+        return ""
+    result = subprocess.run(
+        ["avahi-browse", "-alrt"],
+        text=True,
+        capture_output=True,
+        timeout=4,
+        check=False,
+    )
+    if result.returncode != 0:
+        return ""
+
+    current_interface = ""
+    current_hostname = ""
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("=", "+")):
+            parts = stripped.split()
+            current_interface = parts[1] if len(parts) >= 2 else ""
+            current_hostname = ""
+            continue
+        if current_interface != interface:
+            continue
+        match = re.search(r"hostname\s*=\s*\[(.+)\]", stripped)
+        if match:
+            current_hostname = match.group(1).strip()
+            continue
+        match = re.search(r"address\s*=\s*\[(.+)\]", stripped)
+        if match and match.group(1).strip() == ip:
+            name = lan_hostname_or_empty(ip, current_hostname.removesuffix(".local"))
+            if name:
+                return name
     return ""
 
 
