@@ -7,6 +7,8 @@ from pathlib import Path
 
 
 BACKLIGHT_POWER = Path("/sys/class/backlight/backlight@0/bl_power")
+BACKLIGHT_BRIGHTNESS = Path("/sys/class/backlight/backlight@0/brightness")
+BACKLIGHT_MAX_BRIGHTNESS = Path("/sys/class/backlight/backlight@0/max_brightness")
 FRAMEBUFFER_BLANK = Path("/sys/class/graphics/fb0/blank")
 DRM_ROOT = Path("/sys/class/drm")
 
@@ -42,13 +44,25 @@ def set_display(on: bool) -> None:
         write_text(BACKLIGHT_POWER, "4")
 
 
+def set_brightness(level: int) -> None:
+    max_brightness = int(BACKLIGHT_MAX_BRIGHTNESS.read_text(encoding="utf-8").strip())
+    level = max(1, min(max_brightness, level))
+    write_text(BACKLIGHT_BRIGHTNESS, str(level))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=("toggle", "on", "off", "status"))
+    parser.add_argument("action", choices=("toggle", "on", "off", "status", "brightness"))
+    parser.add_argument("value", nargs="?")
     args = parser.parse_args()
 
     if args.action == "status":
         print("off" if read_screen_off() else "on")
+        return 0
+    if args.action == "brightness":
+        if args.value is None:
+            parser.error("brightness requires a level")
+        set_brightness(int(args.value))
         return 0
     if args.action == "toggle":
         set_display(read_screen_off())

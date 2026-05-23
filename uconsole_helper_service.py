@@ -7,12 +7,14 @@ import argparse
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 
-CONFIG_FILE = Path(os.environ.get("UCONSOLE_HELPER_CONFIG", "/etc/uconsole-helper/uconsole-helper.conf"))
+DEFAULT_CONFIG_FILE = Path("/etc/uconsole-helper/uconsole-helper.conf")
+CONFIG_FILE = Path(os.environ.get("UCONSOLE_HELPER_CONFIG", str(DEFAULT_CONFIG_FILE)))
 
 
 @dataclass(frozen=True)
@@ -38,6 +40,45 @@ def load_config(path: Path = CONFIG_FILE) -> dict[str, str]:
         key, value = line.split("=", 1)
         values[key.strip()] = value.strip().strip('"').strip("'")
     return values
+
+
+def parse_config_text(text: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if len(text.encode("utf-8")) > 65536:
+        raise ValueError("config is too large")
+    for line_no, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            raise ValueError(f"line {line_no}: expected KEY=VALUE")
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key or not all(ch.isupper() or ch.isdigit() or ch == "_" for ch in key):
+            raise ValueError(f"line {line_no}: invalid key")
+        values[key] = value.strip().strip('"').strip("'")
+    return values
+
+
+def write_config_from_stdin(path: Path = DEFAULT_CONFIG_FILE) -> None:
+    if os.geteuid() != 0:
+        raise PermissionError("write-config must run as root")
+    text = os.sys.stdin.read()
+    if not text.endswith("\n"):
+        text += "\n"
+    values = parse_config_text(text)
+    powersaver_config(values)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+        handle.write(text)
+        tmp_path = Path(handle.name)
+    try:
+        os.chmod(tmp_path, 0o644)
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+    subprocess.run(["systemctl", "restart", "uconsole-helper.service"], check=True)
 
 
 def bool_config(value: str, default: bool = False) -> bool:
@@ -343,9 +384,19 @@ def run_service(once: bool = False, dry_run: bool = False) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=("run", "write-config"),
+        default="run",
+        help="run service or write validated config from stdin",
+    )
     parser.add_argument("--once", action="store_true", help="run enabled background tasks once and exit")
     parser.add_argument("--dry-run", action="store_true", help="print actions without writing system state")
     args = parser.parse_args()
+    if args.command == "write-config":
+        write_config_from_stdin()
+        return 0
     run_service(once=args.once, dry_run=args.dry_run)
     return 0
 
