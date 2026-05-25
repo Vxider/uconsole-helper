@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <Adafruit_LittleFS.h>
+#include <Adafruit_NeoPixel.h>
 #include <InternalFileSystem.h>
 #include <LSM6DS3.h>
 #include <PDM.h>
@@ -9,6 +10,7 @@
 using namespace Adafruit_LittleFS_Namespace;
 
 LSM6DS3 imu(I2C_MODE, 0x6A);
+Adafruit_NeoPixel status_pixel(1, D10, NEO_GRB + NEO_KHZ800);
 
 static const uint32_t SAMPLE_INTERVAL_MS = 50;
 static const uint32_t HEARTBEAT_INTERVAL_MS = 30000;
@@ -20,6 +22,9 @@ static const uint32_t LIGHT_REPORT_FAST_INTERVAL_MS = 1000;
 static const uint32_t LIGHT_REPORT_SLOW_INTERVAL_MS = 30000;
 static const uint32_t LIGHT_REPORT_STABLE_MS = 800;
 static const uint32_t LIGHT_REPORT_BOOT_GRACE_MS = 5000;
+static const uint32_t BRIGHTNESS_REPORT_MIN_INTERVAL_MS = 2500;
+static const uint32_t BRIGHTNESS_CHANGE_STABLE_MS = 2500;
+static const uint32_t LIGHT_PEAK_STABLE_MS = 2500;
 static const uint32_t ORIENTATION_STABLE_MS = 700;
 static const uint32_t PICKUP_REST_MIN_MS = 900;
 static const uint32_t PICKUP_SEQUENCE_WINDOW_MS = 1600;
@@ -29,6 +34,11 @@ static const uint32_t PUTDOWN_WITH_EVIDENCE_STABLE_MS = 900;
 static const uint32_t PUTDOWN_SOUND_WINDOW_MS = 900;
 static const uint32_t PUTDOWN_EVIDENCE_WINDOW_MS = 1600;
 static const uint32_t MIC_ASSIST_WINDOW_MS = 1800;
+static const uint32_t LED_BREATH_PERIOD_MS = 2400;
+static const uint32_t LED_SLOW_FLASH_PERIOD_MS = 1600;
+static const uint32_t LED_FAST_FLASH_PERIOD_MS = 400;
+static const uint32_t LED_TMUX_NOTIFY_MS = 600000;
+static const uint32_t LED_TMUX_DOUBLE_FLASH_PERIOD_MS = 3000;
 static const float PICKUP_DELTA_G = 0.10f;
 static const float PICKUP_START_DELTA_G = 0.16f;
 static const float PICKUP_CONFIRM_DELTA_G = 0.08f;
@@ -39,7 +49,7 @@ static const float PUTDOWN_DELTA_WITH_EVIDENCE_G = 0.085f;
 static const float G_CHANGE_DELTA = 0.14f;
 static const float FREEFALL_G = 0.35f;
 static const float IMPACT_G = 1.85f;
-static const float PUTDOWN_IMPACT_G = 1.35f;
+static const float PUTDOWN_IMPACT_G = 1.20f;
 static const float ORIENTATION_AXIS_G = 0.72f;
 static const float STAND_MIN_Y_G = 0.35f;
 static const float STAND_MIN_Z_G = 0.35f;
@@ -51,24 +61,31 @@ static const uint8_t VEML7700_ADDR = 0x10;
 static const uint8_t VEML7700_REG_ALS_CONF = 0x00;
 static const uint8_t VEML7700_REG_ALS_DATA = 0x04;
 static const uint16_t VEML7700_ALS_CONF = 0x0000;  // gain x1, 100 ms integration, ALS on.
+static const uint8_t WS2812_BRIGHTNESS = 24;
 static const float VEML7700_LUX_PER_COUNT = 0.0576f;
 static const uint32_t LIGHT_SAMPLE_INTERVAL_MS = 1000;
-static const float LIGHT_SMOOTH_ALPHA = 0.35f;
+static const float LIGHT_SMOOTH_ALPHA = 0.18f;
 static const float LIGHT_REPORT_SMALL_DELTA_LUX = 6.0f;
 static const float LIGHT_REPORT_LARGE_RATIO = 0.45f;
 static const float LIGHT_PEAK_RATIO = 1.20f;
+static const float LIGHT_SPIKE_RATIO = 3.5f;
 static const char *POSE_CALIBRATION_FILE = "/uconsole_pose.txt";
 
 static uint32_t last_sample_ms = 0;
 static uint32_t last_heartbeat_ms = 0;
 static uint32_t last_light_sample_ms = 0;
 static uint32_t last_light_report_ms = 0;
+static uint32_t last_brightness_report_ms = 0;
+static uint32_t brightness_candidate_since = 0;
 static uint32_t light_report_candidate_since = 0;
+static uint32_t light_spike_candidate_since = 0;
 static uint32_t orientation_candidate_since = 0;
 static uint32_t pickup_sequence_since = 0;
 static uint32_t pickup_confirm_since = 0;
 static uint32_t putdown_candidate_since = 0;
 static uint32_t putdown_evidence_until = 0;
+static uint32_t lock_timeout_ms = 0;
+static uint32_t lock_still_since = 0;
 static uint32_t still_since = 0;
 static bool imu_ready = false;
 static bool mic_ready = false;
@@ -78,7 +95,18 @@ static bool light_ready = false;
 static bool motion_active = false;
 static bool host_screen_on = true;
 static bool stream_samples = false;
+static bool stand_mode_enabled = false;
+static bool lock_ready_sent = false;
+static bool host_power_ac = false;
+static bool led_battery_enabled = true;
+static bool led_notify_enabled = true;
+static bool led_night_mode_enabled = true;
+static bool tmux_notify_active = false;
+static int battery_percent = -1;
 static String device_state = "held";
+static String battery_status = "unknown";
+static uint32_t tmux_notify_until = 0;
+static uint32_t last_led_color = 0;
 
 static String stable_orientation = "unknown";
 static String resting_orientation = "unknown";
@@ -102,6 +130,11 @@ static float light_lux = 0.0f;
 static float smoothed_light_lux = 0.0f;
 static float last_reported_light_lux = -1.0f;
 static float light_report_candidate_lux = 0.0f;
+static float light_spike_candidate_lux = 0.0f;
+static int current_screen_brightness = 0;
+static int current_keyboard_brightness = 0;
+static int last_reported_screen_brightness = 0;
+static int brightness_candidate = 0;
 static bool light_sample_valid = false;
 static bool have_smoothed_light = false;
 static bool storage_ready = false;
@@ -118,6 +151,87 @@ struct Sample {
 };
 
 static void print_status(const char *event_name, const Sample &sample);
+static float relative_delta(float a, float b);
+static void update_brightness_targets();
+
+static uint32_t pixel_color(uint8_t red, uint8_t green, uint8_t blue) {
+  return status_pixel.Color(red, green, blue);
+}
+
+static void set_status_pixel(uint32_t color) {
+  if (color == last_led_color) {
+    return;
+  }
+  last_led_color = color;
+  status_pixel.setPixelColor(0, color);
+  status_pixel.show();
+}
+
+static uint8_t scale_channel(uint8_t value, uint8_t brightness) {
+  return (uint16_t)value * brightness / 255;
+}
+
+static uint32_t scaled_color(uint8_t red, uint8_t green, uint8_t blue, uint8_t brightness) {
+  return pixel_color(scale_channel(red, brightness), scale_channel(green, brightness), scale_channel(blue, brightness));
+}
+
+static uint8_t triangle_brightness(uint32_t now, uint32_t period_ms, uint8_t max_brightness) {
+  const uint32_t phase = now % period_ms;
+  const uint32_t half = period_ms / 2;
+  uint32_t value = phase < half ? phase : period_ms - phase;
+  return (uint32_t)max_brightness * value / half;
+}
+
+static bool flash_on(uint32_t now, uint32_t period_ms, uint32_t on_ms) {
+  return now % period_ms < on_ms;
+}
+
+static bool double_flash_on(uint32_t now) {
+  const uint32_t phase = now % LED_TMUX_DOUBLE_FLASH_PERIOD_MS;
+  return phase < 120 || (phase >= 260 && phase < 380);
+}
+
+static uint32_t battery_gradient_color(int percent, uint8_t brightness) {
+  percent = constrain(percent, 0, 100);
+  if (percent < 50) {
+    uint8_t green = (uint32_t)percent * 170 / 50;
+    return scaled_color(255, green, 0, brightness);
+  }
+  uint8_t red = (uint32_t)(100 - percent) * 255 / 50;
+  uint8_t green = 170 + (uint32_t)(percent - 50) * 85 / 50;
+  return scaled_color(red, green, 0, brightness);
+}
+
+static void update_status_pixel() {
+  const uint32_t now = millis();
+  if (tmux_notify_active && now > tmux_notify_until) {
+    tmux_notify_active = false;
+  }
+  if (led_night_mode_enabled && light_ready && light_lux < 1.0f) {
+    set_status_pixel(0);
+    return;
+  }
+
+  const bool battery_known = battery_percent >= 0;
+  const bool charging = battery_status == "charging";
+  const bool full = battery_status == "full" || (charging && battery_known && battery_percent >= 100);
+  const bool discharging = !charging && !full;
+
+  if (led_battery_enabled && discharging && battery_known && battery_percent < 8) {
+    set_status_pixel(flash_on(now, LED_FAST_FLASH_PERIOD_MS, LED_FAST_FLASH_PERIOD_MS / 2) ? scaled_color(255, 0, 0, WS2812_BRIGHTNESS) : 0);
+  } else if (led_battery_enabled && discharging && battery_known && battery_percent < 15) {
+    set_status_pixel(flash_on(now, LED_SLOW_FLASH_PERIOD_MS, LED_SLOW_FLASH_PERIOD_MS / 2) ? scaled_color(255, 0, 0, WS2812_BRIGHTNESS) : 0);
+  } else if (led_notify_enabled && tmux_notify_active) {
+    set_status_pixel(double_flash_on(now) ? scaled_color(120, 0, 255, WS2812_BRIGHTNESS) : 0);
+  } else if (led_battery_enabled && charging && battery_known && battery_percent < 100) {
+    uint8_t brightness = triangle_brightness(now, LED_BREATH_PERIOD_MS, WS2812_BRIGHTNESS);
+    set_status_pixel(battery_gradient_color(battery_percent, brightness));
+  } else if (led_battery_enabled && host_power_ac && (full || (battery_known && battery_percent >= 100))) {
+    set_status_pixel(scaled_color(0, 255, 64, WS2812_BRIGHTNESS));
+  } else {
+    set_status_pixel(0);
+  }
+}
 
 static bool valid_orientation_name(const String &name) {
   return name == "face_up" ||
@@ -287,14 +401,97 @@ static void update_light_sensor(bool force) {
     smoothed_light_lux = light_lux;
     have_smoothed_light = true;
   } else {
+    const float spike_ratio = relative_delta(light_lux, smoothed_light_lux);
+    if (spike_ratio >= LIGHT_SPIKE_RATIO) {
+      if (fabsf(light_lux - light_spike_candidate_lux) > max(6.0f, smoothed_light_lux * 0.25f)) {
+        light_spike_candidate_lux = light_lux;
+        light_spike_candidate_since = now;
+      }
+      if (now - light_spike_candidate_since < LIGHT_PEAK_STABLE_MS) {
+        light_sample_valid = true;
+        update_brightness_targets();
+        return;
+      }
+    } else {
+      light_spike_candidate_since = 0;
+    }
     smoothed_light_lux += LIGHT_SMOOTH_ALPHA * (light_lux - smoothed_light_lux);
   }
   light_sample_valid = true;
+  update_brightness_targets();
 }
 
 static float relative_delta(float a, float b) {
   const float base = max(max(a, b), 1.0f);
   return fabsf(a - b) / base;
+}
+
+static int classify_screen_brightness(float lux) {
+  if (lux < 2.0f) return 1;
+  if (lux < 5.0f) return 2;
+  if (lux < 9.0f) return 3;
+  if (lux < 30.0f) return 4;
+  if (lux < 120.0f) return 5;
+  if (lux < 220.0f) return 6;
+  if (lux < 420.0f) return 7;
+  if (lux < 900.0f) return 8;
+  return 9;
+}
+
+static int keyboard_brightness_for_screen(int screen_brightness) {
+  if (screen_brightness <= 1) return 1;
+  if (screen_brightness <= 4) return 2;
+  return 0;
+}
+
+static void update_brightness_targets() {
+  if (!light_ready || !light_sample_valid || !have_smoothed_light) {
+    return;
+  }
+  const int target = classify_screen_brightness(smoothed_light_lux);
+  if (current_screen_brightness <= 0) {
+    current_screen_brightness = target;
+  } else if (target > current_screen_brightness) {
+    current_screen_brightness++;
+  } else if (target < current_screen_brightness) {
+    current_screen_brightness--;
+  }
+  current_keyboard_brightness = keyboard_brightness_for_screen(current_screen_brightness);
+}
+
+static bool maybe_report_brightness_change(const Sample &sample, uint32_t now) {
+  if (!host_screen_on && !stream_samples) {
+    return false;
+  }
+  if (current_screen_brightness <= 0) {
+    return false;
+  }
+  if (last_reported_screen_brightness <= 0) {
+    last_reported_screen_brightness = current_screen_brightness;
+    return false;
+  }
+  if (current_screen_brightness == last_reported_screen_brightness) {
+    brightness_candidate = 0;
+    brightness_candidate_since = 0;
+    return false;
+  }
+  if (brightness_candidate != current_screen_brightness) {
+    brightness_candidate = current_screen_brightness;
+    brightness_candidate_since = now;
+    return false;
+  }
+  if (now - brightness_candidate_since < BRIGHTNESS_CHANGE_STABLE_MS) {
+    return false;
+  }
+  if (now - last_brightness_report_ms < BRIGHTNESS_REPORT_MIN_INTERVAL_MS) {
+    return false;
+  }
+  last_reported_screen_brightness = current_screen_brightness;
+  last_brightness_report_ms = now;
+  brightness_candidate = 0;
+  brightness_candidate_since = 0;
+  print_status("brightness_changed", sample);
+  return true;
 }
 
 static bool maybe_report_light_change(const Sample &sample, uint32_t now) {
@@ -400,6 +597,24 @@ static bool stand_still_candidate(const Sample &sample) {
          fabsf(sample.g - 1.0f) <= STAND_MAX_G_CHANGE;
 }
 
+static bool lock_pose_allowed() {
+  return stable_orientation == "face_up" ||
+         stable_orientation == "face_down" ||
+         stable_orientation == "left_edge" ||
+         stable_orientation == "right_edge" ||
+         stable_orientation == "top_edge" ||
+         stable_orientation == "bottom_edge" ||
+         stable_orientation == "tilted";
+}
+
+static bool lock_still_candidate(const Sample &sample) {
+  return !motion_active &&
+         device_state == "put_down" &&
+         lock_pose_allowed() &&
+         sample.delta <= PUTDOWN_DELTA_WITH_EVIDENCE_G &&
+         fabsf(sample.g - 1.0f) <= G_CHANGE_DELTA;
+}
+
 static void update_device_state(const Sample &sample) {
   if (motion_active) {
     device_state = "held";
@@ -441,6 +656,11 @@ static void reset_pickup_sequence() {
   pickup_confirm_since = 0;
 }
 
+static void reset_lock_timer() {
+  lock_still_since = 0;
+  lock_ready_sent = false;
+}
+
 static String classify_orientation(const Sample &sample, bool allow_stand) {
   if (allow_stand && stand_still_candidate(sample)) {
     return "stand";
@@ -479,7 +699,14 @@ static void print_status(const char *event_name, const Sample &sample) {
   Serial.print(motion_active ? "moving" : "still");
   Serial.print("\",\"screen\":\"");
   Serial.print(host_screen_on ? "on" : "off");
-  Serial.print("\",\"g\":");
+  Serial.print("\",\"lock\":{\"timeout\":");
+  Serial.print(lock_timeout_ms / 1000);
+  Serial.print(",\"still_for\":");
+  Serial.print(lock_still_since > 0 ? (millis() - lock_still_since) / 1000.0f : 0.0f, 1);
+  Serial.print(",\"ready\":");
+  Serial.print(lock_ready_sent ? "true" : "false");
+  Serial.print("}");
+  Serial.print(",\"g\":");
   Serial.print(sample.g, 4);
   Serial.print(",\"delta\":");
   Serial.print(sample.delta, 4);
@@ -504,6 +731,10 @@ static void print_status(const char *event_name, const Sample &sample) {
   Serial.print(light_lux, 2);
   Serial.print(",\"smoothed_lux\":");
   Serial.print(smoothed_light_lux, 2);
+  Serial.print(",\"screen\":");
+  Serial.print(current_screen_brightness);
+  Serial.print(",\"keyboard\":");
+  Serial.print(current_keyboard_brightness);
   Serial.print("}");
   Serial.print(",\"accel\":{\"x\":");
   Serial.print(sample.ax, 4);
@@ -554,10 +785,75 @@ static void handle_command(const Sample &sample) {
     print_status("stream_off", sample);
   } else if (command == "screen off" || command == "display off") {
     host_screen_on = false;
+    reset_lock_timer();
     print_status("screen_off_ack", sample);
   } else if (command == "screen on" || command == "display on") {
     host_screen_on = true;
+    reset_lock_timer();
     print_status("screen_on_ack", sample);
+  } else if (command.startsWith("lock timeout ")) {
+    int seconds = command.substring(13).toInt();
+    if (seconds < 0) {
+      seconds = 0;
+    }
+    lock_timeout_ms = (uint32_t)seconds * 1000UL;
+    reset_lock_timer();
+    print_status("lock_timeout_ack", sample);
+  } else if (command == "stand mode on") {
+    stand_mode_enabled = true;
+    reset_lock_timer();
+    print_status("stand_mode_on", sample);
+  } else if (command == "stand mode off") {
+    stand_mode_enabled = false;
+    reset_lock_timer();
+    print_status("stand_mode_off", sample);
+  } else if (command == "power ac") {
+    host_power_ac = true;
+    print_status("power_ac_ack", sample);
+  } else if (command == "power battery") {
+    host_power_ac = false;
+    print_status("power_battery_ack", sample);
+  } else if (command.startsWith("battery ")) {
+    int first_space = command.indexOf(' ');
+    int second_space = command.indexOf(' ', first_space + 1);
+    String percent_text = second_space > 0 ? command.substring(first_space + 1, second_space) : command.substring(first_space + 1);
+    int percent = percent_text.toInt();
+    battery_percent = constrain(percent, 0, 100);
+    battery_status = second_space > 0 ? command.substring(second_space + 1) : "unknown";
+    if (battery_status != "charging" && battery_status != "discharging" && battery_status != "full") {
+      battery_status = "unknown";
+    }
+    print_status("battery_ack", sample);
+  } else if (command == "led battery on") {
+    led_battery_enabled = true;
+    print_status("led_battery_on", sample);
+  } else if (command == "led battery off") {
+    led_battery_enabled = false;
+    print_status("led_battery_off", sample);
+  } else if (command == "led notify on") {
+    led_notify_enabled = true;
+    print_status("led_notify_on", sample);
+  } else if (command == "led notify off") {
+    led_notify_enabled = false;
+    tmux_notify_active = false;
+    tmux_notify_until = 0;
+    print_status("led_notify_off", sample);
+  } else if (command == "led night on") {
+    led_night_mode_enabled = true;
+    print_status("led_night_on", sample);
+  } else if (command == "led night off") {
+    led_night_mode_enabled = false;
+    print_status("led_night_off", sample);
+  } else if (command == "notify tmux") {
+    if (led_notify_enabled) {
+      tmux_notify_active = true;
+      tmux_notify_until = millis() + LED_TMUX_NOTIFY_MS;
+    }
+    print_status("notify_tmux_ack", sample);
+  } else if (command == "notify clear") {
+    tmux_notify_active = false;
+    tmux_notify_until = 0;
+    print_status("notify_clear_ack", sample);
   } else if (command == "mic assist on") {
     mic_assist_enabled = true;
     print_status("mic_assist_on", sample);
@@ -567,7 +863,7 @@ static void handle_command(const Sample &sample) {
     update_mic_power(millis());
     print_status("mic_assist_off", sample);
   } else if (command == "help") {
-    Serial.println("{\"commands\":[\"status\",\"sample\",\"calibrate pose\",\"screen on\",\"screen off\",\"mic assist on\",\"mic assist off\",\"stream on\",\"stream off\",\"help\"]}");
+    Serial.println("{\"commands\":[\"status\",\"sample\",\"calibrate pose\",\"screen on\",\"screen off\",\"lock timeout <seconds>\",\"stand mode on\",\"stand mode off\",\"power ac\",\"power battery\",\"battery <percent> <charging|discharging|full>\",\"led battery on\",\"led battery off\",\"led notify on\",\"led notify off\",\"led night on\",\"led night off\",\"notify tmux\",\"notify clear\",\"mic assist on\",\"mic assist off\",\"stream on\",\"stream off\",\"help\"]}");
   }
 }
 
@@ -583,6 +879,9 @@ static uint32_t heartbeat_interval(uint32_t now) {
 
 void setup() {
   Serial.begin(115200);
+  status_pixel.begin();
+  status_pixel.setBrightness(WS2812_BRIGHTNESS);
+  set_status_pixel(pixel_color(0, 0, 16));
 
   // Do not block on Serial. The GUI may open the port after boot.
   delay(300);
@@ -628,7 +927,9 @@ void loop() {
   update_mic_state();
   update_light_sensor(false);
   handle_command(sample);
+  maybe_report_brightness_change(sample, now);
   maybe_report_light_change(sample, now);
+  update_status_pixel();
 
   if (stream_samples) {
     print_status("sample", sample);
@@ -636,6 +937,7 @@ void loop() {
   }
 
   if (sample.g < FREEFALL_G) {
+    reset_lock_timer();
     print_status("freefall", sample);
     return;
   }
@@ -643,6 +945,7 @@ void loop() {
     if (motion_active) {
       mark_putdown_evidence(now);
     }
+    reset_lock_timer();
     print_status("impact", sample);
     return;
   }
@@ -682,7 +985,6 @@ void loop() {
                                  sample.delta <= PUTDOWN_DELTA_WITH_EVIDENCE_G &&
                                  fabsf(sample.g - 1.0f) <= G_CHANGE_DELTA &&
                                  stable_orientation != "tilted";
-  const uint32_t required_putdown_stable_ms = PUTDOWN_WITH_EVIDENCE_STABLE_MS;
 
   if (!motion_active) {
     putdown_candidate_since = 0;
@@ -702,6 +1004,7 @@ void loop() {
       } else if (now - pickup_confirm_since >= PICKUP_CONFIRM_MS) {
         motion_active = true;
         device_state = "held";
+        reset_lock_timer();
         reset_pickup_sequence();
         mic_assist_until = 0;
         update_mic_power(now);
@@ -717,18 +1020,30 @@ void loop() {
     if (putdown_candidate) {
       if (putdown_candidate_since == 0) {
         putdown_candidate_since = now;
-      } else if (now - putdown_candidate_since >= required_putdown_stable_ms) {
+      } else if (now - putdown_candidate_since >= PUTDOWN_WITH_EVIDENCE_STABLE_MS) {
         motion_active = false;
         resting_orientation = stable_orientation;
         still_since = now;
         putdown_candidate_since = 0;
         putdown_evidence_until = 0;
         device_state = "put_down";
+        reset_lock_timer();
         print_status("state_changed", sample);
       }
     } else {
       putdown_candidate_since = 0;
     }
+  }
+
+  if (lock_timeout_ms > 0 && host_screen_on && lock_still_candidate(sample)) {
+    if (lock_still_since == 0) {
+      lock_still_since = now;
+    } else if (!lock_ready_sent && now - lock_still_since >= lock_timeout_ms) {
+      lock_ready_sent = true;
+      print_status("lock_ready", sample);
+    }
+  } else if (!lock_ready_sent) {
+    lock_still_since = 0;
   }
 
   if (now - last_heartbeat_ms >= heartbeat_interval(now)) {

@@ -236,7 +236,7 @@ int main(int argc, char **argv) {
 
   g_signal_connect(window, "destroy", G_CALLBACK(gtk_main_quit), NULL);
   refresh_label(state);
-  g_timeout_add(120, refresh_label, state);
+  g_timeout_add(40, refresh_label, state);
 
   gtk_widget_show_all(window);
   if (state->last_fraction < 0.0) {

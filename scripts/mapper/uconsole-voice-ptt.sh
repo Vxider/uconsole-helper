@@ -65,14 +65,14 @@ Supported variables:
   ASR_CORRECTION_MODE
                          off | on | auto, default: auto
   ASR_NO_PROXY       1 disables proxy for ASR requests, default: 1
-  ASR_TIMEOUT        ASR request timeout in seconds, default: 60; 0 disables
+  ASR_TIMEOUT        ASR request timeout in seconds, default: 90; 0 disables
   ASR_REQUEST_ATTEMPT_TIMEOUT / ASR_CONNECT_TIMEOUT / ASR_RETRY_COUNT / ASR_RETRY_DELAY
                       HTTP finalize/upload retry knobs used by the stream client
   ASR_PREVIEW_WS_URL Qwen ASR streaming websocket URL; derived from ASR_URL when empty
   ASR_FINALIZE_TEXT_URL
                       endpoint for finalizing streaming text; derived from ASR_URL when empty
   ASR_PREVIEW_FINAL_WAIT_SECONDS
-                      seconds to wait for Qwen streaming final after stop, default: 2.5
+                      seconds to wait for Qwen streaming final after stop, default: 1.5
   VOICE_OUTPUT_MODE      type | type_enter | clipboard | paste | fcitx_commit, default: type
   VOICE_TMUX_OUTPUT_MODE output mode used when a tmux/terminal window is focused, default: type
   VOICE_WECHAT_OUTPUT_MODE
@@ -100,7 +100,9 @@ Supported variables:
   VOICE_NOTIFY_WHILE_PREVIEW
                         1 keeps the system recording notification even when preview is enabled, default: 0
   VOICE_STREAM_SEND_INTERVAL_MS
-                        local recorder read interval, default: 250
+                        local recorder read interval, default: 50
+  VOICE_STREAM_NOTIFY_FROM_READER
+                        1 updates the preview popup from websocket reader events, default: 1
   VOICE_NOTIFY_USE_MARKUP
                          1 enables Pango markup for notifications, default: 0
   VOICE_NOTIFY_FONT_SIZE notification font size when markup is enabled, default: 22
@@ -295,6 +297,31 @@ show_recording_status() {
   if command -v notify-send >/dev/null 2>&1; then
     notify-send "uconsole voice" "${body}" >/dev/null 2>&1 || true
   fi
+}
+
+start_popup_watchdog() {
+  local recorder_pid=$1
+  local script_path=$2
+  local popup_pid=
+
+  popup_pid=$(recording_popup_pid || true)
+  [[ -n "${popup_pid}" ]] || return 0
+  (
+    while [[ -f "${STATE_FILE}" ]]; do
+      if ! kill -0 "${popup_pid}" >/dev/null 2>&1; then
+        if [[ -f "${STATE_FILE}" ]]; then
+          # shellcheck disable=SC1090
+          source "${STATE_FILE}"
+          if [[ "${RECORDER_PID:-}" == "${recorder_pid}" ]]; then
+            VOICE_SUPPRESS_ASR_STATUS=1 "${script_path}" cancel "窗口已关闭"
+          fi
+        fi
+        break
+      fi
+      sleep 0.2
+    done
+  ) >/dev/null 2>&1 &
+  printf '%s\n' "$!"
 }
 
 escape_markup() {
@@ -520,6 +547,16 @@ close_recording_popup_instances() {
   terminate_matching_processes "uconsole-asr-popup .*${escaped_text_file}" KILL 1
 }
 
+recording_popup_pid() {
+  local popup_pid_file="${VOICE_STATE_DIR}/voice-recording-popup.pid"
+  local popup_pid=
+
+  [[ -f "${popup_pid_file}" ]] || return 1
+  popup_pid=$(cat "${popup_pid_file}" 2>/dev/null || true)
+  [[ -n "${popup_pid}" ]] || return 1
+  printf '%s\n' "${popup_pid}"
+}
+
 write_recording_popup_text() {
   local message=$1
   local popup_text_file="${VOICE_STATE_DIR}/voice-recording-popup.txt"
@@ -549,6 +586,7 @@ stop_existing_recording_session() {
   local STREAM_STOP_FILE=
   local STREAM_RESULT_FILE=
   local WATCHDOG_PID=
+  local POPUP_WATCH_PID=
 
   # shellcheck disable=SC1090
   source "${STATE_FILE}"
@@ -556,6 +594,9 @@ stop_existing_recording_session() {
 
   if [[ -n "${WATCHDOG_PID:-}" && "${WATCHDOG_PID}" != "$$" ]]; then
     kill "${WATCHDOG_PID}" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${POPUP_WATCH_PID:-}" && "${POPUP_WATCH_PID}" != "$$" ]]; then
+    kill "${POPUP_WATCH_PID}" >/dev/null 2>&1 || true
   fi
   if [[ -n "${STREAM_STOP_FILE:-}" ]]; then
     : >"${STREAM_STOP_FILE}" || true
@@ -819,6 +860,12 @@ start_recording() {
   context_text=$(build_whisper_context || true)
   prompt_glossary_json=$(build_prompt_glossary_json || true)
 
+  local script_path=${BASH_SOURCE[0]}
+  if [[ "${script_path}" != */* ]]; then
+    script_path=$(command -v -- "${script_path}" || printf '%s' "${script_path}")
+  fi
+  script_path=$(readlink -f -- "${script_path}" 2>/dev/null || printf '%s' "${script_path}")
+
   local stream_client stream_result_file stream_stop_file stream_log_file
   stream_client=$(resolve_stream_client)
   stream_result_file=$(mktemp "${VOICE_STATE_DIR}/voice-stream-XXXXXX.json")
@@ -874,6 +921,7 @@ start_recording() {
     VOICE_STREAM_PREVIEW="${VOICE_STREAM_PREVIEW}" \
     VOICE_QWEN_ASR_STREAMING="${VOICE_QWEN_ASR_STREAMING}" \
     VOICE_STREAM_SEND_INTERVAL_MS="${VOICE_STREAM_SEND_INTERVAL_MS}" \
+    VOICE_STREAM_NOTIFY_FROM_READER="${VOICE_STREAM_NOTIFY_FROM_READER}" \
     VOICE_MAX_RECORD_MS="${VOICE_MAX_RECORD_MS}" \
     setsid ${stream_python:+"${stream_python}"} "${stream_client}" >/dev/null 2>&1 &
 
@@ -889,13 +937,14 @@ STARTED_AT_MS=$(date +%s%3N)
 EOF
   log_ptt "recording state written pid=${recorder_pid} state=${STATE_FILE}"
 
+  local popup_watch_pid=
+  popup_watch_pid=$(start_popup_watchdog "${recorder_pid}" "${script_path}" || true)
+  if [[ -n "${popup_watch_pid}" ]]; then
+    printf 'POPUP_WATCH_PID=%s\n' "${popup_watch_pid}" >>"${STATE_FILE}"
+  fi
+
   if (( VOICE_MAX_RECORD_MS > 0 )); then
     local watchdog_sleep_s=$(((VOICE_MAX_RECORD_MS + 999) / 1000))
-    local script_path=${BASH_SOURCE[0]}
-    if [[ "${script_path}" != */* ]]; then
-      script_path=$(command -v -- "${script_path}" || printf '%s' "${script_path}")
-    fi
-    script_path=$(readlink -f -- "${script_path}" 2>/dev/null || printf '%s' "${script_path}")
     (
       sleep "${watchdog_sleep_s}"
       if [[ -f "${STATE_FILE}" ]]; then
@@ -986,6 +1035,9 @@ stop_recording() {
 
   if [[ -n "${WATCHDOG_PID:-}" && "${WATCHDOG_PID}" != "$$" ]]; then
     kill "${WATCHDOG_PID}" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${POPUP_WATCH_PID:-}" && "${POPUP_WATCH_PID}" != "$$" ]]; then
+    kill "${POPUP_WATCH_PID}" >/dev/null 2>&1 || true
   fi
 
   if [[ -z "${RECORDER_PID:-}" ]]; then
@@ -1105,6 +1157,13 @@ cancel_recording() {
   rm -f "${STATE_FILE}"
   close_recording_status
 
+  if [[ -n "${WATCHDOG_PID:-}" && "${WATCHDOG_PID}" != "$$" ]]; then
+    kill "${WATCHDOG_PID}" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${POPUP_WATCH_PID:-}" && "${POPUP_WATCH_PID}" != "$$" ]]; then
+    kill "${POPUP_WATCH_PID}" >/dev/null 2>&1 || true
+  fi
+
   if [[ -n "${STREAM_STOP_FILE:-}" ]]; then
     : >"${STREAM_STOP_FILE}" || true
   fi
@@ -1178,19 +1237,20 @@ if [[ -z "${ASR_CORRECTION_MODE}" ]]; then
   ASR_CORRECTION_MODE=auto
 fi
 ASR_NO_PROXY=${ASR_NO_PROXY:-1}
-ASR_TIMEOUT=${ASR_TIMEOUT:-60}
-ASR_REQUEST_ATTEMPT_TIMEOUT=${ASR_REQUEST_ATTEMPT_TIMEOUT:-8}
+ASR_TIMEOUT=${ASR_TIMEOUT:-90}
+ASR_REQUEST_ATTEMPT_TIMEOUT=${ASR_REQUEST_ATTEMPT_TIMEOUT:-75}
 ASR_CONNECT_TIMEOUT=${ASR_CONNECT_TIMEOUT:-2}
-ASR_RETRY_COUNT=${ASR_RETRY_COUNT:-3}
+ASR_RETRY_COUNT=${ASR_RETRY_COUNT:-1}
 ASR_RETRY_DELAY=${ASR_RETRY_DELAY:-0.35}
 ASR_PREVIEW_WS_URL=${ASR_PREVIEW_WS_URL:-}
 ASR_FINALIZE_TEXT_URL=${ASR_FINALIZE_TEXT_URL:-}
-ASR_PREVIEW_FINAL_WAIT_SECONDS=${ASR_PREVIEW_FINAL_WAIT_SECONDS:-2.5}
+ASR_PREVIEW_FINAL_WAIT_SECONDS=${ASR_PREVIEW_FINAL_WAIT_SECONDS:-1.5}
 ASR_PREVIEW_WS_TIMEOUT=${ASR_PREVIEW_WS_TIMEOUT:-2}
 VOICE_STREAM_PREVIEW=${VOICE_STREAM_PREVIEW:-1}
 VOICE_QWEN_ASR_STREAMING=${VOICE_QWEN_ASR_STREAMING:-1}
 VOICE_NOTIFY_WHILE_PREVIEW=${VOICE_NOTIFY_WHILE_PREVIEW:-0}
-VOICE_STREAM_SEND_INTERVAL_MS=${VOICE_STREAM_SEND_INTERVAL_MS:-100}
+VOICE_STREAM_SEND_INTERVAL_MS=${VOICE_STREAM_SEND_INTERVAL_MS:-50}
+VOICE_STREAM_NOTIFY_FROM_READER=${VOICE_STREAM_NOTIFY_FROM_READER:-1}
 
 case "${ACTION}" in
   start)
@@ -1200,7 +1260,7 @@ case "${ACTION}" in
     stop_recording
     ;;
   cancel)
-    cancel_recording
+    cancel_recording "${2:-已取消}"
     ;;
   *)
     echo "unknown action: ${ACTION}" >&2

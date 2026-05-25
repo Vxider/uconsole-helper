@@ -150,6 +150,8 @@ class McuTelemetrySample:
     temperature: float | None = None
     light_lux: float | None = None
     light_raw: int | None = None
+    light_screen: int | None = None
+    light_keyboard: int | None = None
     light_ready: bool = False
     source: str = "serial"
     firmware_state: str = ""
@@ -217,6 +219,7 @@ class McuTelemetryState:
     last_event: str
     last_motion: str
     last_error: str
+    serial_waiting: bool
     last_status_requested_at: float
     smoothed_light_lux: float | None
     suggested_backlight: int | None
@@ -231,6 +234,7 @@ class McuTelemetryState:
         self.last_event = "等待样本"
         self.last_motion = "-"
         self.last_error = ""
+        self.serial_waiting = False
         self.last_status_requested_at = 0.0
         self.smoothed_light_lux = None
         self.suggested_backlight = None
@@ -301,6 +305,14 @@ class UConsoleHelperWindow(Gtk.Window):
         self.mcu_mic_assist_switch.set_active(True)
         self.mcu_mic_assist_switch.connect("notify::active", self.on_mcu_mic_assist_changed)
         self.mcu_mic_assist_updating = False
+        self.mcu_led_controls: dict[str, Gtk.Switch] = {
+            "MCU_LED_BATTERY_ENABLED": Gtk.Switch(),
+            "MCU_LED_LXTERMINAL_BELL_ENABLED": Gtk.Switch(),
+            "MCU_LED_NIGHT_MODE_ENABLED": Gtk.Switch(),
+        }
+        for switch in self.mcu_led_controls.values():
+            switch.connect("notify::active", self.on_mcu_led_config_changed)
+        self.mcu_led_config_updating = False
 
         self.message_label = Gtk.Label(label="", xalign=0)
         self.dhcp_card: Gtk.Widget | None = None
@@ -322,6 +334,11 @@ class UConsoleHelperWindow(Gtk.Window):
         self.tailscale_store = Gtk.ListStore(str, str, str, str, str, str, str, str, str, str)
         self.tailscale_summary_label = Gtk.Label(label="", xalign=0)
         self.tailscale_summary_label.get_style_context().add_class("muted")
+        self.tailscale_netcheck_label = Gtk.Label(label="", xalign=0)
+        self.tailscale_netcheck_label.get_style_context().add_class("muted")
+        self.tailscale_netcheck_value_labels: dict[str, Gtk.Label] = {}
+        self.tailscale_netcheck_running = False
+        self.tailscale_netcheck_details: dict[str, str] = {}
         self.power_labels: dict[str, Gtk.Label] = {}
         self.power_controls: dict[str, Gtk.Widget] = {}
         self.power_control_rows: dict[str, tuple[Gtk.Widget, Gtk.Widget]] = {}
@@ -617,10 +634,35 @@ class UConsoleHelperWindow(Gtk.Window):
 
         summary_card = card_box()
         page.pack_start(summary_card, False, False, 0)
-        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        summary_card.pack_start(header, False, False, 0)
         self.tailscale_summary_label.set_hexpand(True)
-        header.pack_start(self.tailscale_summary_label, True, True, 0)
+        self.tailscale_summary_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.tailscale_summary_label.set_single_line_mode(True)
+        summary_card.pack_start(self.tailscale_summary_label, False, False, 0)
+
+        netcheck_grid = Gtk.Grid(column_spacing=14, row_spacing=6)
+        netcheck_grid.set_margin_top(8)
+        summary_card.pack_start(netcheck_grid, False, False, 0)
+        netcheck_rows = [
+            ("udp", "UDP"),
+            ("ipv4", "IPv4"),
+            ("ipv6", "IPv6"),
+            ("derp", "DERP"),
+            ("nat", "NAT"),
+            ("portmap", "Portmap"),
+            ("global", "Global"),
+            ("portal", "Portal"),
+        ]
+        for index, (key, title) in enumerate(netcheck_rows):
+            column = (index % 4) * 2
+            row = index // 4
+            title_label = Gtk.Label(label=title, xalign=0)
+            title_label.get_style_context().add_class("muted")
+            value_label = Gtk.Label(label="-", xalign=0)
+            value_label.set_ellipsize(Pango.EllipsizeMode.END)
+            value_label.set_hexpand(True)
+            self.tailscale_netcheck_value_labels[key] = value_label
+            netcheck_grid.attach(title_label, column, row, 1, 1)
+            netcheck_grid.attach(value_label, column + 1, row, 1, 1)
 
         devices_card = card_box()
         page.pack_start(devices_card, True, True, 0)
@@ -725,10 +767,10 @@ class UConsoleHelperWindow(Gtk.Window):
             auto_brightness = Gtk.Switch()
             self.power_controls[f"POWERSAVER_{profile}_AUTO_BRIGHTNESS"] = auto_brightness
             self._attach_power_control(profile_grid, f"POWERSAVER_{profile}_AUTO_BRIGHTNESS", "Auto Bright", auto_brightness, 6)
-            screen_mode = combo_text_from_values(("Default", "Auto"))
+            screen_mode = Gtk.Switch()
             self.power_controls[f"POWERSAVER_{profile}_SCREEN_MODE"] = screen_mode
-            screen_mode.connect("changed", lambda _combo, value=profile: self.sync_power_screen_mode_visibility(value))
-            self._attach_power_control(profile_grid, f"POWERSAVER_{profile}_SCREEN_MODE", "Screen Mode", screen_mode, 7)
+            screen_mode.connect("notify::active", lambda _switch, _pspec, value=profile: self.sync_power_screen_mode_visibility(value))
+            self._attach_power_control(profile_grid, f"POWERSAVER_{profile}_SCREEN_MODE", "Auto Power Save", screen_mode, 7)
             auto_battery = combo_text_from_values(AUTO_SCREEN_TIMEOUT_OPTIONS)
             self.power_controls[f"POWERSAVER_{profile}_AUTO_BATTERY_PUTDOWN_TIMEOUT_SEC"] = auto_battery
             self._attach_power_control(profile_grid, f"POWERSAVER_{profile}_AUTO_BATTERY_PUTDOWN_TIMEOUT_SEC", "Put Down (Battery)", auto_battery, 8)
@@ -740,10 +782,10 @@ class UConsoleHelperWindow(Gtk.Window):
             self._attach_power_control(
                 profile_grid,
                 f"POWERSAVER_{profile}_STAND_MODE",
-                "Stand Mode",
+                "Bypass Stand",
                 stand_mode,
                 10,
-                tooltip="支架状态不自动熄屏，拿起仍会唤醒。",
+                tooltip="Bypass put-down lock while the device is in stand pose.",
             )
 
         self.load_power_policy_controls()
@@ -872,6 +914,29 @@ class UConsoleHelperWindow(Gtk.Window):
         action_row.pack_start(mic_label, False, False, 0)
         action_row.pack_start(self.mcu_mic_assist_switch, False, False, 0)
 
+        led_card = card_box()
+        page.pack_start(led_card, False, False, 0)
+        led_header = Gtk.Label(label="LED Behavior", xalign=0)
+        led_header.get_style_context().add_class("muted")
+        led_card.pack_start(led_header, False, False, 0)
+        led_grid = Gtk.Grid(column_spacing=14, row_spacing=10)
+        led_grid.set_margin_top(8)
+        led_card.pack_start(led_grid, False, False, 0)
+        led_rows = [
+            ("MCU_LED_BATTERY_ENABLED", "Battery", "Show low battery, charging, and full status."),
+            ("MCU_LED_LXTERMINAL_BELL_ENABLED", "LXTerminal Bell", "Flash on terminal bell from local shells, SSH, or remote tmux."),
+            ("MCU_LED_NIGHT_MODE_ENABLED", "Night Mode", "Turn off LED indicators when ambient light is below 1 lux."),
+        ]
+        for row, (key, title, tooltip) in enumerate(led_rows):
+            label = Gtk.Label(label=title, xalign=0)
+            label.get_style_context().add_class("muted")
+            label.set_tooltip_text(tooltip)
+            switch = self.mcu_led_controls[key]
+            switch.set_tooltip_text(tooltip)
+            led_grid.attach(label, 0, row, 1, 1)
+            led_grid.attach(switch, 1, row, 1, 1)
+
+        self.load_mcu_led_controls()
         self.mcu_page_ready = True
         return page
 
@@ -942,6 +1007,10 @@ class UConsoleHelperWindow(Gtk.Window):
 
         self.asr_controls["ASR_URL"] = Gtk.Entry()
         config_box.pack_start(asr_control_row("Endpoint", self.asr_controls["ASR_URL"]), False, False, 0)
+        self.asr_controls["ASR_FINALIZE_TEXT_URL"] = Gtk.Entry()
+        config_box.pack_start(asr_control_row("Finalize Endpoint", self.asr_controls["ASR_FINALIZE_TEXT_URL"]), False, False, 0)
+        self.asr_controls["ASR_PREVIEW_WS_URL"] = Gtk.Entry()
+        config_box.pack_start(asr_control_row("Preview WS", self.asr_controls["ASR_PREVIEW_WS_URL"]), False, False, 0)
         self.asr_controls["ASR_AUTH_TOKEN"] = Gtk.Entry()
         if isinstance(self.asr_controls["ASR_AUTH_TOKEN"], Gtk.Entry):
             self.asr_controls["ASR_AUTH_TOKEN"].set_visibility(False)
@@ -973,26 +1042,42 @@ class UConsoleHelperWindow(Gtk.Window):
             ("type", "paste", "type_enter", "clipboard", "fcitx_commit")
         )
         self._attach_asr_flow_control(options_flow, "Tmux Output", self.asr_controls["VOICE_TMUX_OUTPUT_MODE"])
-        timeout_adjustment = Gtk.Adjustment(value=15, lower=3, upper=300, step_increment=1, page_increment=10, page_size=0)
+        timeout_adjustment = Gtk.Adjustment(value=90, lower=3, upper=300, step_increment=1, page_increment=10, page_size=0)
         timeout_spin = Gtk.SpinButton(adjustment=timeout_adjustment, climb_rate=1, digits=0)
         timeout_spin.set_numeric(True)
+        disable_spin_scroll(timeout_spin)
         self.asr_controls["ASR_TIMEOUT"] = timeout_spin
         self._attach_asr_flow_control(options_flow, "Request Timeout (s)", timeout_spin)
-        attempt_timeout_adjustment = Gtk.Adjustment(value=8, lower=1, upper=60, step_increment=1, page_increment=5, page_size=0)
+        attempt_timeout_adjustment = Gtk.Adjustment(value=75, lower=1, upper=180, step_increment=1, page_increment=5, page_size=0)
         attempt_timeout_spin = Gtk.SpinButton(adjustment=attempt_timeout_adjustment, climb_rate=1, digits=0)
         attempt_timeout_spin.set_numeric(True)
+        disable_spin_scroll(attempt_timeout_spin)
         self.asr_controls["ASR_REQUEST_ATTEMPT_TIMEOUT"] = attempt_timeout_spin
         self._attach_asr_flow_control(options_flow, "Attempt Timeout (s)", attempt_timeout_spin)
         connect_timeout_adjustment = Gtk.Adjustment(value=2.0, lower=0.2, upper=10.0, step_increment=0.1, page_increment=1.0, page_size=0)
         connect_timeout_spin = Gtk.SpinButton(adjustment=connect_timeout_adjustment, climb_rate=0.1, digits=1)
         connect_timeout_spin.set_numeric(True)
+        disable_spin_scroll(connect_timeout_spin)
         self.asr_controls["ASR_CONNECT_TIMEOUT"] = connect_timeout_spin
         self._attach_asr_flow_control(options_flow, "Connect Timeout (s)", connect_timeout_spin)
-        retry_adjustment = Gtk.Adjustment(value=3, lower=1, upper=8, step_increment=1, page_increment=2, page_size=0)
+        retry_adjustment = Gtk.Adjustment(value=1, lower=1, upper=8, step_increment=1, page_increment=2, page_size=0)
         retry_spin = Gtk.SpinButton(adjustment=retry_adjustment, climb_rate=1, digits=0)
         retry_spin.set_numeric(True)
+        disable_spin_scroll(retry_spin)
         self.asr_controls["ASR_RETRY_COUNT"] = retry_spin
         self._attach_asr_flow_control(options_flow, "Retries", retry_spin)
+        final_wait_adjustment = Gtk.Adjustment(value=1.5, lower=0.5, upper=10, step_increment=0.5, page_increment=1, page_size=0)
+        final_wait_spin = Gtk.SpinButton(adjustment=final_wait_adjustment, climb_rate=0.5, digits=1)
+        final_wait_spin.set_numeric(True)
+        disable_spin_scroll(final_wait_spin)
+        self.asr_controls["ASR_PREVIEW_FINAL_WAIT_SECONDS"] = final_wait_spin
+        self._attach_asr_flow_control(options_flow, "Final Wait (s)", final_wait_spin)
+        preview_ws_timeout_adjustment = Gtk.Adjustment(value=2.0, lower=0.2, upper=30.0, step_increment=0.1, page_increment=1.0, page_size=0)
+        preview_ws_timeout_spin = Gtk.SpinButton(adjustment=preview_ws_timeout_adjustment, climb_rate=0.1, digits=1)
+        preview_ws_timeout_spin.set_numeric(True)
+        disable_spin_scroll(preview_ws_timeout_spin)
+        self.asr_controls["ASR_PREVIEW_WS_TIMEOUT"] = preview_ws_timeout_spin
+        self._attach_asr_flow_control(options_flow, "Preview WS Timeout (s)", preview_ws_timeout_spin)
         self.asr_controls["VOICE_PASTE_BACKEND"] = combo_text_from_values(("uinput", "auto", "wtype"))
         self._attach_asr_flow_control(options_flow, "Paste Backend", self.asr_controls["VOICE_PASTE_BACKEND"])
         tmux_context = Gtk.Switch()
@@ -1036,8 +1121,8 @@ class UConsoleHelperWindow(Gtk.Window):
         self.power_control_rows[key] = (label, widget)
 
     def sync_power_screen_mode_visibility(self, profile: str) -> None:
-        mode = widget_text(self.power_controls.get(f"POWERSAVER_{profile}_SCREEN_MODE")).lower()
-        auto = mode == "auto"
+        screen_mode = self.power_controls.get(f"POWERSAVER_{profile}_SCREEN_MODE")
+        auto = isinstance(screen_mode, Gtk.Switch) and screen_mode.get_active()
         visibility = {
             f"POWERSAVER_{profile}_AUTO_BATTERY_PUTDOWN_TIMEOUT_SEC": auto,
             f"POWERSAVER_{profile}_AUTO_AC_PUTDOWN_TIMEOUT_SEC": auto,
@@ -1422,10 +1507,10 @@ class UConsoleHelperWindow(Gtk.Window):
             reconnect_context.remove_class(class_name)
         if page == "lan":
             if self.dhcp_running:
-                set_underlined_button_label(self.tailscale_reconnect_button, "Disable", "E")
+                set_status_underlined_button_label(self.tailscale_reconnect_button, "Disable", "E", "#34c759")
                 reconnect_context.add_class("action-danger")
             else:
-                set_underlined_button_label(self.tailscale_reconnect_button, "DHCP", "D")
+                set_status_underlined_button_label(self.tailscale_reconnect_button, "DHCP", "D", "#8a8f98")
                 reconnect_context.add_class("action-ready")
         elif page == "power":
             enabled = powersaver_enabled()
@@ -1835,9 +1920,12 @@ class UConsoleHelperWindow(Gtk.Window):
         self.tailscale_store.clear()
         if not status:
             self.tailscale_summary_label.set_text("Tailscale status unavailable")
+            self.update_tailscale_netcheck_details({})
             return
 
         self.tailscale_summary_label.set_text(tailscale_network_summary())
+        self.update_tailscale_netcheck_details(self.tailscale_netcheck_details)
+        self.refresh_tailscale_netcheck_async()
         for device in tailscale_devices(status):
             self.tailscale_store.append(
                 [
@@ -1853,6 +1941,28 @@ class UConsoleHelperWindow(Gtk.Window):
                     device["dns"],
                 ]
             )
+
+    def refresh_tailscale_netcheck_async(self) -> None:
+        if self.tailscale_netcheck_running:
+            return
+        self.tailscale_netcheck_running = True
+        thread = threading.Thread(target=self._tailscale_netcheck_worker, daemon=True)
+        thread.start()
+
+    def _tailscale_netcheck_worker(self) -> None:
+        netcheck_details = tailscale_netcheck_details(tailscale_netcheck())
+        GLib.idle_add(self.finish_tailscale_netcheck, netcheck_details)
+
+    def finish_tailscale_netcheck(self, netcheck_details: dict[str, str]) -> bool:
+        self.tailscale_netcheck_running = False
+        self.tailscale_netcheck_details = netcheck_details
+        if self.current_page_name == "tailscale":
+            self.update_tailscale_netcheck_details(netcheck_details)
+        return False
+
+    def update_tailscale_netcheck_details(self, details: dict[str, str]) -> None:
+        for key, label in self.tailscale_netcheck_value_labels.items():
+            label.set_text(details.get(key) or "-")
 
     def reconnect_tailscale(self) -> None:
         if self.tailscale_reconnecting:
@@ -2146,6 +2256,21 @@ class UConsoleHelperWindow(Gtk.Window):
         self.mcu_mic_assist_switch.set_active(snapshot.mic_assist)
         self.mcu_mic_assist_updating = False
 
+    def load_mcu_led_controls(self) -> None:
+        if not hasattr(self, "mcu_led_controls"):
+            return
+        config = helper_service_config()
+        self.mcu_led_config_updating = True
+        for key, switch in self.mcu_led_controls.items():
+            switch.set_active(config.get(key, "1").lower() in {"1", "yes", "true", "on", "enabled"})
+        self.mcu_led_config_updating = False
+
+    def on_mcu_led_config_changed(self, _switch: Gtk.Switch, _pspec: object) -> None:
+        if self.mcu_led_config_updating:
+            return
+        if self.save_power_policy():
+            self.mcu_action_label.set_text("LED behavior updated.")
+
     def hide_inline_panel_after_timeout(self) -> bool:
         self.hide_inline_panel()
         return False
@@ -2268,6 +2393,8 @@ class UConsoleHelperWindow(Gtk.Window):
         self.utils_status_label.set_text(message)
         if error:
             self.show_error("USB2.0 HUB reset failed", error)
+        else:
+            self.show_success_banner("USB2.0 HUB reset", message, timeout_ms=3000)
         return False
 
     def refresh_mapper_status(self) -> None:
@@ -2344,7 +2471,10 @@ class UConsoleHelperWindow(Gtk.Window):
         for key, widget in self.power_controls.items():
             value = config.get(key, "")
             if isinstance(widget, Gtk.Switch):
-                widget.set_active(value.lower() in {"1", "yes", "true", "on", "enabled"})
+                if key.endswith("_SCREEN_MODE"):
+                    widget.set_active(value.lower() == "auto")
+                else:
+                    widget.set_active(value.lower() in {"1", "yes", "true", "on", "enabled"})
             elif isinstance(widget, Gtk.ComboBoxText):
                 if key.endswith("_UNKNOWN_POWER_ACTION"):
                     value = unknown_action_display_value(value)
@@ -2352,8 +2482,6 @@ class UConsoleHelperWindow(Gtk.Window):
                     value = screen_timeout_display_value(value)
                 elif "_AUTO_" in key and key.endswith("_TIMEOUT_SEC"):
                     value = auto_screen_timeout_display_value(value)
-                elif key.endswith("_SCREEN_MODE"):
-                    value = screen_mode_display_value(value)
                 set_combo_text(widget, value)
             elif isinstance(widget, Gtk.Entry):
                 widget.set_text(value)
@@ -2453,7 +2581,7 @@ class UConsoleHelperWindow(Gtk.Window):
             values[ac_screen_key] = screen_timeout_config_value(widget_text(self.power_controls[ac_screen_key]))
             values[unknown_key] = unknown_action_config_value(widget_text(self.power_controls[unknown_key]))
             values[wwan_key] = widget_text(self.power_controls[wwan_key])
-            values[screen_mode_key] = screen_mode_config_value(widget_text(self.power_controls[screen_mode_key]))
+            values[screen_mode_key] = "auto" if self.power_controls[screen_mode_key].get_active() else "default"
             values[auto_brightness_key] = "1" if self.power_controls[auto_brightness_key].get_active() else "0"
             values[stand_mode_key] = "1" if self.power_controls[stand_mode_key].get_active() else "0"
             values[auto_battery_key] = auto_screen_timeout_config_value(widget_text(self.power_controls[auto_battery_key]))
@@ -2471,7 +2599,7 @@ class UConsoleHelperWindow(Gtk.Window):
             if values[wwan_key] not in {"keep", "off", "ondemand"}:
                 raise ValueError(f"{profile.title()} WWAN must be keep, off, or ondemand.")
             if values[screen_mode_key] not in {"default", "auto"}:
-                raise ValueError(f"{profile.title()} Screen Mode must be Default or Auto.")
+                raise ValueError(f"{profile.title()} Auto Power Save must be on or off.")
             for key in (auto_battery_key, auto_ac_key):
                 try:
                     if int(values[key]) < 0:
@@ -2491,6 +2619,12 @@ class UConsoleHelperWindow(Gtk.Window):
         values["POWERSAVER_POWER_SUPPLY_DIR"] = config.get(
             "POWERSAVER_POWER_SUPPLY_DIR", "/sys/class/power_supply"
         )
+        led_controls = getattr(self, "mcu_led_controls", {})
+        for key, switch in led_controls.items():
+            values[key] = "1" if switch.get_active() else "0"
+        values.setdefault("MCU_LED_BATTERY_ENABLED", config.get("MCU_LED_BATTERY_ENABLED", "1"))
+        values.setdefault("MCU_LED_LXTERMINAL_BELL_ENABLED", config.get("MCU_LED_LXTERMINAL_BELL_ENABLED", "1"))
+        values.setdefault("MCU_LED_NIGHT_MODE_ENABLED", config.get("MCU_LED_NIGHT_MODE_ENABLED", "1"))
         return values
 
     def run_systemctl(self, args: list[str], title: str) -> subprocess.CompletedProcess[str]:
@@ -2569,7 +2703,7 @@ class UConsoleHelperWindow(Gtk.Window):
         if result.returncode == 0:
             self.dhcp_running = True
             self.dhcp_interface = config["interface"]
-            self.message_label.set_text(f"DHCP Server 已在 {config['interface']} 上启动。")
+            self.message_label.hide()
             self.refresh_interface_status()
         else:
             self.dhcp_running = False
@@ -2588,7 +2722,7 @@ class UConsoleHelperWindow(Gtk.Window):
         if result.returncode == 0:
             self.dhcp_running = False
             self.dhcp_interface = ""
-            self.message_label.set_text("DHCP Server 已停止。")
+            self.message_label.hide()
             self.refresh_interface_status()
         else:
             self.message_label.set_text("停止失败。")
@@ -2748,6 +2882,12 @@ class UConsoleHelperWindow(Gtk.Window):
         message_label.set_selectable(True)
         self.show_inline_panel(title, [message_label], show_close=True)
 
+    def show_success_banner(self, title: str, message: str, timeout_ms: int = 3000) -> None:
+        message_label = Gtk.Label(label=message, xalign=0)
+        message_label.set_line_wrap(True)
+        self.show_inline_panel(title, [message_label], show_close=False)
+        GLib.timeout_add(timeout_ms, self.hide_inline_panel_after_timeout)
+
     def show_inline_panel(self, title: str, widgets: list[Gtk.Widget], show_close: bool = True) -> None:
         if self.inline_panel_box is None or self.inline_panel_title is None or self.inline_panel_body is None:
             print(title, file=sys.stderr)
@@ -2755,12 +2895,12 @@ class UConsoleHelperWindow(Gtk.Window):
         for child in list(self.inline_panel_body.get_children()):
             self.inline_panel_body.remove(child)
         self.inline_panel_title.set_text(title)
-        if self.inline_panel_close_button is not None:
-            self.inline_panel_close_button.set_visible(show_close)
         for widget in widgets:
             self.inline_panel_body.pack_start(widget, False, False, 0)
         self.inline_panel_box.set_no_show_all(False)
         self.inline_panel_box.show_all()
+        if self.inline_panel_close_button is not None:
+            self.inline_panel_close_button.set_visible(show_close)
         self.inline_panel_box.set_no_show_all(True)
 
     def hide_error(self) -> None:
@@ -2798,6 +2938,10 @@ def asr_control_row(title: str, widget: Gtk.Widget) -> Gtk.Box:
     return box
 
 
+def disable_spin_scroll(spin: Gtk.SpinButton) -> None:
+    spin.connect("scroll-event", lambda _widget, _event: True)
+
+
 def scrolled_page(content: Gtk.Widget) -> Gtk.ScrolledWindow:
     scroll = Gtk.ScrolledWindow()
     scroll.set_hexpand(True)
@@ -2830,6 +2974,16 @@ def set_underlined_button_label(button: Gtk.Button, text: str, key: str) -> None
     if isinstance(child, Gtk.Label):
         child.set_use_markup(True)
         child.set_markup(underlined_markup(text, key))
+    else:
+        button.set_label(text)
+
+
+def set_status_underlined_button_label(button: Gtk.Button, text: str, key: str, color: str) -> None:
+    child = button.get_child()
+    markup = f'<span foreground="{escape(color)}">●</span> {underlined_markup(text, key)}'
+    if isinstance(child, Gtk.Label):
+        child.set_use_markup(True)
+        child.set_markup(markup)
     else:
         button.set_label(text)
 
@@ -3028,17 +3182,11 @@ def screen_timeout_config_value(value: str) -> str:
     }.get(value, value)
 
 
-def screen_mode_display_value(value: str) -> str:
-    return "Auto" if value == "auto" else "Default"
-
-
-def screen_mode_config_value(value: str) -> str:
-    return "auto" if value == "Auto" else "default"
-
-
 def auto_screen_timeout_display_value(value: str) -> str:
     return {
         "-1": "Never",
+        "5": "5s",
+        "10": "10s",
         "15": "15s",
         "30": "30s",
         "60": "1min",
@@ -3053,6 +3201,8 @@ def auto_screen_timeout_display_value(value: str) -> str:
 def auto_screen_timeout_config_value(value: str) -> str:
     return {
         "Never": "-1",
+        "5s": "5",
+        "10s": "10",
         "15s": "15",
         "30s": "30",
         "1min": "60",
@@ -3164,6 +3314,11 @@ def power_policy_config_text(values: dict[str, str]) -> str:
             "",
             "### POWERSAVER_POWER_SUPPLY_DIR --- power_supply sysfs directory",
             f"POWERSAVER_POWER_SUPPLY_DIR={values['POWERSAVER_POWER_SUPPLY_DIR']}",
+            "",
+            "### MCU LED behavior --- [1|0]",
+            f"MCU_LED_BATTERY_ENABLED={values['MCU_LED_BATTERY_ENABLED']}",
+            f"MCU_LED_LXTERMINAL_BELL_ENABLED={values['MCU_LED_LXTERMINAL_BELL_ENABLED']}",
+            f"MCU_LED_NIGHT_MODE_ENABLED={values['MCU_LED_NIGHT_MODE_ENABLED']}",
             "",
         ]
     )
@@ -3827,6 +3982,33 @@ def tailscale_status() -> dict[str, object]:
         return {}
 
 
+def tailscale_netcheck() -> dict[str, object]:
+    if shutil.which("tailscale") is None:
+        return {}
+    try:
+        result = subprocess.run(
+            ["tailscale", "netcheck", "--format=json"],
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {}
+    if result.returncode != 0:
+        return {}
+    output = result.stdout.strip()
+    json_start = output.find("{")
+    json_end = output.rfind("}")
+    if json_start < 0 or json_end < json_start:
+        return {}
+    try:
+        parsed = json.loads(output[json_start : json_end + 1])
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def tailscale_summary(status: dict[str, object]) -> str:
     if not status:
         return "-"
@@ -3989,6 +4171,86 @@ def tailscale_network_summary() -> str:
         connection = device["connection"] or device["type"] or "-"
         return f"Network {name} {connection}"
     return f"Network {route}"
+
+
+def tailscale_netcheck_summary(netcheck: dict[str, object]) -> str:
+    if not netcheck:
+        return ""
+    details = tailscale_netcheck_details(netcheck)
+    parts = [
+        f"UDP {details['udp']}",
+        f"v4 {details['ipv4']}",
+        f"v6 {details['ipv6']}",
+    ]
+    if details["derp"] != "-":
+        parts.append(f"DERP {details['derp']}")
+    parts.append(f"NAT {details['nat']}")
+    parts.append(f"Portmap {details['portmap']}")
+    if details["global"] != "-":
+        parts.append(f"Global {details['global']}")
+    if details["portal"] != "No":
+        parts.append("Captive portal")
+    return "Netcheck " + " / ".join(parts)
+
+
+def tailscale_netcheck_details(netcheck: dict[str, object]) -> dict[str, str]:
+    if not netcheck:
+        return {}
+    details: dict[str, str] = {
+        "udp": "ok" if netcheck.get("UDP") else "blocked",
+        "ipv4": "ok" if netcheck.get("IPv4") else "off",
+        "ipv6": "ok" if netcheck.get("IPv6") else "off",
+        "derp": "-",
+        "nat": "varies" if netcheck.get("MappingVariesByDestIP") else "stable",
+        "portmap": "off",
+        "global": "-",
+        "portal": "Yes" if netcheck.get("CaptivePortal") else "No",
+    }
+
+    preferred_derp = netcheck.get("PreferredDERP")
+    derp_latency = tailscale_derp_latency_ms(netcheck, preferred_derp)
+    if preferred_derp:
+        derp = str(preferred_derp)
+        if derp_latency is not None:
+            derp = f"{derp} {derp_latency:.1f}ms"
+        details["derp"] = derp
+
+    portmap = [name for name in ("UPnP", "PMP", "PCP") if netcheck.get(name)]
+    if portmap:
+        details["portmap"] = "/".join(portmap)
+
+    global_v4 = tailscale_global_address(netcheck.get("GlobalV4"))
+    global_v6 = tailscale_global_address(netcheck.get("GlobalV6"))
+    if global_v4:
+        details["global"] = global_v4
+    elif global_v6:
+        details["global"] = "v6"
+    return details
+
+
+def tailscale_derp_latency_ms(netcheck: dict[str, object], region: object) -> float | None:
+    if not region:
+        return None
+    latencies = netcheck.get("RegionLatency")
+    if not isinstance(latencies, dict):
+        return None
+    latency = latencies.get(str(region))
+    if latency is None:
+        latency = latencies.get(region)
+    if not isinstance(latency, (int, float)):
+        return None
+    return float(latency) / 1_000_000
+
+
+def tailscale_global_address(value: object) -> str:
+    if not value:
+        return ""
+    text = str(value)
+    if text.startswith("[") and "]:" in text:
+        return text[1 : text.find("]")]
+    if text.count(":") == 1:
+        return text.rsplit(":", 1)[0]
+    return text
 
 
 def tailscale_devices(status: dict[str, object]) -> list[dict[str, str]]:
@@ -5005,6 +5267,9 @@ def helper_service_config() -> dict[str, str]:
         "POWERSAVER_AC_SCREEN_TIMEOUT_SEC": "0",
         "POWERSAVER_CPU_POLICY_PATH": "/sys/devices/system/cpu/cpufreq/policy0",
         "POWERSAVER_POWER_SUPPLY_DIR": "/sys/class/power_supply",
+        "MCU_LED_BATTERY_ENABLED": "1",
+        "MCU_LED_LXTERMINAL_BELL_ENABLED": "1",
+        "MCU_LED_NIGHT_MODE_ENABLED": "1",
     }
     if not SERVICE_CONFIG.exists():
         return defaults
@@ -5059,15 +5324,19 @@ def env_config(path: Path, defaults: dict[str, str]) -> dict[str, str]:
 
 def default_asr_config() -> dict[str, str]:
     return {
-        "ASR_URL": "http://127.0.0.1:3300/api/asr/transcriptions",
+        "ASR_URL": "http://dgx-spark.tail97583.ts.net:3300/api/asr/transcriptions",
+        "ASR_FINALIZE_TEXT_URL": "http://dgx-spark.tail97583.ts.net:3300/api/asr/transcriptions/finalize-text",
+        "ASR_PREVIEW_WS_URL": "ws://dgx-spark.tail97583.ts.net:3300/api/asr-preview/ws",
         "ASR_AUTH_TOKEN": "",
         "ASR_LANGUAGE": "zh",
         "ASR_CORRECTION_MODE": "auto",
-        "ASR_TIMEOUT": "15",
-        "ASR_REQUEST_ATTEMPT_TIMEOUT": "8",
+        "ASR_TIMEOUT": "90",
+        "ASR_REQUEST_ATTEMPT_TIMEOUT": "75",
         "ASR_CONNECT_TIMEOUT": "2",
-        "ASR_RETRY_COUNT": "3",
+        "ASR_RETRY_COUNT": "1",
         "ASR_RETRY_DELAY": "0.35",
+        "ASR_PREVIEW_FINAL_WAIT_SECONDS": "1.5",
+        "ASR_PREVIEW_WS_TIMEOUT": "2",
         "VOICE_RECORDER": "arecord",
         "VOICE_INPUT": "default",
         "VOICE_OUTPUT_MODE": "paste",
@@ -5083,12 +5352,17 @@ def asr_config_text(values: dict[str, str]) -> str:
     merged_values.update(values)
     asr_defaults = {
         "VOICE_STREAM_PREVIEW": "1",
-        "VOICE_STREAM_SEND_INTERVAL_MS": "100",
+        "VOICE_STREAM_SEND_INTERVAL_MS": "50",
+        "VOICE_STREAM_NOTIFY_FROM_READER": "1",
     }
     for key, value in asr_defaults.items():
         merged_values.setdefault(key, value)
     lines = [
         "ASR_URL={ASR_URL}",
+        "ASR_PREVIEW_WS_URL={ASR_PREVIEW_WS_URL}",
+        "ASR_FINALIZE_TEXT_URL={ASR_FINALIZE_TEXT_URL}",
+        "ASR_PREVIEW_FINAL_WAIT_SECONDS={ASR_PREVIEW_FINAL_WAIT_SECONDS}",
+        "ASR_PREVIEW_WS_TIMEOUT={ASR_PREVIEW_WS_TIMEOUT}",
         "ASR_LANGUAGE={ASR_LANGUAGE}",
         "ASR_AUTH_TOKEN={ASR_AUTH_TOKEN}",
         "ASR_CORRECTION_MODE={ASR_CORRECTION_MODE}",
@@ -5117,6 +5391,7 @@ def asr_config_text(values: dict[str, str]) -> str:
         "VOICE_TMUX_CONTEXT={VOICE_TMUX_CONTEXT}",
         "VOICE_STREAM_PREVIEW={VOICE_STREAM_PREVIEW}",
         "VOICE_STREAM_SEND_INTERVAL_MS={VOICE_STREAM_SEND_INTERVAL_MS}",
+        "VOICE_STREAM_NOTIFY_FROM_READER={VOICE_STREAM_NOTIFY_FROM_READER}",
         "",
     ]
     emitted_keys = {
@@ -6475,8 +6750,6 @@ def read_mcu_snapshot(state: McuTelemetryState) -> McuStateSnapshot:
     if sample is None:
         if state.samples:
             last_sample = state.samples[-1]
-            no_line_error = f"/dev/{device.tty} 已打开，但没有收到串口行。"
-            last_error = "" if state.last_error == no_line_error else state.last_error
             return McuStateSnapshot(
                 device=device,
                 state=state.last_state or "已连接",
@@ -6494,7 +6767,7 @@ def read_mcu_snapshot(state: McuTelemetryState) -> McuStateSnapshot:
                 light_ready=last_sample.light_ready,
                 last_update=last_sample.timestamp,
                 raw_line=format_sample_line(last_sample),
-                last_error=last_error,
+                last_error=state.last_error,
                 mic_ready=last_sample.mic_ready,
                 mic_enabled=last_sample.mic_enabled,
                 mic_assist=last_sample.mic_assist,
@@ -6503,12 +6776,12 @@ def read_mcu_snapshot(state: McuTelemetryState) -> McuStateSnapshot:
                 recent_rows=recent_rows_from_samples(state.samples),
             )
         state.last_state = "已连接"
-        state.last_event = state.last_error or "等待传感器数据"
+        state.last_event = "等待串口数据" if state.serial_waiting else "等待传感器数据"
         state.last_motion = "-"
         return McuStateSnapshot(
             device=device,
             state="已连接",
-            event="等待传感器数据",
+            event=state.last_event,
             motion="-",
             still_for=0.0,
             g_force=0.0,
@@ -6535,7 +6808,11 @@ def read_mcu_snapshot(state: McuTelemetryState) -> McuStateSnapshot:
     motion = mcu_motion_label(sample.firmware_motion)
     event = mcu_event_label(sample.firmware_event)
     current_state = mcu_state_label(sample.firmware_state)
-    update_light_smoothing(state, sample.light_lux)
+    if sample.light_screen is not None:
+        state.smoothed_light_lux = sample.light_lux
+        state.suggested_backlight = max(1, min(9, sample.light_screen))
+    else:
+        update_light_smoothing(state, sample.light_lux)
     state.last_state = current_state
     state.last_event = event
     state.last_motion = motion
@@ -6587,14 +6864,16 @@ def read_xiao_sample(device: McuDeviceInfo, state: McuTelemetryState) -> McuTele
         return None
     line = session.read_line(timeout=0.0)
     if not line:
-        if not state.last_error:
-            state.last_error = f"/dev/{device.tty} 已打开，但没有收到串口行。"
+        state.serial_waiting = True
+        state.last_error = ""
         return None
     sample = parse_mcu_line(line)
     if sample is None:
+        state.serial_waiting = False
         state.last_error = f"无法解析串口行: {line[:80]}"
         return None
     write_shared_mcu_line(line)
+    state.serial_waiting = False
     state.last_error = ""
     return sample
 
@@ -6697,13 +6976,19 @@ def parse_mcu_line(line: str) -> McuTelemetrySample | None:
             light = payload.get("light")
             light_lux = None
             light_raw = None
+            light_screen = None
+            light_keyboard = None
             light_ready = False
             if isinstance(light, dict):
                 lux_value = light.get("lux")
                 raw_value = light.get("raw")
+                screen_value = light.get("screen")
+                keyboard_value = light.get("keyboard")
                 valid = bool(light.get("valid", lux_value is not None))
                 light_lux = float(lux_value) if lux_value is not None and valid else None
                 light_raw = int(raw_value) if raw_value is not None else None
+                light_screen = int(screen_value) if screen_value is not None else None
+                light_keyboard = int(keyboard_value) if keyboard_value is not None else None
                 light_ready = bool(light.get("ready"))
             else:
                 lux_value = payload.get("lux", payload.get("light_lux"))
@@ -6717,6 +7002,8 @@ def parse_mcu_line(line: str) -> McuTelemetrySample | None:
                 temperature,
                 light_lux=light_lux,
                 light_raw=light_raw,
+                light_screen=light_screen,
+                light_keyboard=light_keyboard,
                 light_ready=light_ready,
                 source="json",
                 firmware_state=str(payload.get("state") or ""),

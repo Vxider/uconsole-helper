@@ -26,13 +26,11 @@ CONFIG_POLL_SECONDS = 15
 DISPLAY_STATUS_POLL_SECONDS = 30
 DISPLAY_STATUS_ACTIVE_POLL_SECONDS = 10
 AUTO_MCU_STALE_SECONDS = 20
-AUTO_PICKUP_DELTA_THRESHOLD = 0.045
-AUTO_PICKUP_TILT_DELTA_DEGREES = 5.0
-AUTO_PICKUP_MIN_INTERVAL_SECONDS = 0.5
-AUTO_PICKUP_MOVE_MIN_SECONDS = 0.6
-AUTO_PICKUP_SETTLE_SECONDS = 0.4
-AUTO_PICKUP_MOVE_EXPIRE_SECONDS = 3.0
 AUTO_PICKUP_WAKE_ENABLED = False
+LED_POWER_POLL_SECONDS = 30
+TMUX_NOTIFY_POLL_SECONDS = 5
+TMUX_NOTIFY_MARKER = Path(f"/run/user/{os.getuid()}/uconsole-helper-tmux-notify")
+TMUX_CLEAR_MARKER = Path(f"/run/user/{os.getuid()}/uconsole-helper-tmux-clear")
 LIGHT_LEVELS = (
     (2.0, 1),
     (5.0, 2),
@@ -56,6 +54,14 @@ class McuSerialReader:
         self.path: Path | None = None
         self.buffer = ""
         self.last_shared_sample_mtime = 0.0
+        self.lock_timeout_seconds: int | None = None
+        self.stand_mode: bool | None = None
+        self.led_power_state: str | None = None
+        self.led_battery_state: tuple[int, str] | None = None
+        self.led_battery_enabled: bool | None = None
+        self.led_notify_enabled: bool | None = None
+        self.led_night_mode_enabled: bool | None = None
+        self.pending_commands: list[str] = []
 
     def close(self) -> None:
         if self.fd is not None:
@@ -66,6 +72,13 @@ class McuSerialReader:
         self.fd = None
         self.path = None
         self.buffer = ""
+        self.lock_timeout_seconds = None
+        self.stand_mode = None
+        self.led_power_state = None
+        self.led_battery_state = None
+        self.led_battery_enabled = None
+        self.led_notify_enabled = None
+        self.led_night_mode_enabled = None
 
     def read_sample(self, enabled: bool) -> dict[str, object] | None:
         if not enabled:
@@ -79,6 +92,7 @@ class McuSerialReader:
             self.close()
             self.fd = open_mcu_fd(dev)
             self.path = dev if self.fd is not None else None
+            self.flush_pending_commands()
         if self.fd is None:
             return read_shared_mcu_sample(self)
         sample = read_mcu_sample_from_fd(self.fd, self)
@@ -88,11 +102,61 @@ class McuSerialReader:
 
     def write_command(self, command: str) -> None:
         if self.fd is None:
+            if command not in self.pending_commands:
+                self.pending_commands.append(command)
             return
         try:
             os.write(self.fd, f"{command.strip()}\n".encode("utf-8"))
         except OSError:
             self.close()
+
+    def flush_pending_commands(self) -> None:
+        if self.fd is None:
+            return
+        commands = self.pending_commands
+        self.pending_commands = []
+        for command in commands:
+            self.write_command(command)
+
+    def configure_lock_policy(self, timeout_seconds: int, stand_mode: bool) -> None:
+        if self.fd is None:
+            return
+        if self.lock_timeout_seconds != timeout_seconds:
+            self.write_command(f"lock timeout {timeout_seconds}")
+            self.lock_timeout_seconds = timeout_seconds
+        if self.stand_mode is not stand_mode:
+            self.write_command("stand mode on" if stand_mode else "stand mode off")
+            self.stand_mode = stand_mode
+
+    def configure_led_power(self, power: str, battery: tuple[int, str] | None) -> None:
+        if self.fd is None:
+            return
+        if power in {"ac", "battery"} and self.led_power_state != power:
+            self.write_command(f"power {power}")
+            self.led_power_state = power
+        if battery is not None and self.led_battery_state != battery:
+            percent, status = battery
+            self.write_command(f"battery {percent} {status}")
+            self.led_battery_state = battery
+
+    def configure_led_behavior(self, battery_enabled: bool, notify_enabled: bool, night_mode_enabled: bool) -> None:
+        if self.led_battery_enabled is not battery_enabled:
+            self.write_command("led battery on" if battery_enabled else "led battery off")
+            self.led_battery_enabled = battery_enabled
+        if self.led_notify_enabled is not notify_enabled:
+            self.write_command("led notify on" if notify_enabled else "led notify off")
+            if not notify_enabled:
+                self.write_command("notify clear")
+            self.led_notify_enabled = notify_enabled
+        if self.led_night_mode_enabled is not night_mode_enabled:
+            self.write_command("led night on" if night_mode_enabled else "led night off")
+            self.led_night_mode_enabled = night_mode_enabled
+
+    def notify_tmux(self) -> None:
+        self.write_command("notify tmux")
+
+    def notify_clear(self) -> None:
+        self.write_command("notify clear")
 
 
 class AutoBrightnessState:
@@ -178,6 +242,40 @@ class HostInputMonitor:
         return self.last_active_at
 
 
+class TerminalBellMonitor:
+    def __init__(self) -> None:
+        self.last_poll_at = 0.0
+        self.last_notify_marker_mtime = self.marker_mtime(TMUX_NOTIFY_MARKER)
+        self.last_clear_marker_mtime = self.marker_mtime(TMUX_CLEAR_MARKER)
+
+    def marker_mtime(self, path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    def poll(self, *, enabled: bool) -> tuple[bool, bool] | None:
+        now = time.time()
+        if now - self.last_poll_at < TMUX_NOTIFY_POLL_SECONDS:
+            return None
+        self.last_poll_at = now
+        if not enabled:
+            return None
+        marker_triggered = False
+        marker_cleared = False
+        notify_marker_mtime = self.marker_mtime(TMUX_NOTIFY_MARKER)
+        if notify_marker_mtime > self.last_notify_marker_mtime:
+            marker_triggered = True
+            self.last_notify_marker_mtime = notify_marker_mtime
+        clear_marker_mtime = self.marker_mtime(TMUX_CLEAR_MARKER)
+        if clear_marker_mtime > self.last_clear_marker_mtime:
+            marker_cleared = True
+            self.last_clear_marker_mtime = clear_marker_mtime
+        if marker_cleared:
+            return (False, False)
+        return (True, True) if marker_triggered else None
+
+
 class DisplayStateCache:
     def __init__(self) -> None:
         self.off = False
@@ -206,65 +304,6 @@ class DisplayStateCache:
         self.off = True
         self.known = True
         self.last_checked_at = time.time()
-
-
-class AutoMotionState:
-    def __init__(self) -> None:
-        self.last_vector: tuple[float, float, float] | None = None
-        self.last_tilt_deg: float | None = None
-        self.last_pickup_at = 0.0
-        self.last_device_state = ""
-        self.move_started_at: float | None = None
-        self.last_move_at: float | None = None
-        self.waiting_for_settle = False
-
-    def pickup_detected(self, sample: dict[str, object], now: float, motion: str, device_state: str) -> bool:
-        vector = accel_vector(sample)
-        if vector is None:
-            return False
-        tilt = tilt_degrees(vector)
-        previous = self.last_vector
-        previous_tilt = self.last_tilt_deg
-        self.last_vector = vector
-        self.last_tilt_deg = tilt
-        if previous is None or previous_tilt is None:
-            return False
-        delta = sum(abs(vector[index] - previous[index]) for index in range(3))
-        tilt_delta = abs(tilt - previous_tilt)
-        moving_now = (
-            device_state == "held"
-            or motion == "moving"
-            or delta >= AUTO_PICKUP_DELTA_THRESHOLD
-            or tilt_delta >= AUTO_PICKUP_TILT_DELTA_DEGREES
-        )
-        if moving_now:
-            if self.move_started_at is None or (
-                self.last_move_at is not None and now - self.last_move_at > AUTO_PICKUP_MOVE_EXPIRE_SECONDS
-            ):
-                self.move_started_at = now
-                self.waiting_for_settle = False
-            self.last_move_at = now
-            if now - self.move_started_at >= AUTO_PICKUP_MOVE_MIN_SECONDS:
-                self.waiting_for_settle = True
-            return False
-
-        if self.waiting_for_settle and self.last_move_at is not None and now - self.last_move_at >= AUTO_PICKUP_SETTLE_SECONDS:
-            self.move_started_at = None
-            self.last_move_at = None
-            self.waiting_for_settle = False
-            if now - self.last_pickup_at < AUTO_PICKUP_MIN_INTERVAL_SECONDS:
-                return False
-            self.last_pickup_at = now
-            return True
-
-        if self.last_move_at is not None and now - self.last_move_at > AUTO_PICKUP_MOVE_EXPIRE_SECONDS:
-            self.move_started_at = None
-            self.last_move_at = None
-            self.waiting_for_settle = False
-            return False
-        if now - self.last_pickup_at < AUTO_PICKUP_MIN_INTERVAL_SECONDS:
-            return False
-        return False
 
 
 def run_display_control(*args: str) -> subprocess.CompletedProcess[str] | None:
@@ -431,6 +470,26 @@ def power_state(power_supply_dir: Path = POWER_SUPPLY_DIR) -> str:
     return "unknown"
 
 
+def battery_led_state(power_supply_dir: Path = POWER_SUPPLY_DIR) -> tuple[int, str] | None:
+    for path in sorted(power_supply_dir.iterdir()) if power_supply_dir.is_dir() else []:
+        if read_text(path / "type") != "Battery" or not power_supply_present(path):
+            continue
+        capacity_text = read_text(path / "capacity")
+        try:
+            percent = max(0, min(100, int(float(capacity_text))))
+        except ValueError:
+            continue
+        raw_status = read_text(path / "status").lower()
+        if raw_status == "full" or percent >= 100:
+            status = "full"
+        elif raw_status == "charging":
+            status = "charging"
+        else:
+            status = "discharging"
+        return percent, status
+    return None
+
+
 def timeout_for_state(values: dict[str, str], state: str) -> int:
     fallback = values.get("POWERSAVER_SCREEN_TIMEOUT_SEC", "0")
     mode = values.get("POWERSAVER_MODE", "balanced").upper()
@@ -474,6 +533,11 @@ def auto_brightness_enabled(values: dict[str, str]) -> bool:
 
 def stand_mode_enabled(values: dict[str, str]) -> bool:
     value = values.get(f"POWERSAVER_{current_profile(values)}_STAND_MODE", "0").lower()
+    return value in {"1", "yes", "true", "on", "enabled"}
+
+
+def config_enabled(values: dict[str, str], key: str, default: str = "1") -> bool:
+    value = values.get(key, default).lower()
     return value in {"1", "yes", "true", "on", "enabled"}
 
 
@@ -590,30 +654,22 @@ def lux_from_sample(sample: dict[str, object]) -> float | None:
         return None
 
 
-def accel_vector(sample: dict[str, object]) -> tuple[float, float, float] | None:
-    accel = sample.get("accel")
+def brightness_targets_from_sample(sample: dict[str, object]) -> tuple[int | None, int | None]:
+    light = sample.get("light")
+    if not isinstance(light, dict):
+        return None, None
+    if not bool(light.get("valid", True)):
+        return None, None
     try:
-        if isinstance(accel, dict):
-            return (
-                float(accel.get("x", accel.get("ax"))),
-                float(accel.get("y", accel.get("ay"))),
-                float(accel.get("z", accel.get("az"))),
-            )
-        if isinstance(accel, (list, tuple)) and len(accel) >= 3:
-            return (float(accel[0]), float(accel[1]), float(accel[2]))
+        screen = int(light["screen"]) if light.get("screen") is not None else None
+        keyboard = int(light["keyboard"]) if light.get("keyboard") is not None else None
     except (TypeError, ValueError):
-        return None
-    return None
-
-
-def tilt_degrees(vector: tuple[float, float, float]) -> float:
-    ax, ay, az = vector
-    horizontal = (ay * ay + az * az) ** 0.5
-    if horizontal <= 0:
-        return 0.0
-    import math
-
-    return abs(math.degrees(math.atan2(ax, horizontal)))
+        return None, None
+    if screen is not None:
+        screen = max(1, min(9, screen))
+    if keyboard is not None:
+        keyboard = max(0, min(2, keyboard))
+    return screen, keyboard
 
 
 def classify_light_level(lux: float) -> int:
@@ -673,86 +729,52 @@ def auto_screen_tick(
     sample: dict[str, object] | None,
     last_active_at: float,
     last_sample_at: float | None,
-    putdown_since: float | None,
     host_last_active_at: float,
     display_off_now: bool,
-    motion_state: AutoMotionState,
-) -> tuple[float, float | None, float | None, bool | None]:
+) -> tuple[float, float | None, bool | None]:
     now = time.time()
     if sample is None:
         if host_last_active_at > last_active_at:
             last_active_at = host_last_active_at
-            putdown_since = None
         if last_sample_at is None or now - last_sample_at > AUTO_MCU_STALE_SECONDS:
             last_active_at = now
-            putdown_since = None
-        return last_active_at, last_sample_at, putdown_since, None
+        return last_active_at, last_sample_at, None
 
     last_sample_at = now
     event = str(sample.get("event") or "")
     motion = str(sample.get("motion") or "")
-    pose = str(sample.get("pose") or "")
     device_state = str(sample.get("state") or "")
 
-    if device_state != "put_down" and host_last_active_at > last_active_at:
+    if host_last_active_at > last_active_at:
         last_active_at = host_last_active_at
-        putdown_since = None
 
-    pickup_detected = motion_state.pickup_detected(sample, now, motion, device_state)
-    moving = (
-        device_state == "held"
-        or (device_state != "put_down" and pickup_detected)
-    )
-    if moving:
+    if event == "screen_wake_intent":
         last_active_at = now
-        putdown_since = None
         if display_off_now:
             if not AUTO_PICKUP_WAKE_ENABLED:
                 print(
                     f"auto pickup detected: wake disabled state={device_state} event={event} "
-                    f"motion={motion} pickup={int(pickup_detected)}",
+                    f"motion={motion}",
                     flush=True,
                 )
-                return last_active_at, last_sample_at, putdown_since, None
+                return last_active_at, last_sample_at, None
             if display_on():
                 print(
                     f"auto screen on: state={device_state} event={event} "
-                    f"motion={motion} pickup={int(pickup_detected)}",
+                    f"motion={motion}",
                     flush=True,
                 )
-                return last_active_at, last_sample_at, putdown_since, False
-        return last_active_at, last_sample_at, putdown_since, None
+                return last_active_at, last_sample_at, False
+        return last_active_at, last_sample_at, None
 
-    if device_state == "stand" and stand_mode_enabled(values):
-        putdown_since = None
-        return last_active_at, last_sample_at, putdown_since, None
-
-    motion_state.last_device_state = device_state
-    if device_state == "put_down" and putdown_since is None:
-        putdown_since = now
+    if event == "lock_ready" and not display_off_now:
         print(
-            f"auto putdown timer start: state={device_state} pose={pose} motion={motion} event={event}",
-            flush=True,
-        )
-
-    if putdown_since is None:
-        return last_active_at, last_sample_at, putdown_since, None
-
-    timeout_sec = auto_timeout_for_state(values, state, pose)
-    if timeout_sec < 0:
-        return last_active_at, last_sample_at, putdown_since, None
-    if timeout_sec == 0:
-        return last_active_at, last_sample_at, putdown_since, None
-    if now - putdown_since >= timeout_sec and not display_off_now:
-        print(
-            f"auto screen off: state={device_state} pose={pose} motion={motion} event={event} "
-            f"timeout={timeout_sec}s putdown={int(now - putdown_since)}s",
+            f"auto screen off: state={device_state} motion={motion} event={event}",
             flush=True,
         )
         if display_off():
-            putdown_since = None
-            return last_active_at, last_sample_at, putdown_since, True
-    return last_active_at, last_sample_at, putdown_since, None
+            return last_active_at, last_sample_at, True
+    return last_active_at, last_sample_at, None
 
 
 def maybe_apply_auto_brightness(
@@ -763,21 +785,27 @@ def maybe_apply_auto_brightness(
 ) -> None:
     if sample is None or not auto_brightness_enabled(values) or display_off_now:
         return
-    state.smoothed_lux, suggested = update_light_smoothing(
-        state.smoothed_lux,
-        state.current_backlight,
-        lux_from_sample(sample),
-    )
+    light = sample.get("light")
+    has_mcu_brightness = isinstance(light, dict) and light.get("screen") is not None
+    suggested, keyboard_level = brightness_targets_from_sample(sample)
+    if suggested is None:
+        state.smoothed_lux, suggested = update_light_smoothing(
+            state.smoothed_lux,
+            state.current_backlight,
+            lux_from_sample(sample),
+        )
+        keyboard_level = keyboard_backlight_level(suggested) if suggested is not None else None
     if suggested is None or suggested == state.current_backlight:
         return
-    if state.current_backlight is not None:
+    if keyboard_level is None:
+        keyboard_level = keyboard_backlight_level(suggested)
+    if state.current_backlight is not None and not has_mcu_brightness:
         delta = abs(suggested - state.current_backlight)
         is_extreme = suggested in {1, 9}
         if delta > 1 and not is_extreme:
             step = 2 if delta >= 3 else 1
             suggested = state.current_backlight + (step if suggested > state.current_backlight else -step)
     display_brightness(suggested)
-    keyboard_level = keyboard_backlight_level(suggested)
     current_keyboard_level = read_keyboard_backlight()
     if current_keyboard_level != keyboard_level:
         set_keyboard_backlight(keyboard_level)
@@ -793,13 +821,14 @@ def main() -> int:
     last_display_off: bool | None = None
     auto_last_active_at = time.time()
     auto_last_sample_at: float | None = None
-    auto_putdown_since: float | None = None
-    auto_motion_state = AutoMotionState()
     auto_brightness_state = AutoBrightnessState()
     mcu_reader = McuSerialReader()
     host_input = HostInputMonitor()
+    terminal_bell_monitor = TerminalBellMonitor()
     display_cache = DisplayStateCache()
     reported_display_off: bool | None = None
+    last_led_power_update = 0.0
+    tmux_notify_active: bool | None = None
     values = load_config()
     state = power_state(Path(values.get("POWERSAVER_POWER_SUPPLY_DIR", str(POWER_SUPPLY_DIR))))
     last_config_check = 0.0
@@ -819,9 +848,26 @@ def main() -> int:
             state = power_state(Path(values.get("POWERSAVER_POWER_SUPPLY_DIR", str(POWER_SUPPLY_DIR))))
             last_config_check = now
         screen_mode = screen_mode_for_profile(values)
-        needs_mcu_sample = screen_mode == "auto" or auto_brightness_enabled(values)
+        needs_mcu_sample = True
         host_last_active_at = host_input.poll()
         sample = mcu_reader.read_sample(needs_mcu_sample)
+        battery_led_enabled = config_enabled(values, "MCU_LED_BATTERY_ENABLED", "1")
+        notify_led_enabled = config_enabled(values, "MCU_LED_LXTERMINAL_BELL_ENABLED", "1")
+        night_mode_enabled = config_enabled(values, "MCU_LED_NIGHT_MODE_ENABLED", "1")
+        mcu_reader.configure_led_behavior(battery_led_enabled, notify_led_enabled, night_mode_enabled)
+        if battery_led_enabled and now - last_led_power_update >= LED_POWER_POLL_SECONDS:
+            power_for_led = state if state in {"ac", "battery"} else "battery"
+            battery_for_led = battery_led_state(Path(values.get("POWERSAVER_POWER_SUPPLY_DIR", str(POWER_SUPPLY_DIR))))
+            mcu_reader.configure_led_power(power_for_led, battery_for_led)
+            last_led_power_update = now
+        tmux_state = terminal_bell_monitor.poll(enabled=notify_led_enabled)
+        if tmux_state is not None:
+            tmux_triggered, tmux_active = tmux_state
+            if tmux_triggered:
+                mcu_reader.notify_tmux()
+            elif tmux_notify_active is not False and not tmux_active:
+                mcu_reader.notify_clear()
+            tmux_notify_active = tmux_active
         timeout_sec = timeout_for_state(values, state)
         status_interval = DISPLAY_STATUS_POLL_SECONDS
         was_display_off = display_cache.get(interval=status_interval)
@@ -833,7 +879,6 @@ def main() -> int:
         restore_display_off = was_display_off or (power_state_changed and last_display_off is True)
         if screen_mode_changed:
             auto_last_active_at = time.time()
-            auto_putdown_since = None
         if timeout_sec != active_timeout or screen_mode_changed or (process is not None and process.poll() is not None):
             stop_process(process, suppress_resume=restore_display_off)
             process = start_swayidle(timeout_sec)
@@ -852,23 +897,28 @@ def main() -> int:
             was_display_off,
         )
         if screen_mode == "auto":
-            auto_last_active_at, auto_last_sample_at, auto_putdown_since, new_display_off = auto_screen_tick(
+            mcu_reader.configure_lock_policy(
+                max(0, auto_timeout_for_state(values, state, "")),
+                state == "ac" and stand_mode_enabled(values),
+            )
+            auto_last_active_at, auto_last_sample_at, new_display_off = auto_screen_tick(
                 values,
                 state,
                 sample,
                 auto_last_active_at,
                 auto_last_sample_at,
-                auto_putdown_since,
                 host_last_active_at,
                 was_display_off,
-                auto_motion_state,
             )
-            if new_display_off is True:
-                display_cache.mark_off()
-                was_display_off = True
-            elif new_display_off is False:
-                display_cache.mark_on()
-                was_display_off = False
+        else:
+            mcu_reader.configure_lock_policy(0, state == "ac" and stand_mode_enabled(values))
+            new_display_off = None
+        if new_display_off is True:
+            display_cache.mark_off()
+            was_display_off = True
+        elif new_display_off is False:
+            display_cache.mark_on()
+            was_display_off = False
         active_power_state = state
         active_screen_mode = screen_mode
         last_display_off = was_display_off

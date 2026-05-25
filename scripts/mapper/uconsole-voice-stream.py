@@ -12,6 +12,7 @@ import ssl
 import struct
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -116,6 +117,12 @@ def resolve_finalize_text_url() -> str:
     return urllib.parse.urlunparse(parsed._replace(path=path, params="", query="", fragment=""))
 
 
+def should_fallback_to_audio_after_finalize_error(exc: Exception) -> bool:
+    if isinstance(exc, urllib.error.HTTPError):
+        return 400 <= int(exc.code) < 500
+    return False
+
+
 def resolve_asr_preview_ws_url() -> str:
     explicit = str(os.environ.get("ASR_PREVIEW_WS_URL", "")).strip()
     if explicit:
@@ -145,7 +152,18 @@ def notify_text(value: str, *, progress: int = 50, notify_id: str | None = None)
     popup_text_file = os.environ.get("VOICE_RECORDING_POPUP_TEXT_FILE", "").strip()
     if popup_text_file:
         try:
-            Path(popup_text_file).write_text(f"# {text}\n", encoding="utf-8")
+            popup_path = Path(popup_text_file)
+            popup_path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=str(popup_path.parent),
+                prefix=f".{popup_path.name}.",
+                delete=False,
+            ) as handle:
+                handle.write(f"# {text}\n")
+                temp_name = handle.name
+            Path(temp_name).replace(popup_path)
             return
         except Exception as exc:
             append_log(f"recording popup update failed: {type(exc).__name__}: {exc}")
@@ -237,12 +255,19 @@ class QwenAsrStreamingPreview:
         self.sample_rate = sample_rate
         self.channels = channels
         self.timeout = max(0.2, env_float("ASR_PREVIEW_WS_TIMEOUT", 2.0))
-        self.final_wait_seconds = max(0.1, env_float("ASR_PREVIEW_FINAL_WAIT_SECONDS", 2.5))
+        self.final_wait_seconds = max(0.1, env_float("ASR_PREVIEW_FINAL_WAIT_SECONDS", 1.5))
+        self.final_stable_wait_seconds = max(0.02, env_float("ASR_PREVIEW_FINAL_STABLE_WAIT_SECONDS", 0.08))
         self.sock: socket.socket | ssl.SSLSocket | None = None
         self.connected = False
         self.last_text = ""
         self.final_text = ""
         self.done = False
+        self.notify_from_reader = env_bool("VOICE_STREAM_NOTIFY_FROM_READER", True)
+        self.last_notified_text = ""
+        self.reader_stop = threading.Event()
+        self.reader_thread: threading.Thread | None = None
+        self.text_lock = threading.Lock()
+        self.send_lock = threading.Lock()
         if not self.enabled:
             return
         if self.channels != 1:
@@ -251,7 +276,8 @@ class QwenAsrStreamingPreview:
             return
         try:
             self.connect(resolve_asr_preview_ws_url())
-            self.send_json({"type": "start", "sampleRate": self.sample_rate, "channels": self.channels, "format": "s16le"})
+            self.send_json(self.build_start_message())
+            self.start_reader()
             append_log("qwen ASR streaming preview connected")
         except Exception as exc:
             append_log(f"qwen ASR streaming preview unavailable: {type(exc).__name__}: {exc}")
@@ -315,7 +341,10 @@ class QwenAsrStreamingPreview:
             header = struct.pack("!BBQ", 0x80 | opcode, 0x80 | 127, length)
         mask = os.urandom(4)
         masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
-        self.sock.sendall(header + mask + masked)
+        with self.send_lock:
+            if self.sock is None or not self.connected:
+                return
+            self.sock.sendall(header + mask + masked)
 
     def recv_exact(self, size: int) -> bytes:
         if self.sock is None:
@@ -361,6 +390,67 @@ class QwenAsrStreamingPreview:
     def send_json(self, payload: dict[str, object]) -> None:
         self.send_frame(1, json.dumps(payload, ensure_ascii=False).encode("utf-8"))
 
+    def build_start_message(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "type": "start",
+            "sampleRate": self.sample_rate,
+            "channels": self.channels,
+            "format": "s16le",
+            "language": os.environ.get("ASR_LANGUAGE", os.environ.get("VOICE_LANGUAGE", "zh")),
+        }
+        prompt = normalize_text(os.environ.get("ASR_PROMPT", ""))
+        if prompt:
+            payload["prompt"] = prompt
+        prompt_glossary = normalize_text(os.environ.get("ASR_PROMPT_GLOSSARY", ""))
+        if prompt_glossary:
+            payload["promptGlossary"] = prompt_glossary
+            try:
+                parsed = json.loads(prompt_glossary)
+                if isinstance(parsed, dict) and isinstance(parsed.get("terms"), list):
+                    terms = [normalize_text(str(item or "")) for item in parsed.get("terms", [])]
+                    terms = [item for item in terms if item]
+                    if terms:
+                        payload["glossaryTerms"] = terms
+            except Exception as exc:
+                append_log(f"qwen ASR streaming glossary ignored: {type(exc).__name__}: {exc}")
+        context_text = os.environ.get("ASR_CONTEXT_TEXT", "").strip()
+        if context_text:
+            payload["contextText"] = context_text
+        return payload
+
+    def current_text(self) -> str:
+        with self.text_lock:
+            return normalize_text(self.final_text or self.last_text)
+
+    def start_reader(self) -> None:
+        if self.reader_thread is not None:
+            return
+        self.reader_stop.clear()
+        self.reader_thread = threading.Thread(target=self.reader_loop, name="qwen-asr-ws-reader", daemon=True)
+        self.reader_thread.start()
+
+    def reader_loop(self) -> None:
+        while self.connected and not self.reader_stop.is_set() and not self.done:
+            try:
+                frame = self.recv_frame(self.timeout)
+            except Exception as exc:
+                if self.connected and not self.reader_stop.is_set():
+                    append_log(f"qwen ASR streaming reader failed: {type(exc).__name__}: {exc}")
+                break
+            if frame is None:
+                continue
+            opcode, payload = frame
+            if opcode == 1:
+                self.process_message(payload)
+            elif opcode == 8:
+                self.done = True
+                break
+            elif opcode == 9:
+                try:
+                    self.send_frame(10, payload)
+                except Exception:
+                    break
+
     def process_message(self, payload: bytes) -> str:
         try:
             message = json.loads(payload.decode("utf-8", "replace"))
@@ -381,9 +471,16 @@ class QwenAsrStreamingPreview:
         event_type = normalize_text(str(message.get("type") or message.get("event") or "")).lower()
         is_final = bool(message.get("final") or message.get("isFinal") or message.get("done") or event_type in {"final", "segment", "done"})
         if text:
-            self.last_text = text
-            if is_final:
-                self.final_text = text
+            should_notify = False
+            with self.text_lock:
+                self.last_text = text
+                if is_final:
+                    self.final_text = text
+                if self.notify_from_reader and text != self.last_notified_text:
+                    self.last_notified_text = text
+                    should_notify = True
+            if should_notify:
+                notify_text(text, progress=35, notify_id=os.environ.get("VOICE_RECORDING_NOTIFY_ID", "991200"))
         if event_type in {"done", "end", "closed"} or bool(message.get("done")):
             self.done = True
         if message.get("error"):
@@ -419,8 +516,7 @@ class QwenAsrStreamingPreview:
             return ""
         try:
             self.send_frame(2, pcm)
-            text = self.drain(0.001)
-            return text
+            return self.current_text()
         except Exception as exc:
             append_log(f"qwen ASR streaming failed: {type(exc).__name__}: {exc}")
             self.close()
@@ -429,17 +525,34 @@ class QwenAsrStreamingPreview:
 
     def finish(self) -> str:
         if not self.enabled or not self.connected:
-            return normalize_text(self.final_text or self.last_text)
+            return self.current_text()
+        started_at = time.monotonic()
         try:
             self.send_json({"type": "stop"})
-            self.drain(self.final_wait_seconds, idle_timeout=0.1)
+            deadline = started_at + self.final_wait_seconds
+            previous_text = self.current_text()
+            stable_since: float | None = started_at if previous_text else None
+            while time.monotonic() < deadline and not self.done:
+                time.sleep(0.01)
+                current = self.current_text()
+                if current and current == previous_text:
+                    if stable_since is None:
+                        stable_since = time.monotonic()
+                    elif time.monotonic() - stable_since >= self.final_stable_wait_seconds:
+                        break
+                else:
+                    previous_text = current
+                    stable_since = time.monotonic() if current else None
         except Exception as exc:
             append_log(f"qwen ASR streaming final wait failed: {type(exc).__name__}: {exc}")
         finally:
+            elapsed_ms = int((time.monotonic() - started_at) * 1000)
+            append_log(f"qwen ASR streaming final wait done elapsedMs={elapsed_ms} hasText={int(bool(self.current_text()))} done={int(self.done)}")
             self.close()
-        return normalize_text(self.final_text or self.last_text)
+        return self.current_text()
 
     def close(self) -> None:
+        self.reader_stop.set()
         sock = self.sock
         self.sock = None
         self.connected = False
@@ -448,6 +561,13 @@ class QwenAsrStreamingPreview:
                 sock.close()
             except Exception:
                 pass
+        thread = self.reader_thread
+        if thread is not None and thread is not threading.current_thread():
+            try:
+                thread.join(timeout=0.2)
+            except Exception:
+                pass
+        self.reader_thread = None
 
 
 class SegmentingTranscriptionSession:
@@ -457,7 +577,7 @@ class SegmentingTranscriptionSession:
         self.stop_file = Path(os.environ["STREAM_STOP_FILE"])
         self.sample_rate = env_int("VOICE_SAMPLE_RATE", 16000)
         self.channels = env_int("VOICE_CHANNELS", 1)
-        self.chunk_ms = env_int("VOICE_STREAM_SEND_INTERVAL_MS", 100)
+        self.chunk_ms = env_int("VOICE_STREAM_SEND_INTERVAL_MS", 50)
         self.max_record_ms = env_int("VOICE_MAX_RECORD_MS", 60000)
         self.timeout = max(1.0, float(os.environ.get("ASR_TIMEOUT", "60") or 60))
         self.request_attempt_timeout = max(1.0, env_float("ASR_REQUEST_ATTEMPT_TIMEOUT", min(8.0, self.timeout)))
@@ -673,11 +793,7 @@ class SegmentingTranscriptionSession:
             return ""
         payload: dict[str, object] = self.build_fields(self.request_id)
         payload["rawText"] = text
-        try:
-            raw = self.post_json_request(resolve_finalize_text_url(), payload)
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", "replace")
-            raise RuntimeError(f"streaming final text failed: HTTP {exc.code} {detail}") from exc
+        raw = self.post_json_request(resolve_finalize_text_url(), payload)
         final_text, raw_text_result, corrected_text, _applied, response_request_id = extract_transcription_fields(json.loads(raw) if raw else {})
         if is_placeholder_text(final_text):
             return ""
@@ -801,7 +917,8 @@ class SegmentingTranscriptionSession:
                     qwen_preview_text = self.qwen_preview.accept_pcm(data)
                     if qwen_preview_text:
                         self.qwen_preview_text = qwen_preview_text
-                        notify_text(qwen_preview_text, progress=35, notify_id=os.environ.get("VOICE_RECORDING_NOTIFY_ID", "991200"))
+                        if not env_bool("VOICE_STREAM_NOTIFY_FROM_READER", True):
+                            notify_text(qwen_preview_text, progress=35, notify_id=os.environ.get("VOICE_RECORDING_NOTIFY_ID", "991200"))
                 try:
                     if recorder.poll() is None:
                         recorder.terminate()
@@ -819,26 +936,25 @@ class SegmentingTranscriptionSession:
             if qwen_text:
                 self.qwen_preview_text = qwen_text
             preferred_text = normalize_text(qwen_text)
+            finalized_from_stream = False
             if preferred_text:
                 try:
                     finalized_text = self.finalize_streaming_text(preferred_text)
                     if not finalized_text:
-                        self.final_text = preferred_text
-                        self.raw_text = preferred_text
-                        self.corrected_text = ""
                         append_log(
-                            f"streaming final text returned empty; using preview result fallback "
+                            f"streaming final text returned empty; falling back to recorded audio "
                             f"requestId={self.request_id} chars={len(preferred_text)}"
                         )
+                    else:
+                        finalized_from_stream = True
                 except Exception as exc:
-                    self.final_text = preferred_text
-                    self.raw_text = preferred_text
-                    self.corrected_text = ""
+                    fallback_reason = "client_error" if should_fallback_to_audio_after_finalize_error(exc) else "request_error"
                     append_log(
-                        f"streaming final text failed; using preview result fallback "
-                        f"requestId={self.request_id} chars={len(preferred_text)} error={type(exc).__name__}: {exc}"
+                        f"streaming final text failed; falling back to recorded audio "
+                        f"requestId={self.request_id} chars={len(preferred_text)} "
+                        f"reason={fallback_reason} error={type(exc).__name__}: {exc}"
                     )
-            elif recording:
+            if not finalized_from_stream and recording:
                 self.transcribe_segment(bytes(recording), final_segment=True)
             self.write_result(status="ok" if self.final_text else "empty")
             append_log(
