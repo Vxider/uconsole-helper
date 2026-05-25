@@ -25,6 +25,7 @@ POLL_SECONDS = 1
 CONFIG_POLL_SECONDS = 15
 DISPLAY_STATUS_POLL_SECONDS = 30
 DISPLAY_STATUS_ACTIVE_POLL_SECONDS = 10
+DISPLAY_STATUS_OFF_POLL_SECONDS = 2
 AUTO_MCU_STALE_SECONDS = 20
 AUTO_PICKUP_WAKE_ENABLED = False
 LED_POWER_POLL_SECONDS = 30
@@ -869,7 +870,7 @@ def main() -> int:
                 mcu_reader.notify_clear()
             tmux_notify_active = tmux_active
         timeout_sec = timeout_for_state(values, state)
-        status_interval = DISPLAY_STATUS_POLL_SECONDS
+        status_interval = DISPLAY_STATUS_OFF_POLL_SECONDS if display_cache.off else DISPLAY_STATUS_POLL_SECONDS
         was_display_off = display_cache.get(interval=status_interval)
         if needs_mcu_sample and reported_display_off != was_display_off:
             mcu_reader.write_command("screen off" if was_display_off else "screen on")

@@ -102,6 +102,7 @@ static bool led_battery_enabled = true;
 static bool led_notify_enabled = true;
 static bool led_night_mode_enabled = true;
 static bool tmux_notify_active = false;
+static bool force_brightness_report = false;
 static int battery_percent = -1;
 static String device_state = "held";
 static String battery_status = "unknown";
@@ -470,6 +471,15 @@ static bool maybe_report_brightness_change(const Sample &sample, uint32_t now) {
     last_reported_screen_brightness = current_screen_brightness;
     return false;
   }
+  if (force_brightness_report) {
+    force_brightness_report = false;
+    last_reported_screen_brightness = current_screen_brightness;
+    last_brightness_report_ms = now;
+    brightness_candidate = 0;
+    brightness_candidate_since = 0;
+    print_status("brightness_changed", sample);
+    return true;
+  }
   if (current_screen_brightness == last_reported_screen_brightness) {
     brightness_candidate = 0;
     brightness_candidate_since = 0;
@@ -789,6 +799,11 @@ static void handle_command(const Sample &sample) {
     print_status("screen_off_ack", sample);
   } else if (command == "screen on" || command == "display on") {
     host_screen_on = true;
+    force_brightness_report = true;
+    last_light_report_ms = 0;
+    brightness_candidate = 0;
+    brightness_candidate_since = 0;
+    light_report_candidate_since = 0;
     reset_lock_timer();
     print_status("screen_on_ack", sample);
   } else if (command.startsWith("lock timeout ")) {
