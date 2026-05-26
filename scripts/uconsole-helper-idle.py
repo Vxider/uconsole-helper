@@ -33,7 +33,6 @@ LED_POWER_POLL_SECONDS = 30
 TMUX_NOTIFY_POLL_SECONDS = 5
 TMUX_NOTIFY_MARKER = Path(f"/run/user/{os.getuid()}/uconsole-helper-tmux-notify")
 TMUX_CLEAR_MARKER = Path(f"/run/user/{os.getuid()}/uconsole-helper-tmux-clear")
-LAST_KEYBOARD_BACKLIGHT_LEVEL: int | None = None
 INPUT_EVENT_FORMAT = "llHHI"
 INPUT_EVENT_SIZE = struct.calcsize(INPUT_EVENT_FORMAT)
 INPUT_ACTIVITY_TYPES = {1, 2}
@@ -355,10 +354,7 @@ def keyboard_backlight_level(screen_brightness: int) -> int:
 
 
 def set_keyboard_backlight(level: int) -> None:
-    global LAST_KEYBOARD_BACKLIGHT_LEVEL
     if not KEYBOARD_BACKLIGHT_SCRIPT.exists():
-        return
-    if LAST_KEYBOARD_BACKLIGHT_LEVEL == level:
         return
     try:
         result = subprocess.run(
@@ -375,7 +371,6 @@ def set_keyboard_backlight(level: int) -> None:
     if result.returncode != 0:
         print(f"warning: keyboard backlight set failed: {result.stderr.strip()}", flush=True)
         return
-    LAST_KEYBOARD_BACKLIGHT_LEVEL = level
 
 
 def read_keyboard_backlight() -> int | None:
