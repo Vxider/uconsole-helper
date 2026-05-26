@@ -34,18 +34,20 @@ static const uint32_t PUTDOWN_WITH_EVIDENCE_STABLE_MS = 900;
 static const uint32_t PUTDOWN_SOUND_WINDOW_MS = 900;
 static const uint32_t PUTDOWN_EVIDENCE_WINDOW_MS = 1600;
 static const uint32_t MIC_ASSIST_WINDOW_MS = 1800;
-static const uint32_t LED_BREATH_PERIOD_MS = 2400;
+static const uint32_t LED_CHARGING_FLASH_PERIOD_MS = 3000;
+static const uint32_t LED_CHARGING_FLASH_ON_MS = 180;
 static const uint32_t LED_SLOW_FLASH_PERIOD_MS = 1600;
 static const uint32_t LED_FAST_FLASH_PERIOD_MS = 400;
 static const uint32_t LED_TMUX_NOTIFY_MS = 600000;
 static const uint32_t LED_TMUX_DOUBLE_FLASH_PERIOD_MS = 3000;
 static const float PICKUP_DELTA_G = 0.10f;
-static const float PICKUP_START_DELTA_G = 0.16f;
-static const float PICKUP_CONFIRM_DELTA_G = 0.08f;
-static const float PICKUP_GYRO_DPS = 45.0f;
-static const float PICKUP_ORIENTATION_CHANGE_G = 0.22f;
+static const float PICKUP_START_DELTA_G = 0.10f;
+static const float PICKUP_CONFIRM_DELTA_G = 0.045f;
+static const float PICKUP_GYRO_DPS = 25.0f;
+static const float PICKUP_ORIENTATION_CHANGE_G = 0.14f;
 static const float PUTDOWN_DELTA_G = 0.055f;
 static const float PUTDOWN_DELTA_WITH_EVIDENCE_G = 0.085f;
+static const float LOCK_STILL_DELTA_G = 0.040f;
 static const float G_CHANGE_DELTA = 0.14f;
 static const float FREEFALL_G = 0.35f;
 static const float IMPACT_G = 1.85f;
@@ -176,13 +178,6 @@ static uint32_t scaled_color(uint8_t red, uint8_t green, uint8_t blue, uint8_t b
   return pixel_color(scale_channel(red, brightness), scale_channel(green, brightness), scale_channel(blue, brightness));
 }
 
-static uint8_t triangle_brightness(uint32_t now, uint32_t period_ms, uint8_t max_brightness) {
-  const uint32_t phase = now % period_ms;
-  const uint32_t half = period_ms / 2;
-  uint32_t value = phase < half ? phase : period_ms - phase;
-  return (uint32_t)max_brightness * value / half;
-}
-
 static bool flash_on(uint32_t now, uint32_t period_ms, uint32_t on_ms) {
   return now % period_ms < on_ms;
 }
@@ -225,8 +220,11 @@ static void update_status_pixel() {
   } else if (led_notify_enabled && tmux_notify_active) {
     set_status_pixel(double_flash_on(now) ? scaled_color(120, 0, 255, WS2812_BRIGHTNESS) : 0);
   } else if (led_battery_enabled && charging && battery_known && battery_percent < 100) {
-    uint8_t brightness = triangle_brightness(now, LED_BREATH_PERIOD_MS, WS2812_BRIGHTNESS);
-    set_status_pixel(battery_gradient_color(battery_percent, brightness));
+    set_status_pixel(
+      flash_on(now, LED_CHARGING_FLASH_PERIOD_MS, LED_CHARGING_FLASH_ON_MS)
+        ? battery_gradient_color(battery_percent, WS2812_BRIGHTNESS)
+        : 0
+    );
   } else if (led_battery_enabled && host_power_ac && (full || (battery_known && battery_percent >= 100))) {
     set_status_pixel(scaled_color(0, 255, 64, WS2812_BRIGHTNESS));
   } else {
@@ -621,7 +619,7 @@ static bool lock_still_candidate(const Sample &sample) {
   return !motion_active &&
          device_state == "put_down" &&
          lock_pose_allowed() &&
-         sample.delta <= PUTDOWN_DELTA_WITH_EVIDENCE_G &&
+         sample.delta <= LOCK_STILL_DELTA_G &&
          fabsf(sample.g - 1.0f) <= G_CHANGE_DELTA;
 }
 
