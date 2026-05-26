@@ -19,6 +19,7 @@ from pathlib import Path
 CONFIG_FILE = Path(os.environ.get("UCONSOLE_HELPER_CONFIG", "/etc/uconsole-helper/uconsole-helper.conf"))
 POWER_SUPPLY_DIR = Path("/sys/class/power_supply")
 DISPLAY_CONTROL = "/usr/local/bin/uconsole-helper-mapper-display-control"
+DISPLAY_BACKLIGHT_BRIGHTNESS = Path("/sys/class/backlight/backlight@0/brightness")
 KEYBOARD_BACKLIGHT_SCRIPT = Path("~/WorkSpace/uconsole-keyboard/tools/keyboard_state.sh").expanduser()
 MCU_SHARED_SAMPLE_FILE = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "uconsole-helper-mcu-latest.json"
 POLL_SECONDS = 1
@@ -345,8 +346,16 @@ def display_off() -> bool:
     return result is not None and result.returncode == 0
 
 
-def display_brightness(level: int) -> None:
-    run_display_control("brightness", str(level))
+def read_display_brightness() -> int | None:
+    try:
+        return int(DISPLAY_BACKLIGHT_BRIGHTNESS.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def display_brightness(level: int) -> bool:
+    result = run_display_control("brightness", str(level))
+    return result is not None and result.returncode == 0
 
 
 def keyboard_backlight_level(screen_brightness: int) -> int:
@@ -789,28 +798,38 @@ def maybe_apply_auto_brightness(
     light = sample.get("light")
     has_mcu_brightness = isinstance(light, dict) and light.get("screen") is not None
     suggested, keyboard_level = brightness_targets_from_sample(sample)
+    actual_backlight = read_display_brightness()
+    current_backlight = actual_backlight if actual_backlight is not None else state.current_backlight
     if suggested is None:
         state.smoothed_lux, suggested = update_light_smoothing(
             state.smoothed_lux,
-            state.current_backlight,
+            current_backlight,
             lux_from_sample(sample),
         )
         keyboard_level = keyboard_backlight_level(suggested) if suggested is not None else None
-    if suggested is None or suggested == state.current_backlight:
+    if suggested is None:
         return
     if keyboard_level is None:
         keyboard_level = keyboard_backlight_level(suggested)
-    if state.current_backlight is not None and not has_mcu_brightness:
-        delta = abs(suggested - state.current_backlight)
+    if current_backlight is not None and not has_mcu_brightness:
+        delta = abs(suggested - current_backlight)
         is_extreme = suggested in {1, 9}
         if delta > 1 and not is_extreme:
             step = 2 if delta >= 3 else 1
-            suggested = state.current_backlight + (step if suggested > state.current_backlight else -step)
-    display_brightness(suggested)
+            suggested = current_backlight + (step if suggested > current_backlight else -step)
     current_keyboard_level = read_keyboard_backlight()
+    if suggested == current_backlight and current_keyboard_level == keyboard_level:
+        state.current_backlight = suggested
+        return
+    if suggested != current_backlight and not display_brightness(suggested):
+        return
     if current_keyboard_level != keyboard_level:
         set_keyboard_backlight(keyboard_level)
-    print(f"auto brightness: screen={suggested} keyboard={keyboard_level}", flush=True)
+    print(
+        f"auto brightness: screen={suggested} keyboard={keyboard_level} "
+        f"actual={actual_backlight if actual_backlight is not None else '-'}",
+        flush=True,
+    )
     state.current_backlight = suggested
 
 
