@@ -2510,10 +2510,29 @@ class UConsoleHelperWindow(Gtk.Window):
         if mismatched:
             self.show_error("Save policy failed", f"配置写入后校验失败: {mismatched[0]}")
             return False
+        if self.should_enable_wwan_after_policy_save(values):
+            if not self.enable_wwan_radio_after_policy_save():
+                return False
         idle_restart = self.run_user_systemctl(["restart", "uconsole-helper-idle.service"], "Restart idle service")
         if idle_restart.returncode != 0:
             return False
         self.refresh_power_status()
+        return True
+
+    def should_enable_wwan_after_policy_save(self, values: dict[str, str]) -> bool:
+        return any(
+            values.get(f"POWERSAVER_{profile}_WWAN_POLICY") == "keep"
+            for profile in ("ECO", "BALANCED", "PERFORMANCE")
+        )
+
+    def enable_wwan_radio_after_policy_save(self) -> bool:
+        if shutil.which("nmcli") is None:
+            self.show_error("Save policy failed", "WWAN 策略已保存，但找不到 nmcli，无法自动开启 WWAN。")
+            return False
+        result = subprocess.run(["nmcli", "radio", "wwan", "on"], text=True, capture_output=True, check=False)
+        if result.returncode != 0:
+            self.show_error("Save policy failed", combine_output(result) or "WWAN 策略已保存，但自动开启 WWAN 失败。")
+            return False
         return True
 
     def set_power_mode(self, mode: str, persist: bool = True) -> bool:
