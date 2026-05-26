@@ -1483,7 +1483,7 @@ class MapperDaemon:
             LOGGER.debug("lock popup failed: %s", exc)
 
     def _write_lock_popup_text(self) -> None:
-        text = "# Locked\nhold Y to unlock\n"
+        text = "hold Y to unlock\n"
         if self.lock_progress_visible:
             text += f"@progress={self.lock_progress:.3f}\n"
         tmp_path = LOCK_POPUP_TEXT.with_suffix(f"{LOCK_POPUP_TEXT.suffix}.{os.getpid()}.tmp")

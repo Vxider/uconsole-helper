@@ -2,15 +2,18 @@
 from __future__ import annotations
 
 import base64
+import array
 import hashlib
 import json
 import os
+import select
 import shlex
 import signal
 import socket
 import ssl
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -145,28 +148,43 @@ def append_log(message: str) -> None:
         pass
 
 
+def write_popup_text(value: str, *, volume: float | None = None) -> bool:
+    text = normalize_text(value)
+    if not text:
+        return False
+    dismissed_file = os.environ.get("VOICE_RECORDING_POPUP_DISMISSED_FILE", "").strip()
+    if dismissed_file and Path(dismissed_file).exists():
+        return False
+    popup_text_file = os.environ.get("VOICE_RECORDING_POPUP_TEXT_FILE", "").strip()
+    if not popup_text_file:
+        return False
+    try:
+        popup_path = Path(popup_text_file)
+        popup_path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=str(popup_path.parent),
+            prefix=f".{popup_path.name}.",
+            delete=False,
+        ) as handle:
+            handle.write(f"# {text}\n")
+            if volume is not None:
+                handle.write(f"@volume={max(0.0, min(1.0, volume)):.3f}\n")
+            temp_name = handle.name
+        Path(temp_name).replace(popup_path)
+        return True
+    except Exception as exc:
+        append_log(f"recording popup update failed: {type(exc).__name__}: {exc}")
+        return False
+
+
 def notify_text(value: str, *, progress: int = 50, notify_id: str | None = None) -> None:
     text = normalize_text(value)
     if not text:
         return
-    popup_text_file = os.environ.get("VOICE_RECORDING_POPUP_TEXT_FILE", "").strip()
-    if popup_text_file:
-        try:
-            popup_path = Path(popup_text_file)
-            popup_path.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile(
-                "w",
-                encoding="utf-8",
-                dir=str(popup_path.parent),
-                prefix=f".{popup_path.name}.",
-                delete=False,
-            ) as handle:
-                handle.write(f"# {text}\n")
-                temp_name = handle.name
-            Path(temp_name).replace(popup_path)
-            return
-        except Exception as exc:
-            append_log(f"recording popup update failed: {type(exc).__name__}: {exc}")
+    if write_popup_text(text):
+        return
     notify_id = notify_id or os.environ.get("VOICE_NOTIFY_ID", "991199")
     if shutil_which("dunstify"):
         subprocess.run(
@@ -256,7 +274,7 @@ class QwenAsrStreamingPreview:
         self.channels = channels
         self.timeout = max(0.2, env_float("ASR_PREVIEW_WS_TIMEOUT", 2.0))
         self.final_wait_seconds = max(0.1, env_float("ASR_PREVIEW_FINAL_WAIT_SECONDS", 1.5))
-        self.final_stable_wait_seconds = max(0.02, env_float("ASR_PREVIEW_FINAL_STABLE_WAIT_SECONDS", 0.08))
+        self.final_stable_wait_seconds = max(0.1, env_float("ASR_PREVIEW_FINAL_STABLE_WAIT_SECONDS", 0.5))
         self.sock: socket.socket | ssl.SSLSocket | None = None
         self.connected = False
         self.last_text = ""
@@ -538,7 +556,7 @@ class QwenAsrStreamingPreview:
                 if current and current == previous_text:
                     if stable_since is None:
                         stable_since = time.monotonic()
-                    elif time.monotonic() - stable_since >= self.final_stable_wait_seconds:
+                    elif self.final_text and time.monotonic() - stable_since >= self.final_stable_wait_seconds:
                         break
                 else:
                     previous_text = current
@@ -591,11 +609,46 @@ class SegmentingTranscriptionSession:
         self.raw_text = ""
         self.corrected_text = ""
         self.qwen_preview_text = ""
+        self.popup_text = "录音中"
+        self.last_popup_volume_update = 0.0
         self.last_request_id = self.request_id
         self.pending_segment = bytearray()
         self.qwen_preview = QwenAsrStreamingPreview(sample_rate=self.sample_rate, channels=self.channels)
+        self.stop_drain_ms = env_int("VOICE_STOP_DRAIN_MS", 250)
         signal.signal(signal.SIGTERM, self._signal_stop)
         signal.signal(signal.SIGINT, self._signal_stop)
+
+    def pcm_volume(self, data: bytes) -> float:
+        if len(data) < 2:
+            return 0.0
+        usable_length = len(data) - (len(data) % 2)
+        if usable_length <= 0:
+            return 0.0
+        samples = array.array("h")
+        samples.frombytes(data[:usable_length])
+        if sys.byteorder != "little":
+            samples.byteswap()
+        if not samples:
+            return 0.0
+        square_sum = sum(sample * sample for sample in samples)
+        rms = (square_sum / len(samples)) ** 0.5
+        linear = min(1.0, rms / 1800.0)
+        return linear ** 0.55
+
+    def update_recording_popup_volume(self, data: bytes) -> None:
+        popup_text_file = os.environ.get("VOICE_RECORDING_POPUP_TEXT_FILE", "").strip()
+        if not popup_text_file:
+            return
+        dismissed_file = os.environ.get("VOICE_RECORDING_POPUP_DISMISSED_FILE", "").strip()
+        if dismissed_file and Path(dismissed_file).exists():
+            return
+        if self.stop_requested or self.stop_file.exists():
+            return
+        now = time.monotonic()
+        if now - self.last_popup_volume_update < 0.08:
+            return
+        self.last_popup_volume_update = now
+        write_popup_text(self.popup_text, volume=self.pcm_volume(data))
 
     def _signal_stop(self, _signum: int, _frame: object) -> None:
         self.stop_requested = True
@@ -869,6 +922,39 @@ class SegmentingTranscriptionSession:
                 except FileNotFoundError:
                     pass
 
+    def drain_recorder_stdout(self, recorder: subprocess.Popen[bytes], recording: bytearray, frame_bytes: int) -> int:
+        stdout = recorder.stdout
+        if stdout is None or self.stop_drain_ms <= 0:
+            return 0
+        drained = 0
+        fd = stdout.fileno()
+        deadline = time.monotonic() + (self.stop_drain_ms / 1000)
+        while time.monotonic() < deadline:
+            timeout = max(0.0, deadline - time.monotonic())
+            try:
+                ready, _, _ = select.select([fd], [], [], timeout)
+            except Exception:
+                break
+            if not ready:
+                break
+            try:
+                data = os.read(fd, frame_bytes)
+            except BlockingIOError:
+                continue
+            except OSError:
+                break
+            if not data:
+                break
+            recording.extend(data)
+            drained += len(data)
+            self.qwen_preview.accept_pcm(data)
+        if drained:
+            append_log(
+                f"stream recorder drained tail bytes={drained} "
+                f"durationMs={int(drained / max(1, self.sample_rate * self.channels * 2) * 1000)}"
+            )
+        return drained
+
     def run(self) -> int:
         if not os.environ.get("ASR_AUTH_TOKEN", "").strip():
             raise RuntimeError("ASR_AUTH_TOKEN is required for FlashAI ASR")
@@ -914,13 +1000,16 @@ class SegmentingTranscriptionSession:
                         )
                         break
                     recording.extend(data)
+                    self.update_recording_popup_volume(data)
                     qwen_preview_text = self.qwen_preview.accept_pcm(data)
                     if qwen_preview_text:
                         self.qwen_preview_text = qwen_preview_text
+                        self.popup_text = qwen_preview_text
                         if not env_bool("VOICE_STREAM_NOTIFY_FROM_READER", True):
                             notify_text(qwen_preview_text, progress=35, notify_id=os.environ.get("VOICE_RECORDING_NOTIFY_ID", "991200"))
                 try:
                     if recorder.poll() is None:
+                        self.drain_recorder_stdout(recorder, recording, frame_bytes)
                         recorder.terminate()
                         recorder.wait(timeout=2)
                 except Exception:

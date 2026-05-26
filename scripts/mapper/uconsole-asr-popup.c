@@ -3,24 +3,32 @@
 
 typedef struct {
   GtkWidget *label;
+  GtkWidget *clock_label;
+  GtkWidget *volume_box;
+  GtkWidget *volume_bar;
   GtkWidget *progress;
   gchar *path;
   gchar *last_text;
+  gchar *last_clock_text;
   gdouble last_fraction;
+  gdouble last_volume;
+  gboolean pulse;
   gboolean fullscreen;
 } AppState;
 
-static gchar *read_popup_text(const gchar *path, gdouble *fraction) {
+static gchar *read_popup_text(const gchar *path, gdouble *fraction, gdouble *volume, gboolean *pulse) {
   gchar *contents = NULL;
   gsize length = 0;
   GError *error = NULL;
   *fraction = -1.0;
+  *volume = -1.0;
+  *pulse = FALSE;
 
   if (!g_file_get_contents(path, &contents, &length, &error)) {
     if (error != NULL) {
       g_error_free(error);
     }
-    return g_strdup("录音中...");
+    return g_strdup("录音中");
   }
 
   gchar **lines = g_strsplit(contents, "\n", 0);
@@ -33,6 +41,21 @@ static gchar *read_popup_text(const gchar *path, gdouble *fraction) {
       if (end != line + 10) {
         *fraction = CLAMP(value, 0.0, 1.0);
       }
+      continue;
+    }
+    if (g_str_has_prefix(line, "@volume=")) {
+      gchar *end = NULL;
+      gdouble value = g_ascii_strtod(line + 8, &end);
+      if (end != line + 8) {
+        *volume = CLAMP(value, 0.0, 1.0);
+      }
+      continue;
+    }
+    if (g_str_has_prefix(line, "@pulse=")) {
+      gchar *value = g_strstrip(line + 7);
+      *pulse = g_strcmp0(value, "1") == 0 ||
+               g_ascii_strcasecmp(value, "true") == 0 ||
+               g_ascii_strcasecmp(value, "on") == 0;
       continue;
     }
     if (g_str_has_prefix(line, "#")) {
@@ -50,7 +73,7 @@ static gchar *read_popup_text(const gchar *path, gdouble *fraction) {
     g_string_free(message, TRUE);
     g_strfreev(lines);
     g_free(contents);
-    return g_strdup("录音中...");
+    return g_strdup("录音中");
   }
 
   gchar *result = g_string_free(message, FALSE);
@@ -62,24 +85,60 @@ static gchar *read_popup_text(const gchar *path, gdouble *fraction) {
 static gboolean refresh_label(gpointer user_data) {
   AppState *state = (AppState *)user_data;
   gdouble fraction = -1.0;
-  gchar *text = read_popup_text(state->path, &fraction);
+  gdouble volume = -1.0;
+  gboolean pulse = FALSE;
+  gchar *text = read_popup_text(state->path, &fraction, &volume, &pulse);
+  gchar *clock_text = NULL;
 
   if (state->last_text == NULL || g_strcmp0(text, state->last_text) != 0) {
     gtk_label_set_text(GTK_LABEL(state->label), text);
     g_free(state->last_text);
     state->last_text = g_strdup(text);
   }
-  if (fraction >= 0.0) {
+  if (state->fullscreen && state->clock_label != NULL) {
+    GDateTime *now = g_date_time_new_now_local();
+    clock_text = g_date_time_format(now, "%H:%M");
+    g_date_time_unref(now);
+    if (state->last_clock_text == NULL || g_strcmp0(clock_text, state->last_clock_text) != 0) {
+      gtk_label_set_text(GTK_LABEL(state->clock_label), clock_text);
+      g_free(state->last_clock_text);
+      state->last_clock_text = g_strdup(clock_text);
+    }
+  }
+  if (pulse) {
     gtk_widget_show(state->progress);
+    gtk_progress_bar_pulse(GTK_PROGRESS_BAR(state->progress));
+    state->pulse = TRUE;
+    state->last_fraction = -1.0;
+  } else if (fraction >= 0.0) {
+    gtk_widget_show(state->progress);
+    if (state->pulse) {
+      gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(state->progress), fraction);
+      state->pulse = FALSE;
+      state->last_fraction = fraction;
+    }
     if (fraction != state->last_fraction) {
       gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(state->progress), fraction);
       state->last_fraction = fraction;
     }
   } else {
     gtk_widget_hide(state->progress);
+    state->pulse = FALSE;
     state->last_fraction = -1.0;
   }
+  if (!state->fullscreen && state->volume_box != NULL && state->volume_bar != NULL && !pulse) {
+    gtk_widget_show_all(state->volume_box);
+    gdouble visible_volume = volume >= 0.0 ? volume : 0.0;
+    if (visible_volume != state->last_volume) {
+      gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(state->volume_bar), visible_volume);
+      state->last_volume = visible_volume;
+    }
+  } else if (state->volume_box != NULL) {
+    gtk_widget_hide(state->volume_box);
+    state->last_volume = -1.0;
+  }
 
+  g_free(clock_text);
   g_free(text);
   return G_SOURCE_CONTINUE;
 }
@@ -91,6 +150,7 @@ static void app_state_free(gpointer user_data) {
   }
   g_free(state->path);
   g_free(state->last_text);
+  g_free(state->last_clock_text);
   g_free(state);
 }
 
@@ -110,6 +170,20 @@ static void install_dark_theme(void) {
       ".uconsole-asr-progress {"
       "  min-height: 8px;"
       "}"
+      ".uconsole-asr-volume-icon {"
+      "  color: #f3f6fb;"
+      "}"
+      ".uconsole-asr-volume {"
+      "  min-height: 6px;"
+      "}"
+      ".uconsole-asr-volume trough {"
+      "  background: #2a303a;"
+      "  border-radius: 3px;"
+      "}"
+      ".uconsole-asr-volume progress {"
+      "  background: #41d399;"
+      "  border-radius: 3px;"
+      "}"
       ".uconsole-asr-progress trough {"
       "  background: #2a303a;"
       "  border-radius: 4px;"
@@ -125,6 +199,9 @@ static void install_dark_theme(void) {
       "  background: #05070a;"
       "}"
       ".uconsole-lock-label {"
+      "  color: #f8fafc;"
+      "}"
+      ".uconsole-lock-clock {"
       "  color: #f8fafc;"
       "}"
       ".uconsole-lock-progress {"
@@ -196,7 +273,27 @@ int main(int argc, char **argv) {
   }
   gtk_container_add(GTK_CONTAINER(window), box);
 
-  GtkWidget *label = gtk_label_new("录音中...");
+  GtkWidget *clock_label = NULL;
+  if (fullscreen) {
+    clock_label = gtk_label_new("");
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(clock_label),
+        "uconsole-lock-clock");
+    gtk_label_set_justify(GTK_LABEL(clock_label), GTK_JUSTIFY_CENTER);
+    gtk_label_set_xalign(GTK_LABEL(clock_label), 0.5);
+    gtk_widget_set_halign(clock_label, GTK_ALIGN_CENTER);
+    gtk_widget_set_valign(clock_label, GTK_ALIGN_CENTER);
+    gtk_widget_set_margin_bottom(clock_label, 28);
+    gtk_box_pack_start(GTK_BOX(box), clock_label, FALSE, FALSE, 0);
+
+    PangoAttrList *clock_attrs = pango_attr_list_new();
+    pango_attr_list_insert(clock_attrs, pango_attr_scale_new(5.0));
+    pango_attr_list_insert(clock_attrs, pango_attr_weight_new(PANGO_WEIGHT_LIGHT));
+    gtk_label_set_attributes(GTK_LABEL(clock_label), clock_attrs);
+    pango_attr_list_unref(clock_attrs);
+  }
+
+  GtkWidget *label = gtk_label_new("录音中");
   gtk_style_context_add_class(
       gtk_widget_get_style_context(label),
       fullscreen ? "uconsole-lock-label" : "uconsole-asr-label");
@@ -209,6 +306,32 @@ int main(int argc, char **argv) {
   gtk_widget_set_halign(label, GTK_ALIGN_CENTER);
   gtk_widget_set_valign(label, GTK_ALIGN_CENTER);
   gtk_box_pack_start(GTK_BOX(box), label, TRUE, TRUE, 0);
+
+  GtkWidget *volume_box = NULL;
+  GtkWidget *volume_bar = NULL;
+  if (!fullscreen) {
+    volume_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    gtk_widget_set_margin_top(volume_box, 12);
+    gtk_widget_set_margin_start(volume_box, 26);
+    gtk_widget_set_margin_end(volume_box, 26);
+    gtk_box_pack_start(GTK_BOX(box), volume_box, FALSE, FALSE, 0);
+
+    GtkWidget *volume_icon = gtk_image_new_from_icon_name("audio-input-microphone-symbolic", GTK_ICON_SIZE_BUTTON);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(volume_icon),
+        "uconsole-asr-volume-icon");
+    gtk_widget_set_halign(volume_icon, GTK_ALIGN_CENTER);
+    gtk_widget_set_valign(volume_icon, GTK_ALIGN_CENTER);
+    gtk_box_pack_start(GTK_BOX(volume_box), volume_icon, FALSE, FALSE, 0);
+
+    volume_bar = gtk_progress_bar_new();
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(volume_bar),
+        "uconsole-asr-volume");
+    gtk_widget_set_hexpand(volume_bar, TRUE);
+    gtk_widget_set_valign(volume_bar, GTK_ALIGN_CENTER);
+    gtk_box_pack_start(GTK_BOX(volume_box), volume_bar, TRUE, TRUE, 0);
+  }
 
   GtkWidget *progress = gtk_progress_bar_new();
   gtk_style_context_add_class(
@@ -228,9 +351,13 @@ int main(int argc, char **argv) {
 
   AppState *state = g_new0(AppState, 1);
   state->label = label;
+  state->clock_label = clock_label;
+  state->volume_box = volume_box;
+  state->volume_bar = volume_bar;
   state->progress = progress;
   state->path = g_strdup(argv[1]);
   state->last_fraction = -1.0;
+  state->last_volume = -1.0;
   state->fullscreen = fullscreen;
   g_object_set_data_full(G_OBJECT(window), "app-state", state, app_state_free);
 

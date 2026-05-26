@@ -176,6 +176,18 @@ close_recording_popup() {
   rm -f "${popup_text_file}" >/dev/null 2>&1 || true
 }
 
+recording_popup_active() {
+  local popup_pid=
+  popup_pid=$(recording_popup_pid || true)
+  [[ -n "${popup_pid}" ]] && kill -0 "${popup_pid}" >/dev/null 2>&1
+}
+
+dismiss_recording_popup() {
+  mkdir -p "${VOICE_STATE_DIR}" >/dev/null 2>&1 || true
+  : >"${VOICE_POPUP_DISMISSED_FILE}" || true
+  close_recording_status
+}
+
 show_recording_popup_message_then_close() {
   local message=$1
   local delay_seconds=${2:-2}
@@ -195,7 +207,7 @@ focus_recording_popup() {
 }
 
 launch_recording_popup() {
-  local body="录音中..."
+  local body="录音中"
   local popup_pid_file="${VOICE_STATE_DIR}/voice-recording-popup.pid"
   local popup_text_file="${VOICE_STATE_DIR}/voice-recording-popup.txt"
   local popup_pid=
@@ -210,6 +222,7 @@ launch_recording_popup() {
 
   close_recording_popup || true
   rm -f "${popup_text_file}" >/dev/null 2>&1 || true
+  rm -f "${VOICE_POPUP_DISMISSED_FILE}" >/dev/null 2>&1 || true
   write_recording_popup_text "${body}"
 
   if [[ -x "${popup_helper}" ]]; then
@@ -270,7 +283,7 @@ close_recording_status() {
 }
 
 show_recording_status() {
-  local body="录音中..."
+  local body="录音中"
 
   if launch_recording_popup >/dev/null 2>&1; then
     return
@@ -559,11 +572,18 @@ recording_popup_pid() {
 
 write_recording_popup_text() {
   local message=$1
+  local pulse=${2:-0}
   local popup_text_file="${VOICE_STATE_DIR}/voice-recording-popup.txt"
   local tmp_file="${popup_text_file}.$$"
 
+  [[ ! -f "${VOICE_POPUP_DISMISSED_FILE}" ]] || return 0
   mkdir -p "${VOICE_STATE_DIR}" >/dev/null 2>&1 || true
-  printf '# %s\n' "${message}" >"${tmp_file}" || return 0
+  {
+    printf '# %s\n' "${message}"
+    if [[ "${pulse}" == "1" ]]; then
+      printf '@pulse=1\n'
+    fi
+  } >"${tmp_file}" || return 0
   mv -f "${tmp_file}" "${popup_text_file}" >/dev/null 2>&1 || true
 }
 
@@ -839,6 +859,11 @@ build_whisper_context() {
 start_recording() {
   mkdir -p "${VOICE_STATE_DIR}"
   log_ptt "start_recording begin"
+  if [[ ! -f "${STATE_FILE}" ]] && recording_popup_active; then
+    log_ptt "recording popup dismissed by short press"
+    dismiss_recording_popup
+    return
+  fi
   close_recording_popup || true
   stop_existing_recording_session
   stop_orphan_recording_processes
@@ -900,6 +925,7 @@ start_recording() {
     ASR_PREVIEW_WS_URL="${ASR_PREVIEW_WS_URL}" \
     ASR_FINALIZE_TEXT_URL="${ASR_FINALIZE_TEXT_URL}" \
     ASR_PREVIEW_FINAL_WAIT_SECONDS="${ASR_PREVIEW_FINAL_WAIT_SECONDS}" \
+    ASR_PREVIEW_FINAL_STABLE_WAIT_SECONDS="${ASR_PREVIEW_FINAL_STABLE_WAIT_SECONDS}" \
     ASR_PREVIEW_WS_TIMEOUT="${ASR_PREVIEW_WS_TIMEOUT}" \
     ASR_PROMPT="${ASR_PROMPT}" \
     ASR_PROMPT_FIELD="${ASR_PROMPT_FIELD}" \
@@ -918,10 +944,12 @@ start_recording() {
     VOICE_RECORDING_NOTIFY_ID="${VOICE_RECORDING_NOTIFY_ID}" \
     VOICE_RECORDING_POPUP_TEXT_FILE="${VOICE_STATE_DIR}/voice-recording-popup.txt" \
     VOICE_RECORDING_POPUP_PID_FILE="${VOICE_STATE_DIR}/voice-recording-popup.pid" \
+    VOICE_RECORDING_POPUP_DISMISSED_FILE="${VOICE_POPUP_DISMISSED_FILE}" \
     VOICE_STREAM_PREVIEW="${VOICE_STREAM_PREVIEW}" \
     VOICE_QWEN_ASR_STREAMING="${VOICE_QWEN_ASR_STREAMING}" \
     VOICE_STREAM_SEND_INTERVAL_MS="${VOICE_STREAM_SEND_INTERVAL_MS}" \
     VOICE_STREAM_NOTIFY_FROM_READER="${VOICE_STREAM_NOTIFY_FROM_READER}" \
+    VOICE_STOP_DRAIN_MS="${VOICE_STOP_DRAIN_MS}" \
     VOICE_MAX_RECORD_MS="${VOICE_MAX_RECORD_MS}" \
     setsid ${stream_python:+"${stream_python}"} "${stream_client}" >/dev/null 2>&1 &
 
@@ -1031,7 +1059,12 @@ stop_recording() {
   # shellcheck disable=SC1090
   source "${STATE_FILE}"
   rm -f "${STATE_FILE}"
-  close_recording_status
+  close_recording_notification
+  if [[ "${suppress_asr_status}" != "1" ]]; then
+    write_recording_popup_text "识别中" 1
+  else
+    close_recording_popup
+  fi
 
   if [[ -n "${WATCHDOG_PID:-}" && "${WATCHDOG_PID}" != "$$" ]]; then
     kill "${WATCHDOG_PID}" >/dev/null 2>&1 || true
@@ -1055,8 +1088,14 @@ stop_recording() {
   if [[ -n "${STREAM_STOP_FILE:-}" ]]; then
     : >"${STREAM_STOP_FILE}" || true
   fi
+  if [[ "${suppress_asr_status}" != "1" ]]; then
+    write_recording_popup_text "识别中" 1
+  fi
   if kill -0 "${RECORDER_PID}" >/dev/null 2>&1; then
     if ! wait_for_exit "${RECORDER_PID}" 120; then
+      if [[ "${suppress_asr_status}" != "1" ]]; then
+        write_recording_popup_text "识别中" 1
+      fi
       terminate_process_group "${RECORDER_PID}" INT
       wait_for_exit "${RECORDER_PID}" 20 || true
     fi
@@ -1084,7 +1123,9 @@ stop_recording() {
     exit 0
   fi
 
-  close_recording_status
+  if [[ "${suppress_asr_status}" != "1" ]]; then
+    write_recording_popup_text "识别中" 1
+  fi
 
   if [[ ! -s "${STREAM_RESULT_FILE:-}" ]]; then
     echo "ASR result is empty" >&2
@@ -1106,6 +1147,9 @@ stop_recording() {
   context_text=$(build_whisper_context || true)
 
   local stream_status stream_error
+  if [[ "${suppress_asr_status}" != "1" ]]; then
+    write_recording_popup_text "识别中" 1
+  fi
   stream_status=$(jq -r '.status // empty' "${STREAM_RESULT_FILE}")
   stream_error=$(jq -r '.error // empty' "${STREAM_RESULT_FILE}")
   if [[ "${stream_status}" == "error" ]]; then
@@ -1133,7 +1177,9 @@ stop_recording() {
 
   if ! inject_text "${text}" "${context_text}"; then
     if [[ "${suppress_asr_status}" != "1" ]]; then
-      show_status "uconsole voice" "文本注入失败" "0" "1200"
+      show_recording_popup_message_then_close "文本注入失败" 2
+    else
+      close_recording_status
     fi
     rm -f "${STREAM_RESULT_FILE:-}" "${STREAM_STOP_FILE:-}"
     exit 1
@@ -1199,6 +1245,7 @@ fi
 VOICE_GLOSSARY_FILE=${VOICE_GLOSSARY_FILE:-"${HOME}/.config/uconsole-helper-mapper/voice-glossary.txt"}
 VOICE_STATE_DIR=${VOICE_STATE_DIR:-"${XDG_STATE_HOME:-${HOME}/.local/state}/uconsole-helper-mapper"}
 STATE_FILE="${VOICE_STATE_DIR}/voice-ptt.state"
+VOICE_POPUP_DISMISSED_FILE="${VOICE_STATE_DIR}/voice-recording-popup.dismissed"
 VOICE_RECORDER=${VOICE_RECORDER:-auto}
 VOICE_INPUT=${VOICE_INPUT:-default}
 VOICE_MIN_RECORD_MS=${VOICE_MIN_RECORD_MS:-350}
@@ -1245,12 +1292,14 @@ ASR_RETRY_DELAY=${ASR_RETRY_DELAY:-0.35}
 ASR_PREVIEW_WS_URL=${ASR_PREVIEW_WS_URL:-}
 ASR_FINALIZE_TEXT_URL=${ASR_FINALIZE_TEXT_URL:-}
 ASR_PREVIEW_FINAL_WAIT_SECONDS=${ASR_PREVIEW_FINAL_WAIT_SECONDS:-1.5}
+ASR_PREVIEW_FINAL_STABLE_WAIT_SECONDS=${ASR_PREVIEW_FINAL_STABLE_WAIT_SECONDS:-0.5}
 ASR_PREVIEW_WS_TIMEOUT=${ASR_PREVIEW_WS_TIMEOUT:-2}
 VOICE_STREAM_PREVIEW=${VOICE_STREAM_PREVIEW:-1}
 VOICE_QWEN_ASR_STREAMING=${VOICE_QWEN_ASR_STREAMING:-1}
 VOICE_NOTIFY_WHILE_PREVIEW=${VOICE_NOTIFY_WHILE_PREVIEW:-0}
 VOICE_STREAM_SEND_INTERVAL_MS=${VOICE_STREAM_SEND_INTERVAL_MS:-50}
 VOICE_STREAM_NOTIFY_FROM_READER=${VOICE_STREAM_NOTIFY_FROM_READER:-1}
+VOICE_STOP_DRAIN_MS=${VOICE_STOP_DRAIN_MS:-250}
 
 case "${ACTION}" in
   start)
