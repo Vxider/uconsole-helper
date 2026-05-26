@@ -1,7 +1,5 @@
 [general]
 rescan_seconds = 3.0
-session_watch_processes = ["wf-panel-pi", "labwc"]
-session_watch_settle_ms = 1500
 
 [gamepad]
 device_name_patterns = ["ClockworkPI uConsole"]
@@ -46,13 +44,8 @@ repeat_delay_ms = 600
 buttons = ["KEY_ESC"]
 command = "~/.local/bin/esc-switch-ime-english"
 
-# Legacy keyboard interception mode is available, but disabled by default.
-# Prefer keyd + labwc for keyboard shortcuts so normal typing does not depend
-# on the mapper's virtual keyboard bridge.
 # Desktop launcher bindings now live in:
 #   ~/.config/uconsole-helper-mapper/desktop-keybinds.toml
-# Uncomment the examples below only if you intentionally want the mapper to
-# own those keyboard combos again.
 # [[keyboard.bindings]]
 # buttons = ["KEY_RIGHTSHIFT", "KEY_C"]
 # command = "~/.local/bin/run-or-raise-chromium"

@@ -87,13 +87,10 @@ class MouseRemap:
 @dataclass(slots=True)
 class Config:
     rescan_seconds: float
-    session_watch_processes: list[str]
-    session_watch_settle_ms: int
     gamepad_patterns: list[str]
     gamepad_debounce_ms: int
     gamepad_bindings: list[Binding]
     keyboard_enabled: bool
-    keyboard_grab: bool
     keyboard_patterns: list[str]
     keyboard_debounce_ms: int
     keyboard_repeat_rate: int
@@ -384,6 +381,8 @@ def load_config(path: Path) -> Config:
 
     keyboard_bindings: list[Binding] = []
     for item in keyboard_bindings_raw:
+        if item.get("emit_key") or item.get("emit_rel"):
+            raise ValueError("keyboard bindings support command, press_command, release_command, or text")
         buttons = frozenset(code_from_name(button) for button in item["buttons"])
         keyboard_bindings.append(
             Binding(
@@ -412,13 +411,10 @@ def load_config(path: Path) -> Config:
 
     return Config(
         rescan_seconds=float(general.get("rescan_seconds", 3.0)),
-        session_watch_processes=list(general.get("session_watch_processes", ["wf-panel-pi", "labwc"])),
-        session_watch_settle_ms=int(general.get("session_watch_settle_ms", 1500)),
         gamepad_patterns=list(gamepad.get("device_name_patterns", ["ClockworkPI uConsole"])),
         gamepad_debounce_ms=int(gamepad.get("debounce_ms", 250)),
         gamepad_bindings=bindings,
         keyboard_enabled=bool(keyboard.get("enabled", False)),
-        keyboard_grab=bool(keyboard.get("grab", True)),
         keyboard_patterns=list(keyboard.get("device_name_patterns", ["ClockworkPI uConsole Keyboard"])),
         keyboard_debounce_ms=int(keyboard.get("debounce_ms", 50)),
         keyboard_repeat_rate=int(keyboard.get("repeat_rate", 20)),
@@ -972,45 +968,21 @@ class KeyboardWatcher:
         for binding in self.config.keyboard_bindings:
             validate_binding(binding)
 
-        self.virtual_keyboard: VirtualKeyboard | None = None
-        if self.config.keyboard_grab:
-            extra_keys = {
-                binding.emit_key for binding in self.config.keyboard_bindings if binding.emit_key is not None
-            }
-            self.virtual_keyboard = VirtualKeyboard(
-                device,
-                repeat_rate=self.config.keyboard_repeat_rate,
-                repeat_delay_ms=self.config.keyboard_repeat_delay_ms,
-                extra_keys=extra_keys,
-            )
         self.binding_codes = self._binding_codes()
         self.pressed: set[int] = set()
-        self.pending_order: list[int] = []
-        self.pending_set: set[int] = set()
         self.active_bindings: set[int] = set()
-        self.consumed_keys: set[int] = set()
         self.repeat_tasks: dict[int, asyncio.Task[None]] = {}
-        self.grab_active = self.virtual_keyboard is not None
-        self.grab_degraded = False
         self.grabbed = False
         self.lock_controller.add_listener(self._sync_lock_grab)
 
     async def run(self) -> None:
         LOGGER.info("watch keyboard: %s (%s)", self.device.name, self.device.path)
         try:
-            if self.grab_active:
-                self.device.grab()
-                self.grabbed = True
             async for event in self.device.async_read_loop():
                 if event.type != ecodes.EV_KEY:
                     continue
                 self._sync_lock_grab()
-                try:
-                    self._handle_key(event.code, event.value)
-                except DeviceWriteError as exc:
-                    if not self._degrade_to_passthrough(exc, self.grabbed):
-                        raise
-                    self.grabbed = False
+                self._handle_key(event.code, event.value)
                 self._sync_lock_grab()
         except OSError as exc:
             LOGGER.warning("keyboard watcher stopped for %s: %s", self.device.path, exc)
@@ -1020,14 +992,12 @@ class KeyboardWatcher:
                     self.device.ungrab()
                 except OSError:
                     pass
-            if self.virtual_keyboard is not None:
-                self.virtual_keyboard.close()
             for task in self.repeat_tasks.values():
                 task.cancel()
             self.device.close()
 
     def _sync_lock_grab(self) -> None:
-        if not self.config.lock_enabled or self.grab_active:
+        if not self.config.lock_enabled:
             return
         if self.lock_controller.locked and not self.grabbed:
             self.device.grab()
@@ -1039,75 +1009,16 @@ class KeyboardWatcher:
 
     def _clear_keyboard_state(self) -> None:
         self.pressed.clear()
-        self.pending_order.clear()
-        self.pending_set.clear()
         self.active_bindings.clear()
-        self.consumed_keys.clear()
         for task in self.repeat_tasks.values():
             task.cancel()
         self.repeat_tasks.clear()
-
-    def _degrade_to_passthrough(self, exc: DeviceWriteError, grabbed: bool) -> bool:
-        if not self.grab_active or self.grab_degraded:
-            return False
-
-        LOGGER.error(
-            "keyboard watchdog: virtual keyboard path failed for %s; disabling grab and falling back to passthrough: %s",
-            self.device.path,
-            exc,
-        )
-        self.grab_degraded = True
-        self.grab_active = False
-        self.pending_order.clear()
-        self.pending_set.clear()
-        self.active_bindings.clear()
-        self.consumed_keys.clear()
-        for task in self.repeat_tasks.values():
-            task.cancel()
-        self.repeat_tasks.clear()
-        if grabbed:
-            try:
-                self.device.ungrab()
-            except OSError:
-                pass
-        if self.virtual_keyboard is not None:
-            try:
-                self.virtual_keyboard.close()
-            except OSError:
-                pass
-            self.virtual_keyboard = None
-        return True
 
     def _binding_codes(self) -> set[int]:
         codes: set[int] = set()
         for binding in self.config.keyboard_bindings:
             codes.update(binding.buttons)
         return codes
-
-    def _possible_binding(self) -> bool:
-        relevant_pressed = self.pressed & self.binding_codes
-        if not relevant_pressed:
-            return False
-        return any(relevant_pressed.issubset(binding.buttons) for binding in self.config.keyboard_bindings)
-
-    def _queue_pending(self, code: int) -> None:
-        if code in self.pending_set:
-            return
-        self.pending_order.append(code)
-        self.pending_set.add(code)
-
-    def _discard_pending(self, code: int) -> None:
-        if code not in self.pending_set:
-            return
-        self.pending_set.remove(code)
-        self.pending_order = [item for item in self.pending_order if item != code]
-
-    def _flush_pending(self) -> None:
-        for code in list(self.pending_order):
-            if code in self.pending_set and code in self.pressed and code not in self.consumed_keys:
-                self.virtual_keyboard.write_key(code, 1)
-        self.pending_order.clear()
-        self.pending_set.clear()
 
     def _refresh_active_bindings(self) -> None:
         for index, binding in enumerate(self.config.keyboard_bindings):
@@ -1118,9 +1029,6 @@ class KeyboardWatcher:
                 self.active_bindings.add(index)
                 if binding.repeat_ms > 0 and binding.emit_key is None:
                     self.repeat_tasks[index] = asyncio.create_task(self._repeat_binding(index, binding))
-                self.consumed_keys.update(binding.buttons)
-                for code in binding.buttons:
-                    self._discard_pending(code)
             elif not matched and was_active:
                 self.active_bindings.remove(index)
                 task = self.repeat_tasks.pop(index, None)
@@ -1128,15 +1036,7 @@ class KeyboardWatcher:
                     task.cancel()
                 self._deactivate_binding(binding)
 
-        active_codes: set[int] = set()
-        for index in self.active_bindings:
-            active_codes.update(self.config.keyboard_bindings[index].buttons)
-        self.consumed_keys = active_codes
-
     def _activate_binding(self, binding: Binding) -> None:
-        if binding.emit_key is not None and self.virtual_keyboard is not None:
-            self.virtual_keyboard.write_key(binding.emit_key, 1)
-            return
         if binding.emit_rel is not None and self.virtual_mouse is not None:
             self.virtual_mouse.write_synthetic_rel(binding.emit_rel, binding.emit_rel_value)
             self.virtual_mouse.syn()
@@ -1145,8 +1045,7 @@ class KeyboardWatcher:
             self.runner.run(binding, self.config.keyboard_debounce_ms)
 
     def _deactivate_binding(self, binding: Binding) -> None:
-        if binding.emit_key is not None and self.virtual_keyboard is not None:
-            self.virtual_keyboard.write_key(binding.emit_key, 0)
+        return
 
     async def _repeat_binding(self, index: int, binding: Binding) -> None:
         try:
@@ -1173,68 +1072,8 @@ class KeyboardWatcher:
                 self.lock_controller.wake_screen()
             return
 
-        if not self.grab_active:
-            self._handle_key_passthrough(code, value)
-            return
-
-        if value == 2:
-            if code in self.consumed_keys:
-                return
-            if code in self.pending_set:
-                # Let the virtual keyboard own autorepeat once a pending key
-                # is disambiguated, instead of replaying hardware repeats.
-                self._flush_pending()
-            return
-
         is_pressed = value != 0
 
-        if is_pressed:
-            self.pressed.add(code)
-            if code in self.binding_codes:
-                self._refresh_active_bindings()
-                if code in self.consumed_keys:
-                    return
-                if self._possible_binding():
-                    self._queue_pending(code)
-                    return
-                self._flush_pending()
-                self.virtual_keyboard.write_key(code, 1)
-                return
-
-            if self.pending_set:
-                self._flush_pending()
-            self.virtual_keyboard.write_key(code, 1)
-            return
-
-        was_consumed = code in self.consumed_keys
-        self.pressed.discard(code)
-        self._refresh_active_bindings()
-
-        if was_consumed:
-            return
-
-        if code in self.pending_set:
-            self._discard_pending(code)
-            self.virtual_keyboard.write_key(code, 1)
-            self.virtual_keyboard.write_key(code, 0)
-            return
-
-        self.virtual_keyboard.write_key(code, 0)
-
-    def _handle_key_passthrough(self, code: int, value: int) -> None:
-        if self.lock_controller.is_lock_key(code):
-            was_locked = self.lock_controller.locked
-            self.lock_controller.handle_lock_key(value)
-            if was_locked and not self.lock_controller.locked:
-                self._clear_keyboard_state()
-            return
-
-        if self.lock_controller.locked:
-            if value == 1:
-                self.lock_controller.wake_screen()
-            return
-
-        is_pressed = value != 0
         if is_pressed:
             self.pressed.add(code)
         else:
@@ -1413,8 +1252,6 @@ class MapperDaemon:
             self.virtual_power_button,
         )
         self.tasks: dict[str, DeviceTask] = {}
-        self.session_watch_baselines: dict[str, frozenset[int]] = {}
-        self.session_watch_pending: dict[str, tuple[frozenset[int], float]] = {}
         self.backlight_power_path = DEFAULT_BACKLIGHT_POWER
         self.last_backlight_off: bool | None = None
         self.lock_popup_process: subprocess.Popen[Any] | None = None
@@ -1444,7 +1281,6 @@ class MapperDaemon:
                 self._prune_tasks()
                 self._scan_devices()
                 self.lock_controller.sync_listeners()
-                self._check_session_watch()
                 await asyncio.sleep(self.config.rescan_seconds)
         finally:
             backlight_task.cancel()
@@ -1638,66 +1474,6 @@ class MapperDaemon:
             else:
                 device.close()
 
-    def _check_session_watch(self) -> None:
-        if not self.config.keyboard_grab:
-            return
-        if not self.config.session_watch_processes:
-            return
-
-        now = time.monotonic()
-        for raw_pattern in self.config.session_watch_processes:
-            pattern = raw_pattern.strip().lower()
-            if not pattern:
-                continue
-            current = self._matching_process_pids(pattern)
-            baseline = self.session_watch_baselines.get(pattern)
-            if baseline is None:
-                if current:
-                    self.session_watch_baselines[pattern] = current
-                continue
-
-            if current == baseline:
-                self.session_watch_pending.pop(pattern, None)
-                continue
-
-            pending = self.session_watch_pending.get(pattern)
-            if pending is None or pending[0] != current:
-                LOGGER.warning(
-                    "session watchdog: observed %s process change %s -> %s; waiting %sms before recovery",
-                    pattern,
-                    sorted(baseline),
-                    sorted(current),
-                    self.config.session_watch_settle_ms,
-                )
-                self.session_watch_pending[pattern] = (current, now)
-                continue
-
-            if (now - pending[1]) * 1000 < self.config.session_watch_settle_ms:
-                continue
-
-            raise RuntimeError(
-                f"session process changed for {pattern}: {sorted(baseline)} -> {sorted(current)}"
-            )
-
-    def _matching_process_pids(self, pattern: str) -> frozenset[int]:
-        matches: set[int] = set()
-        proc_root = Path("/proc")
-        for entry in proc_root.iterdir():
-            if not entry.name.isdigit():
-                continue
-            pid = int(entry.name)
-            try:
-                comm = (entry / "comm").read_text(encoding="utf-8", errors="ignore").strip().lower()
-                if pattern in comm:
-                    matches.add(pid)
-                    continue
-                cmdline = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", errors="ignore").lower()
-                if pattern in cmdline:
-                    matches.add(pid)
-            except OSError:
-                continue
-        return frozenset(matches)
-
     def _detect_role(self, device: InputDevice) -> str | None:
         if is_ignored_device(device.name):
             return None
@@ -1777,10 +1553,6 @@ async def main_async() -> int:
         return 1
 
     config = load_config(config_path)
-    if config.keyboard_enabled and config.keyboard_grab:
-        LOGGER.warning(
-            "legacy keyboard grab mode is enabled; prefer keyd plus labwc so normal typing stays off the mapper path"
-        )
     daemon = MapperDaemon(config)
 
     loop = asyncio.get_running_loop()

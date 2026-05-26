@@ -2629,8 +2629,6 @@ class UConsoleHelperWindow(Gtk.Window):
                         raise ValueError
                 except ValueError as exc:
                     raise ValueError(f"{profile.title()} auto screen timeouts must be seconds or Never.") from exc
-        values["POWERSAVER_BATTERY_SCREEN_TIMEOUT_SEC"] = values["POWERSAVER_BALANCED_BATTERY_SCREEN_TIMEOUT_SEC"]
-        values["POWERSAVER_AC_SCREEN_TIMEOUT_SEC"] = values["POWERSAVER_BALANCED_AC_SCREEN_TIMEOUT_SEC"]
         values["POWERSAVER_UNKNOWN_POWER_ACTION"] = values["POWERSAVER_BALANCED_UNKNOWN_POWER_ACTION"]
         values["POWERSAVER_WWAN_POLICY"] = values["POWERSAVER_BALANCED_WWAN_POLICY"]
         if values["POWERSAVER_MODE"] not in {"eco", "balanced", "performance"}:
@@ -3317,11 +3315,6 @@ def power_policy_config_text(values: dict[str, str]) -> str:
             f"POWERSAVER_PERFORMANCE_STAND_MODE={values['POWERSAVER_PERFORMANCE_STAND_MODE']}",
             f"POWERSAVER_PERFORMANCE_AUTO_BATTERY_PUTDOWN_TIMEOUT_SEC={values['POWERSAVER_PERFORMANCE_AUTO_BATTERY_PUTDOWN_TIMEOUT_SEC']}",
             f"POWERSAVER_PERFORMANCE_AUTO_AC_PUTDOWN_TIMEOUT_SEC={values['POWERSAVER_PERFORMANCE_AUTO_AC_PUTDOWN_TIMEOUT_SEC']}",
-            "",
-            "### Screen idle timeout seconds --- 0 disables helper-managed timeout",
-            "# Legacy global keys are kept for downgrade compatibility.",
-            f"POWERSAVER_BATTERY_SCREEN_TIMEOUT_SEC={values['POWERSAVER_BATTERY_SCREEN_TIMEOUT_SEC']}",
-            f"POWERSAVER_AC_SCREEN_TIMEOUT_SEC={values['POWERSAVER_AC_SCREEN_TIMEOUT_SEC']}",
             "",
             "### POWERSAVER_UNKNOWN_POWER_ACTION --- [restore|battery|keep]",
             f"POWERSAVER_UNKNOWN_POWER_ACTION={values['POWERSAVER_UNKNOWN_POWER_ACTION']}",
@@ -5130,8 +5123,6 @@ def mapper_config_text(rows: list[dict[str, str]]) -> str:
     lines = [
         "[general]",
         "rescan_seconds = 3.0",
-        'session_watch_processes = ["wf-panel-pi", "labwc"]',
-        "session_watch_settle_ms = 1500",
         "",
         "[gamepad]",
         'device_name_patterns = ["ClockworkPI uConsole"]',
@@ -5285,9 +5276,6 @@ def helper_service_config() -> dict[str, str]:
         "POWERSAVER_UNKNOWN_POWER_ACTION": "restore",
         "POWERSAVER_WWAN_POLICY": "ondemand",
         "POWERSAVER_POLL_INTERVAL_SEC": "5",
-        "POWERSAVER_SCREEN_TIMEOUT_SEC": "0",
-        "POWERSAVER_BATTERY_SCREEN_TIMEOUT_SEC": "0",
-        "POWERSAVER_AC_SCREEN_TIMEOUT_SEC": "0",
         "POWERSAVER_CPU_POLICY_PATH": "/sys/devices/system/cpu/cpufreq/policy0",
         "POWERSAVER_POWER_SUPPLY_DIR": "/sys/class/power_supply",
         "MCU_LED_BATTERY_ENABLED": "1",
@@ -5763,14 +5751,8 @@ def powersaver_config_summary(config: dict[str, str]) -> str:
         config.get("POWERSAVER_UNKNOWN_POWER_ACTION", "restore"),
     )
     wwan = config.get(f"POWERSAVER_{profile}_WWAN_POLICY", config.get("POWERSAVER_WWAN_POLICY", "ondemand"))
-    battery_screen = config.get(
-        "POWERSAVER_BATTERY_SCREEN_TIMEOUT_SEC",
-        config.get(f"POWERSAVER_{profile}_BATTERY_SCREEN_TIMEOUT_SEC", config.get("POWERSAVER_SCREEN_TIMEOUT_SEC", "0")),
-    )
-    ac_screen = config.get(
-        "POWERSAVER_AC_SCREEN_TIMEOUT_SEC",
-        config.get(f"POWERSAVER_{profile}_AC_SCREEN_TIMEOUT_SEC", config.get("POWERSAVER_SCREEN_TIMEOUT_SEC", "0")),
-    )
+    battery_screen = config.get(f"POWERSAVER_{profile}_BATTERY_SCREEN_TIMEOUT_SEC", "0")
+    ac_screen = config.get(f"POWERSAVER_{profile}_AC_SCREEN_TIMEOUT_SEC", "0")
     state = "enabled" if enabled.lower() in {"1", "yes", "true", "on", "enabled"} else "disabled"
     screen_label = "off" if battery_screen == "0" and ac_screen == "0" else f"B {battery_screen}s / AC {ac_screen}s"
     return f"{state}; {mode}; battery {battery} MHz; AC {ac}; unknown {unknown}; WWAN {wwan}; screen {screen_label}"
@@ -5779,9 +5761,8 @@ def powersaver_config_summary(config: dict[str, str]) -> str:
 def power_screen_timeout_summary(config: dict[str, str], power_state: str) -> str:
     mode = config.get("POWERSAVER_MODE", "balanced")
     profile = mode.upper()
-    fallback = config.get("POWERSAVER_SCREEN_TIMEOUT_SEC", "0")
-    battery = config.get("POWERSAVER_BATTERY_SCREEN_TIMEOUT_SEC", config.get(f"POWERSAVER_{profile}_BATTERY_SCREEN_TIMEOUT_SEC", fallback))
-    ac = config.get("POWERSAVER_AC_SCREEN_TIMEOUT_SEC", config.get(f"POWERSAVER_{profile}_AC_SCREEN_TIMEOUT_SEC", fallback))
+    battery = config.get(f"POWERSAVER_{profile}_BATTERY_SCREEN_TIMEOUT_SEC", "0")
+    ac = config.get(f"POWERSAVER_{profile}_AC_SCREEN_TIMEOUT_SEC", "0")
     power_state = power_state.lower()
     if power_state == "ac":
         return screen_timeout_display_value(ac)
@@ -6837,7 +6818,8 @@ def read_mcu_snapshot(state: McuTelemetryState) -> McuStateSnapshot:
         state.smoothed_light_lux = sample.light_lux
         state.suggested_backlight = max(1, min(9, sample.light_screen))
     else:
-        update_light_smoothing(state, sample.light_lux)
+        state.smoothed_light_lux = sample.light_lux
+        state.suggested_backlight = None
     state.last_state = current_state
     state.last_event = event
     state.last_motion = motion
@@ -6964,26 +6946,23 @@ def parse_mcu_line(line: str) -> McuTelemetrySample | None:
         except json_module.JSONDecodeError:
             payload = None
         if isinstance(payload, dict):
-            values = payload.get("accel") or payload.get("a") or payload
+            values = payload.get("accel")
             if isinstance(values, dict):
-                ax = float(values.get("x", values.get("ax", 0.0)))
-                ay = float(values.get("y", values.get("ay", 0.0)))
-                az = float(values.get("z", values.get("az", 0.0)))
-            elif isinstance(values, list) and len(values) >= 3:
-                ax, ay, az = (float(values[0]), float(values[1]), float(values[2]))
+                ax = float(values.get("x", 0.0))
+                ay = float(values.get("y", 0.0))
+                az = float(values.get("z", 0.0))
             else:
                 return None
-            temp_value = payload.get("temp", payload.get("temperature"))
-            temperature = float(temp_value) if temp_value is not None else None
+            temperature = None
             delta_value = payload.get("delta")
             gyro = payload.get("gyro")
             gx = None
             gy = None
             gz = None
             if isinstance(gyro, dict):
-                gx = float(gyro.get("x", gyro.get("gx", 0.0)))
-                gy = float(gyro.get("y", gyro.get("gy", 0.0)))
-                gz = float(gyro.get("z", gyro.get("gz", 0.0)))
+                gx = float(gyro.get("x", 0.0))
+                gy = float(gyro.get("y", 0.0))
+                gz = float(gyro.get("z", 0.0))
             mic = payload.get("mic")
             mic_peak = None
             mic_recent_peak = False
@@ -7015,10 +6994,6 @@ def parse_mcu_line(line: str) -> McuTelemetrySample | None:
                 light_screen = int(screen_value) if screen_value is not None else None
                 light_keyboard = int(keyboard_value) if keyboard_value is not None else None
                 light_ready = bool(light.get("ready"))
-            else:
-                lux_value = payload.get("lux", payload.get("light_lux"))
-                light_lux = float(lux_value) if lux_value is not None else None
-                light_ready = light_lux is not None
             return McuTelemetrySample(
                 time.time(),
                 ax,
@@ -7235,11 +7210,13 @@ def format_light_label(snapshot: McuStateSnapshot) -> str:
     actual_backlight = read_display_backlight_label()
     if lux is not None:
         suggested = snapshot.suggested_backlight
-        if suggested is None:
-            suggested = classify_light_level(smoothed_lux if smoothed_lux is not None else lux)[3]
-        level = light_level_by_backlight(suggested)
         smooth_text = f"{smoothed_lux:.1f}" if smoothed_lux is not None else "-"
-        suffix = f" / 滤波 {smooth_text} lx / 建议 {level[1]} {suggested}/9 / 实际 {actual_backlight}"
+        if suggested is None:
+            suggest_text = "-"
+        else:
+            level = light_level_by_backlight(suggested)
+            suggest_text = f"{level[1]} {suggested}/9"
+        suffix = f" / 滤波 {smooth_text} lx / 建议 {suggest_text} / 实际 {actual_backlight}"
         if raw is not None:
             return f"原始 {lux:.1f} lx (raw {raw}){suffix}"
         return f"原始 {lux:.1f} lx{suffix}"
@@ -7248,38 +7225,11 @@ def format_light_label(snapshot: McuStateSnapshot) -> str:
     return "-"
 
 
-def classify_light_level(lux: float) -> tuple[str, str, float | None, int]:
-    for level in MCU_LIGHT_LEVELS:
-        limit = level[2]
-        if limit is None or lux < limit:
-            return level
-    return MCU_LIGHT_LEVELS[-1]
-
-
 def light_level_by_backlight(backlight: int) -> tuple[str, str, float | None, int]:
     for level in MCU_LIGHT_LEVELS:
         if level[3] == backlight:
             return level
     return MCU_LIGHT_LEVELS[-1]
-
-
-def update_light_smoothing(state: McuTelemetryState, lux: float | None) -> None:
-    if lux is None:
-        return
-    target = classify_light_level(lux)[3]
-    current = state.suggested_backlight
-    if current is None:
-        suggested = target
-    elif target in {1, 9}:
-        suggested = target
-    elif target > current:
-        suggested = current + 1
-    elif target < current:
-        suggested = current - 1
-    else:
-        suggested = current
-    state.smoothed_light_lux = lux
-    state.suggested_backlight = max(1, min(9, suggested))
 
 
 def read_display_backlight_label() -> str:

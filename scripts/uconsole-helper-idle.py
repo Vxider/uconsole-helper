@@ -33,17 +33,6 @@ LED_POWER_POLL_SECONDS = 30
 TMUX_NOTIFY_POLL_SECONDS = 5
 TMUX_NOTIFY_MARKER = Path(f"/run/user/{os.getuid()}/uconsole-helper-tmux-notify")
 TMUX_CLEAR_MARKER = Path(f"/run/user/{os.getuid()}/uconsole-helper-tmux-clear")
-LIGHT_LEVELS = (
-    (2.0, 1),
-    (5.0, 2),
-    (9.0, 3),
-    (30.0, 4),
-    (120.0, 5),
-    (220.0, 6),
-    (420.0, 7),
-    (900.0, 8),
-    (None, 9),
-)
 LAST_KEYBOARD_BACKLIGHT_LEVEL: int | None = None
 INPUT_EVENT_FORMAT = "llHHI"
 INPUT_EVENT_SIZE = struct.calcsize(INPUT_EVENT_FORMAT)
@@ -163,7 +152,6 @@ class McuSerialReader:
 
 class AutoBrightnessState:
     def __init__(self) -> None:
-        self.smoothed_lux: float | None = None
         self.current_backlight: int | None = None
 
 
@@ -501,23 +489,13 @@ def battery_led_state(power_supply_dir: Path = POWER_SUPPLY_DIR) -> tuple[int, s
 
 
 def timeout_for_state(values: dict[str, str], state: str) -> int:
-    fallback = values.get("POWERSAVER_SCREEN_TIMEOUT_SEC", "0")
     mode = values.get("POWERSAVER_MODE", "balanced").upper()
     if state == "battery":
-        raw = values.get(
-            f"POWERSAVER_{mode}_BATTERY_SCREEN_TIMEOUT_SEC",
-            values.get("POWERSAVER_BATTERY_SCREEN_TIMEOUT_SEC", fallback),
-        )
+        raw = values.get(f"POWERSAVER_{mode}_BATTERY_SCREEN_TIMEOUT_SEC", "0")
     elif state == "ac":
-        raw = values.get(
-            f"POWERSAVER_{mode}_AC_SCREEN_TIMEOUT_SEC",
-            values.get("POWERSAVER_AC_SCREEN_TIMEOUT_SEC", fallback),
-        )
+        raw = values.get(f"POWERSAVER_{mode}_AC_SCREEN_TIMEOUT_SEC", "0")
     else:
-        raw = values.get(
-            f"POWERSAVER_{mode}_BATTERY_SCREEN_TIMEOUT_SEC",
-            values.get("POWERSAVER_BATTERY_SCREEN_TIMEOUT_SEC", fallback),
-        )
+        raw = values.get(f"POWERSAVER_{mode}_BATTERY_SCREEN_TIMEOUT_SEC", "0")
     try:
         return max(0, int(raw or "0"))
     except ValueError:
@@ -650,20 +628,6 @@ def write_shared_mcu_sample(payload: dict[str, object]) -> None:
         return
 
 
-def lux_from_sample(sample: dict[str, object]) -> float | None:
-    light = sample.get("light")
-    if isinstance(light, dict):
-        lux = light.get("smoothed_lux", light.get("lux"))
-        if not bool(light.get("valid", lux is not None)):
-            return None
-    else:
-        lux = sample.get("lux", sample.get("light_lux"))
-    try:
-        return float(lux) if lux is not None else None
-    except (TypeError, ValueError):
-        return None
-
-
 def brightness_targets_from_sample(sample: dict[str, object]) -> tuple[int | None, int | None]:
     light = sample.get("light")
     if not isinstance(light, dict):
@@ -680,24 +644,6 @@ def brightness_targets_from_sample(sample: dict[str, object]) -> tuple[int | Non
     if keyboard is not None:
         keyboard = max(0, min(2, keyboard))
     return screen, keyboard
-
-
-def classify_light_level(lux: float) -> int:
-    for limit, backlight in LIGHT_LEVELS:
-        if limit is None or lux < limit:
-            return backlight
-    return 9
-
-
-def update_light_smoothing(smoothed_lux: float | None, current_backlight: int | None, lux: float | None) -> tuple[float | None, int | None]:
-    if lux is None:
-        return smoothed_lux, current_backlight
-    target = classify_light_level(lux)
-    if smoothed_lux is None:
-        smoothed_lux = lux
-    else:
-        smoothed_lux = (smoothed_lux * 0.35) + (lux * 0.65)
-    return smoothed_lux, classify_light_level(smoothed_lux)
 
 
 def start_swayidle(timeout_sec: int) -> subprocess.Popen[str] | None:
@@ -795,28 +741,13 @@ def maybe_apply_auto_brightness(
 ) -> None:
     if sample is None or not auto_brightness_enabled(values) or display_off_now:
         return
-    light = sample.get("light")
-    has_mcu_brightness = isinstance(light, dict) and light.get("screen") is not None
     suggested, keyboard_level = brightness_targets_from_sample(sample)
     actual_backlight = read_display_brightness()
     current_backlight = actual_backlight if actual_backlight is not None else state.current_backlight
     if suggested is None:
-        state.smoothed_lux, suggested = update_light_smoothing(
-            state.smoothed_lux,
-            current_backlight,
-            lux_from_sample(sample),
-        )
-        keyboard_level = keyboard_backlight_level(suggested) if suggested is not None else None
-    if suggested is None:
         return
     if keyboard_level is None:
         keyboard_level = keyboard_backlight_level(suggested)
-    if current_backlight is not None and not has_mcu_brightness:
-        delta = abs(suggested - current_backlight)
-        is_extreme = suggested in {1, 9}
-        if delta > 1 and not is_extreme:
-            step = 2 if delta >= 3 else 1
-            suggested = current_backlight + (step if suggested > current_backlight else -step)
     current_keyboard_level = read_keyboard_backlight()
     if suggested == current_backlight and current_keyboard_level == keyboard_level:
         state.current_backlight = suggested

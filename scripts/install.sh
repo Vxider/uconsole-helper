@@ -142,8 +142,6 @@ install_service() {
     ensure_config_key "${config_file}" "POWERSAVER_PERFORMANCE_STAND_MODE" "0"
     ensure_config_key "${config_file}" "POWERSAVER_PERFORMANCE_AUTO_BATTERY_PUTDOWN_TIMEOUT_SEC" "120"
     ensure_config_key "${config_file}" "POWERSAVER_PERFORMANCE_AUTO_AC_PUTDOWN_TIMEOUT_SEC" "300"
-    ensure_config_key "${config_file}" "POWERSAVER_BATTERY_SCREEN_TIMEOUT_SEC" "0"
-    ensure_config_key "${config_file}" "POWERSAVER_AC_SCREEN_TIMEOUT_SEC" "0"
   fi
   sudo install -m 0644 "${APP_DIR}/services/uconsole-helper.service" "${service_file}"
   sudo systemctl daemon-reload
@@ -176,23 +174,6 @@ ensure_config_key() {
   local value="$3"
   if ! sudo grep -Eq "^${key}=" "${config_file}"; then
     printf '%s=%s\n' "${key}" "${value}" | sudo tee -a "${config_file}" >/dev/null
-  fi
-}
-
-disable_legacy_labwc_idle() {
-  local autostart="${HOME}/.config/labwc/autostart"
-  if [[ -f "${autostart}" ]] && grep -Eq "^[[:space:]]*swayidle .*wlopm --off .*wlopm --on" "${autostart}"; then
-    cp -n "${autostart}" "${autostart}.bak-uconsole-helper-idle" 2>/dev/null || true
-    perl -0pi -e 's/^(?!#)([ \t]*swayidle\b[^\n]*wlopm --off[^\n]*wlopm --on[^\n]*&?[ \t]*)$/# disabled by uconsole-helper-idle.service: $1/mg' "${autostart}"
-    echo "Disabled legacy labwc swayidle/wlopm autostart:"
-    echo "  ${autostart}"
-  fi
-  if command -v pgrep >/dev/null 2>&1; then
-    while IFS= read -r pid; do
-      if [[ -n "${pid}" ]]; then
-        kill "${pid}" >/dev/null 2>&1 || true
-      fi
-    done < <(pgrep -f "swayidle .*wlopm --off .*wlopm --on" || true)
   fi
 }
 
@@ -261,36 +242,11 @@ install_mapper() {
   local idle_app_dir="${HOME}/.local/share/uconsole-helper-idle"
   local bin_dir="${HOME}/.local/bin"
   local config_dir="${HOME}/.config/uconsole-helper-mapper"
-  local old_mapper_app_dir="${HOME}/.local/share/uconsole-mapper"
-  local old_config_dir="${HOME}/.config/uconsole-mapper"
   local systemd_dir="${HOME}/.config/systemd/user"
   local fcitx_lua_dir="${HOME}/.local/share/fcitx5/lua/imeapi/extensions"
   local python_bin="${PYTHON_BIN:-/usr/bin/python3}"
 
   mkdir -p "${mapper_app_dir}" "${idle_app_dir}" "${bin_dir}" "${config_dir}" "${systemd_dir}" "${fcitx_lua_dir}"
-
-  if systemctl --user list-unit-files uconsole-mapper.service >/dev/null 2>&1; then
-    systemctl --user disable --now uconsole-mapper.service >/dev/null 2>&1 || true
-  fi
-  if [[ -f "${systemd_dir}/uconsole-mapper.service" ]]; then
-    rm -f "${systemd_dir}/uconsole-mapper.service"
-  fi
-  if [[ -d "${old_config_dir}" ]]; then
-    for name in config.toml desktop-keybinds.toml voice.env voice-glossary.txt; do
-      if [[ -f "${old_config_dir}/${name}" && ! -f "${config_dir}/${name}" ]]; then
-        install -m 0644 "${old_config_dir}/${name}" "${config_dir}/${name}"
-      fi
-    done
-  fi
-  if [[ -d "${old_mapper_app_dir}" ]]; then
-    echo "Migrated mapper runtime name from uconsole-mapper to uconsole-helper-mapper."
-  fi
-  if [[ -f "${config_dir}/config.toml" ]]; then
-    perl -0pi -e 's#/usr/local/bin/uconsole-mapper-display-control#/usr/local/bin/uconsole-helper-mapper-display-control#g' "${config_dir}/config.toml"
-    perl -0pi -e 's#lock_command = "rm -f \${XDG_RUNTIME_DIR:-/tmp}/uconsole-helper-auto-screen-off && sudo -n /usr/local/bin/uconsole-helper-mapper-display-control off"#lock_command = "sudo -n /usr/local/bin/uconsole-helper-mapper-display-control off"#g' "${config_dir}/config.toml"
-    perl -0pi -e 's#lock_command = "mkdir -p \${XDG_RUNTIME_DIR:-/tmp} && rm -f \${XDG_RUNTIME_DIR:-/tmp}/uconsole-helper-auto-screen-off && date \+%s > \${XDG_RUNTIME_DIR:-/tmp}/uconsole-helper-manual-screen-off && sudo -n /usr/local/bin/uconsole-helper-mapper-display-control off"#lock_command = "sudo -n /usr/local/bin/uconsole-helper-mapper-display-control off"#g' "${config_dir}/config.toml"
-    perl -0pi -e 's#unlock_command = "rm -f \${XDG_RUNTIME_DIR:-/tmp}/uconsole-helper-manual-screen-off \${XDG_RUNTIME_DIR:-/tmp}/uconsole-helper-auto-screen-off && sudo -n /usr/local/bin/uconsole-helper-mapper-display-control on"#unlock_command = "sudo -n /usr/local/bin/uconsole-helper-mapper-display-control on"#g' "${config_dir}/config.toml"
-  fi
 
   if [[ ! -x "${python_bin}" ]]; then
     echo "Python interpreter not found: ${python_bin}" >&2
@@ -402,7 +358,6 @@ install_mapper() {
 
   "${python_bin}" "${mapper_app_dir}/generate_desktop_keybinds.py" --config "${config_dir}/desktop-keybinds.toml"
   "${python_bin}" "${mapper_app_dir}/sync_labwc_keybinds.py"
-  disable_legacy_labwc_idle
   if command -v labwc >/dev/null 2>&1; then
     labwc --reconfigure >/dev/null 2>&1 || true
   fi
