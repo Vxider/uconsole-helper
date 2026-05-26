@@ -1030,6 +1030,10 @@ class UConsoleHelperWindow(Gtk.Window):
         self.asr_controls["ASR_CORRECTION_MODE"] = combo_text_from_values(("auto", "on", "off"))
         self.asr_controls["ASR_CORRECTION_MODE"].connect("changed", lambda _combo: self.sync_asr_tmux_context_state())
         self._attach_asr_flow_control(options_flow, "Correction", self.asr_controls["ASR_CORRECTION_MODE"])
+        stream_preview = Gtk.Switch()
+        stream_preview.set_halign(Gtk.Align.START)
+        self.asr_controls["VOICE_QWEN_ASR_STREAMING"] = stream_preview
+        self._attach_asr_flow_control(options_flow, "Preview", stream_preview)
         self.asr_controls["VOICE_RECORDER"] = combo_text_from_values(("auto", "pw-record", "ffmpeg", "arecord"))
         self._attach_asr_flow_control(options_flow, "Recorder", self.asr_controls["VOICE_RECORDER"])
         self.asr_controls["VOICE_INPUT"] = ellipsized_combo_text_from_values(tuple(audio_input_options()), width_chars=28)
@@ -5343,6 +5347,7 @@ def default_asr_config() -> dict[str, str]:
         "VOICE_TMUX_OUTPUT_MODE": "type",
         "VOICE_PASTE_BACKEND": "uinput",
         "VOICE_TMUX_CONTEXT": "1",
+        "VOICE_QWEN_ASR_STREAMING": "1",
     }
 
 
@@ -5390,6 +5395,7 @@ def asr_config_text(values: dict[str, str]) -> str:
         "VOICE_NOTIFY_PADDING_LINES=1",
         "VOICE_TMUX_CONTEXT={VOICE_TMUX_CONTEXT}",
         "VOICE_STREAM_PREVIEW={VOICE_STREAM_PREVIEW}",
+        "VOICE_QWEN_ASR_STREAMING={VOICE_QWEN_ASR_STREAMING}",
         "VOICE_STREAM_SEND_INTERVAL_MS={VOICE_STREAM_SEND_INTERVAL_MS}",
         "VOICE_STREAM_NOTIFY_FROM_READER={VOICE_STREAM_NOTIFY_FROM_READER}",
         "",
