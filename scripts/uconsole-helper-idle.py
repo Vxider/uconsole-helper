@@ -19,6 +19,7 @@ from pathlib import Path
 CONFIG_FILE = Path(os.environ.get("UCONSOLE_HELPER_CONFIG", "/etc/uconsole-helper/uconsole-helper.conf"))
 POWER_SUPPLY_DIR = Path("/sys/class/power_supply")
 DISPLAY_CONTROL = "/usr/local/bin/uconsole-helper-mapper-display-control"
+DISPLAY_BACKLIGHT_POWER = Path("/sys/class/backlight/backlight@0/bl_power")
 DISPLAY_BACKLIGHT_BRIGHTNESS = Path("/sys/class/backlight/backlight@0/brightness")
 KEYBOARD_BACKLIGHT_SCRIPT = Path("~/WorkSpace/uconsole-keyboard/tools/keyboard_state.sh").expanduser()
 MCU_SHARED_SAMPLE_FILE = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "uconsole-helper-mcu-latest.json"
@@ -321,6 +322,13 @@ def display_off_from_status_result(result: subprocess.CompletedProcess[str] | No
     if result is None or result.returncode != 0:
         return False
     return result.stdout.strip() == "off"
+
+
+def read_display_off_sysfs() -> bool | None:
+    try:
+        return DISPLAY_BACKLIGHT_POWER.read_text(encoding="utf-8").strip() == "4"
+    except OSError:
+        return None
 
 
 def display_on() -> bool:
@@ -734,7 +742,8 @@ def maybe_apply_auto_brightness(
     state: AutoBrightnessState,
     display_off_now: bool,
 ) -> None:
-    if sample is None or not auto_brightness_enabled(values) or display_off_now:
+    actual_display_off = read_display_off_sysfs()
+    if sample is None or not auto_brightness_enabled(values) or display_off_now or actual_display_off is True:
         return
     suggested, keyboard_level = brightness_targets_from_sample(sample)
     actual_backlight = read_display_brightness()

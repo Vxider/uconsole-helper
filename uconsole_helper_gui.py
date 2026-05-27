@@ -5150,7 +5150,7 @@ def mapper_config_text(rows: list[dict[str, str]]) -> str:
             "[lock]",
             "enabled = false",
             'key = "KEY_COFFEE"',
-            'lock_command = "rm -f ${XDG_RUNTIME_DIR:-/tmp}/uconsole-helper-auto-screen-off && sudo -n /usr/local/bin/uconsole-helper-mapper-display-control off"',
+            'lock_command = "sudo -n /usr/local/bin/uconsole-helper-mapper-display-control off"',
             'unlock_command = "sudo -n /usr/local/bin/uconsole-helper-mapper-display-control on"',
             'keyboard_backlight_script = "~/WorkSpace/uconsole-keyboard/tools/keyboard_state.sh"',
             "",

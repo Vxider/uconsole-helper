@@ -154,13 +154,10 @@ class KeyboardBacklightController:
         level = self._read_level()
         if level is None:
             return
-        self.saved_level = level
         if level != 0:
             self._set_level(0)
 
     def _unlock_sync(self) -> None:
-        if self.saved_level is not None:
-            self._set_level(self.saved_level)
         self.saved_level = None
 
     def _read_level(self) -> int | None:
