@@ -859,9 +859,15 @@ build_whisper_context() {
 start_recording() {
   mkdir -p "${VOICE_STATE_DIR}"
   log_ptt "start_recording begin"
+  if [[ -f "${STATE_FILE}" ]]; then
+    log_ptt "start_recording ignored: recording already active"
+    return
+  fi
+  : >"${STARTING_FILE}" || true
   if [[ ! -f "${STATE_FILE}" ]] && recording_popup_active; then
     log_ptt "recording popup dismissed by short press"
     dismiss_recording_popup
+    rm -f "${STARTING_FILE}" >/dev/null 2>&1 || true
     return
   fi
   close_recording_popup || true
@@ -870,11 +876,13 @@ start_recording() {
 
   if [[ -z "${ASR_URL}" ]]; then
     echo "ASR_URL is required" >&2
+    rm -f "${STARTING_FILE}" >/dev/null 2>&1 || true
     show_status "uconsole voice" "未配置 ASR Endpoint" "0" "1200"
     exit 1
   fi
   if [[ -z "${ASR_AUTH_TOKEN}" ]]; then
     echo "ASR_AUTH_TOKEN is required for FlashAI ASR" >&2
+    rm -f "${STARTING_FILE}" >/dev/null 2>&1 || true
     show_status "uconsole voice" "未配置 ASR Token" "0" "1200"
     exit 1
   fi
@@ -963,6 +971,7 @@ STREAM_STOP_FILE=$(printf '%q' "${stream_stop_file}")
 RECORDER_NAME=stream
 STARTED_AT_MS=$(date +%s%3N)
 EOF
+  rm -f "${STARTING_FILE}" >/dev/null 2>&1 || true
   log_ptt "recording state written pid=${recorder_pid} state=${STATE_FILE}"
 
   local popup_watch_pid=
@@ -1048,6 +1057,15 @@ inject_text() {
 }
 
 stop_recording() {
+  log_ptt "stop_recording begin state=$([[ -f "${STATE_FILE}" ]] && printf 1 || printf 0) starting=$([[ -f "${STARTING_FILE}" ]] && printf 1 || printf 0)"
+  local wait_started=0
+  while [[ ! -f "${STATE_FILE}" && -f "${STARTING_FILE}" && ${wait_started} -lt 50 ]]; do
+    sleep 0.1
+    wait_started=$((wait_started + 1))
+  done
+  if (( wait_started > 0 )); then
+    log_ptt "stop_recording waited_for_start ticks=${wait_started} state=$([[ -f "${STATE_FILE}" ]] && printf 1 || printf 0)"
+  fi
   if [[ ! -f "${STATE_FILE}" ]]; then
     close_recording_status
     exit 0
@@ -1086,18 +1104,20 @@ stop_recording() {
   fi
 
   if [[ -n "${STREAM_STOP_FILE:-}" ]]; then
+    log_ptt "stop_recording touch stop file=${STREAM_STOP_FILE}"
     : >"${STREAM_STOP_FILE}" || true
   fi
   if [[ "${suppress_asr_status}" != "1" ]]; then
     write_recording_popup_text "识别中" 1
   fi
   if kill -0 "${RECORDER_PID}" >/dev/null 2>&1; then
-    if ! wait_for_exit "${RECORDER_PID}" 120; then
+    if ! wait_for_exit "${RECORDER_PID}" 3; then
+      log_ptt "stop_recording interrupt stream pid=${RECORDER_PID}"
+      terminate_process_group "${RECORDER_PID}" INT
       if [[ "${suppress_asr_status}" != "1" ]]; then
         write_recording_popup_text "识别中" 1
       fi
-      terminate_process_group "${RECORDER_PID}" INT
-      wait_for_exit "${RECORDER_PID}" 20 || true
+      wait_for_exit "${RECORDER_PID}" 120 || true
     fi
     if kill -0 "${RECORDER_PID}" >/dev/null 2>&1; then
       terminate_process_group "${RECORDER_PID}" TERM
@@ -1114,6 +1134,7 @@ stop_recording() {
   fi
 
   if (( duration_ms < VOICE_MIN_RECORD_MS )); then
+    log_ptt "stop_recording too short durationMs=${duration_ms} minMs=${VOICE_MIN_RECORD_MS}"
     if [[ "${suppress_asr_status}" != "1" ]]; then
       show_recording_popup_message_then_close "录音太短，已取消" 2
     else
@@ -1188,6 +1209,7 @@ stop_recording() {
   if [[ "${suppress_asr_status}" != "1" ]]; then
     close_status
   fi
+  log_ptt "stop_recording finished durationMs=${duration_ms}"
   rm -f "${STREAM_RESULT_FILE:-}" "${STREAM_STOP_FILE:-}"
 }
 
@@ -1245,6 +1267,7 @@ fi
 VOICE_GLOSSARY_FILE=${VOICE_GLOSSARY_FILE:-"${HOME}/.config/uconsole-helper-mapper/voice-glossary.txt"}
 VOICE_STATE_DIR=${VOICE_STATE_DIR:-"${XDG_STATE_HOME:-${HOME}/.local/state}/uconsole-helper-mapper"}
 STATE_FILE="${VOICE_STATE_DIR}/voice-ptt.state"
+STARTING_FILE="${VOICE_STATE_DIR}/voice-ptt.starting"
 VOICE_POPUP_DISMISSED_FILE="${VOICE_STATE_DIR}/voice-recording-popup.dismissed"
 VOICE_RECORDER=${VOICE_RECORDER:-auto}
 VOICE_INPUT=${VOICE_INPUT:-default}

@@ -6,12 +6,14 @@ import argparse
 import asyncio
 import logging
 import os
+import queue
 import re
 import subprocess
 import shlex
 import shutil
 import signal
 import sys
+import threading
 import time
 import tomllib
 from dataclasses import dataclass
@@ -439,6 +441,8 @@ def load_config(path: Path) -> Config:
 class ActionRunner:
     def __init__(self) -> None:
         self._last_run: dict[str, float] = {}
+        self._phase_queues: dict[str, queue.Queue[str | None]] = {}
+        self._phase_lock = threading.Lock()
         self._env = os.environ.copy()
         self._hydrate_session_env()
         self._wtype_path = shutil.which("wtype")
@@ -514,7 +518,8 @@ class ActionRunner:
         if (now - last) * 1000 < debounce_ms:
             return
         self._last_run[key] = now
-        self._run_command(command)
+        sequence_key = self._binding_key(binding)
+        self._run_phase_command(sequence_key, command)
 
     def _binding_key(self, binding: Binding) -> str:
         if binding.command:
@@ -535,6 +540,40 @@ class ActionRunner:
             start_new_session=True,
             env=self._env,
         )
+
+    def _run_phase_command(self, sequence_key: str, command: str) -> None:
+        with self._phase_lock:
+            command_queue = self._phase_queues.get(sequence_key)
+            if command_queue is None:
+                command_queue = queue.Queue()
+                self._phase_queues[sequence_key] = command_queue
+                threading.Thread(
+                    target=self._phase_worker,
+                    args=(sequence_key, command_queue),
+                    name=f"phase-binding-{len(self._phase_queues)}",
+                    daemon=True,
+                ).start()
+        command_queue.put(command)
+
+    def _phase_worker(self, sequence_key: str, command_queue: queue.Queue[str | None]) -> None:
+        while True:
+            command = command_queue.get()
+            if command is None:
+                return
+            LOGGER.info("run phase command: %s", command)
+            try:
+                subprocess.run(
+                    ["sh", "-lc", command],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    env=self._env,
+                    check=False,
+                )
+            except OSError as exc:
+                LOGGER.error("phase command failed for %s: %s", sequence_key, exc)
+            finally:
+                command_queue.task_done()
 
     def _run_text(self, text: str, press_enter: bool) -> None:
         if not self._wtype_path:
