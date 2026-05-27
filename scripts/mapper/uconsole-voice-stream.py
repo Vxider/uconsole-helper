@@ -6,6 +6,7 @@ import array
 import hashlib
 import json
 import os
+import re
 import select
 import shlex
 import signal
@@ -51,9 +52,34 @@ def normalize_text(value: str) -> str:
     return " ".join(str(value or "").replace("\r", " ").replace("\n", " ").split()).strip()
 
 
+def is_asr_prompt_echo_transcript(value: str) -> bool:
+    text = re.sub(r"\s+", " ", normalize_text(value))
+    if not text:
+        return False
+    normalized = re.sub(r"[。.!！]+$", "", text).strip()
+    if not normalized:
+        return False
+    glossary_match = re.match(
+        r"^(术语参考|热词参考|关键词参考|glossary\s*terms?)\s*[:：]\s*[^:：]+$",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if glossary_match:
+        term_text = re.sub(
+            r"^(术语参考|热词参考|关键词参考|glossary\s*terms?)\s*[:：]\s*",
+            "",
+            normalized,
+            flags=re.IGNORECASE,
+        ).strip()
+        return bool(re.search(r"[,，、;；]", term_text))
+    return bool(re.match(r"^(ASR\s*Prompt|参考上下文|补充上下文|原始转写)\s*[:：]", normalized, flags=re.IGNORECASE))
+
+
 def is_placeholder_text(value: str) -> bool:
     normalized = normalize_text(value)
     if not normalized:
+        return True
+    if is_asr_prompt_echo_transcript(normalized):
         return True
     return normalized in {"嗯", "嗯。", "嗯，", "呃", "呃。", "啊", "啊。", "啊，"}
 
@@ -850,8 +876,8 @@ class SegmentingTranscriptionSession:
         final_text, raw_text_result, corrected_text, _applied, response_request_id = extract_transcription_fields(json.loads(raw) if raw else {})
         if is_placeholder_text(final_text):
             return ""
-        self.final_text = final_text or text
-        self.raw_text = raw_text_result or text
+        self.final_text = final_text
+        self.raw_text = raw_text_result or final_text
         self.corrected_text = corrected_text
         self.last_request_id = response_request_id or self.request_id
         append_log(
