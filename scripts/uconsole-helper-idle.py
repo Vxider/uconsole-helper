@@ -746,12 +746,12 @@ def maybe_apply_auto_brightness(
     if sample is None or not auto_brightness_enabled(values) or display_off_now or actual_display_off is True:
         return
     suggested, keyboard_level = brightness_targets_from_sample(sample)
-    actual_backlight = read_display_brightness()
-    current_backlight = actual_backlight if actual_backlight is not None else state.current_backlight
     if suggested is None:
         return
     if keyboard_level is None:
         keyboard_level = keyboard_backlight_level(suggested)
+    actual_backlight = read_display_brightness()
+    current_backlight = actual_backlight if actual_backlight is not None else state.current_backlight
     current_keyboard_level = read_keyboard_backlight()
     if suggested == current_backlight and current_keyboard_level == keyboard_level:
         state.current_backlight = suggested
