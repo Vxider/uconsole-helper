@@ -71,6 +71,7 @@ static const float LIGHT_REPORT_SMALL_DELTA_LUX = 6.0f;
 static const float LIGHT_REPORT_LARGE_RATIO = 0.45f;
 static const float LIGHT_PEAK_RATIO = 1.20f;
 static const float LIGHT_SPIKE_RATIO = 3.5f;
+static const uint8_t LIGHT_ZERO_REINIT_SAMPLES = 3;
 static const char *POSE_CALIBRATION_FILE = "/uconsole_pose.txt";
 
 static uint32_t last_sample_ms = 0;
@@ -134,6 +135,7 @@ static float smoothed_light_lux = 0.0f;
 static float last_reported_light_lux = -1.0f;
 static float light_report_candidate_lux = 0.0f;
 static float light_spike_candidate_lux = 0.0f;
+static uint8_t light_zero_sample_count = 0;
 static int current_screen_brightness = 0;
 static int current_keyboard_brightness = 0;
 static int last_reported_screen_brightness = 0;
@@ -372,6 +374,7 @@ static bool init_light_sensor() {
     light_sample_valid = false;
     return false;
   }
+  light_zero_sample_count = 0;
   return true;
 }
 
@@ -393,6 +396,18 @@ static void update_light_sensor(bool force) {
     light_ready = false;
     light_sample_valid = false;
     return;
+  }
+  if (value == 0) {
+    if (light_zero_sample_count < LIGHT_ZERO_REINIT_SAMPLES) {
+      light_zero_sample_count++;
+    }
+    if (light_zero_sample_count >= LIGHT_ZERO_REINIT_SAMPLES) {
+      light_ready = init_light_sensor();
+      light_sample_valid = false;
+      return;
+    }
+  } else {
+    light_zero_sample_count = 0;
   }
   light_raw = value;
   light_lux = (float)value * VEML7700_LUX_PER_COUNT;
