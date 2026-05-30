@@ -331,7 +331,7 @@ class UConsoleHelperWindow(Gtk.Window):
         self.scan_store = Gtk.ListStore(str, str, str, str)
         self.interface_status_store = Gtk.ListStore(str, str, str, str, str, str, str)
         self.interface_tree: Gtk.TreeView | None = None
-        self.tailscale_store = Gtk.ListStore(str, str, str, str, str, str, str, str, str, str)
+        self.tailscale_store = Gtk.ListStore(str, str, str, str, str, str, str, str, str, str, str)
         self.tailscale_summary_label = Gtk.Label(label="", xalign=0)
         self.tailscale_summary_label.get_style_context().add_class("muted")
         self.tailscale_netcheck_label = Gtk.Label(label="", xalign=0)
@@ -339,6 +339,8 @@ class UConsoleHelperWindow(Gtk.Window):
         self.tailscale_netcheck_value_labels: dict[str, Gtk.Label] = {}
         self.tailscale_netcheck_running = False
         self.tailscale_netcheck_details: dict[str, str] = {}
+        self.tailscale_latency_running = False
+        self.tailscale_latency_cache: dict[str, str] = {}
         self.power_labels: dict[str, Gtk.Label] = {}
         self.power_controls: dict[str, Gtk.Widget] = {}
         self.power_control_rows: dict[str, tuple[Gtk.Widget, Gtk.Widget]] = {}
@@ -669,9 +671,9 @@ class UConsoleHelperWindow(Gtk.Window):
         self.tailscale_tree = Gtk.TreeView(model=self.tailscale_store)
         self.tailscale_tree.set_headers_visible(True)
         self.tailscale_tree.connect("button-press-event", self.on_tailscale_tree_button_press)
-        for index, title in enumerate(["设备", "OS", "地址", "状态", "最后在线", "出口节点"]):
+        for index, title in enumerate(["设备", "OS", "地址", "延迟", "状态", "最后在线", "出口节点"]):
             renderer = Gtk.CellRendererText()
-            column = Gtk.TreeViewColumn(title, renderer, text=index, foreground=6)
+            column = Gtk.TreeViewColumn(title, renderer, text=index, foreground=7)
             column.set_resizable(True)
             self.tailscale_tree.append_column(column)
 
@@ -1275,9 +1277,9 @@ class UConsoleHelperWindow(Gtk.Window):
         tree_iter = self.tailscale_store.get_iter(path)
         menu = Gtk.Menu()
         for value in (
-            self.tailscale_store[tree_iter][7],
             self.tailscale_store[tree_iter][8],
             self.tailscale_store[tree_iter][9],
+            self.tailscale_store[tree_iter][10],
         ):
             item = Gtk.MenuItem(label=value)
             item.set_sensitive(value != "-")
@@ -1525,10 +1527,10 @@ class UConsoleHelperWindow(Gtk.Window):
             set_underlined_button_label(self.tailscale_reconnect_button, "Disable" if active else "Enable", "E")
             reconnect_context.add_class("action-active" if active else "action-ready")
         elif self.tailscale_reconnecting:
-            set_underlined_button_label(self.tailscale_reconnect_button, "Reconnecting", "C")
+            set_underlined_button_label(self.tailscale_reconnect_button, "Reconnecting", "E")
             reconnect_context.add_class("action-busy")
         else:
-            set_underlined_button_label(self.tailscale_reconnect_button, "Reconnect", "C")
+            set_underlined_button_label(self.tailscale_reconnect_button, "Reconnect", "E")
             reconnect_context.add_class("action-ready")
         action_context = self.context_action_button.get_style_context()
         for class_name in ("action-ready", "action-active", "action-busy"):
@@ -1762,7 +1764,7 @@ class UConsoleHelperWindow(Gtk.Window):
         if key_lower == "v" and self.stack.get_visible_child_name() in {"power", "mapper", "asr"}:
             self.run_context_action()
             return True
-        if key_lower == "c" and self.stack.get_visible_child_name() == "tailscale":
+        if key_lower == "e" and self.stack.get_visible_child_name() == "tailscale":
             self.run_secondary_header_action()
             return True
         if key_lower == "c":
@@ -1930,12 +1932,17 @@ class UConsoleHelperWindow(Gtk.Window):
         self.tailscale_summary_label.set_text(tailscale_network_summary())
         self.update_tailscale_netcheck_details(self.tailscale_netcheck_details)
         self.refresh_tailscale_netcheck_async()
-        for device in tailscale_devices(status):
+        devices = tailscale_devices(status)
+        for device in devices:
+            latency = device["ping_latency"]
+            if device["ping_target"] != "-":
+                latency = self.tailscale_latency_cache.get(device["ping_target"], "...")
             self.tailscale_store.append(
                 [
                     device["name"],
                     device["os"],
                     device["addresses"],
+                    latency,
                     device["status"],
                     device["last_seen"],
                     device["exit_node"],
@@ -1945,6 +1952,37 @@ class UConsoleHelperWindow(Gtk.Window):
                     device["dns"],
                 ]
             )
+        self.refresh_tailscale_latency_async(devices)
+
+    def refresh_tailscale_latency_async(self, devices: list[dict[str, str]]) -> None:
+        if self.tailscale_latency_running:
+            return
+        targets = sorted(
+            {
+                device["ping_target"]
+                for device in devices
+                if device["ping_target"] != "-" and device["status"] in {"Online", "Active"}
+            }
+        )
+        if not targets:
+            return
+        self.tailscale_latency_running = True
+        thread = threading.Thread(target=self._tailscale_latency_worker, args=(targets,), daemon=True)
+        thread.start()
+
+    def _tailscale_latency_worker(self, targets: list[str]) -> None:
+        latencies = tailscale_ping_latencies(targets)
+        GLib.idle_add(self.finish_tailscale_latency_refresh, latencies)
+
+    def finish_tailscale_latency_refresh(self, latencies: dict[str, str]) -> bool:
+        self.tailscale_latency_running = False
+        self.tailscale_latency_cache.update(latencies)
+        if self.current_page_name == "tailscale":
+            for row in self.tailscale_store:
+                target = row[8]
+                if target in latencies:
+                    row[3] = latencies[target]
+        return False
 
     def refresh_tailscale_netcheck_async(self) -> None:
         if self.tailscale_netcheck_running:
@@ -4299,10 +4337,13 @@ def tailscale_device_row(device: dict[str, object], is_self: bool) -> dict[str, 
     if is_self or online:
         last_seen = "-"
     exit_node = "yes" if bool(device.get("ExitNode")) or bool(device.get("ExitNodeOption")) else "-"
+    ping_target = ipv4 if online and not is_self and ipv4 != "-" else "-"
     return {
         "name": name,
         "os": os_name,
         "addresses": ipv4,
+        "ping_latency": "-",
+        "ping_target": ping_target,
         "status": status,
         "last_seen": last_seen,
         "exit_node": exit_node,
@@ -4310,6 +4351,57 @@ def tailscale_device_row(device: dict[str, object], is_self: bool) -> dict[str, 
         "ipv6": ipv6,
         "dns": dns or "-",
     }
+
+
+def tailscale_ping_latencies(targets: list[str]) -> dict[str, str]:
+    ping = shutil.which("tailscale")
+    if ping is None:
+        return {target: "-" for target in targets}
+
+    def ping_one(target: str) -> tuple[str, str]:
+        try:
+            result = subprocess.run(
+                [ping, "ping", "--c", "1", "--timeout", "1s", target],
+                text=True,
+                capture_output=True,
+                timeout=2.5,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return target, "-"
+        label = tailscale_ping_latency_label(result.stdout)
+        return target, label
+
+    latencies: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(targets)))) as executor:
+        futures = [executor.submit(ping_one, target) for target in targets]
+        for future in as_completed(futures):
+            target, label = future.result()
+            latencies[target] = label
+    return latencies
+
+
+def tailscale_ping_latency_label(output: str) -> str:
+    match = re.search(r"\bin\s+([0-9.]+)\s*(µs|us|ms|s)\b", output)
+    if match is None:
+        return "-"
+    try:
+        value = float(match.group(1))
+    except ValueError:
+        return "-"
+    unit = match.group(2)
+    if unit in {"µs", "us"}:
+        ms = value / 1000.0
+    elif unit == "s":
+        ms = value * 1000.0
+    else:
+        ms = value
+    route = " DERP" if "via DERP" in output else ""
+    if ms >= 100:
+        return f"{ms:.0f} ms{route}"
+    if ms >= 10:
+        return f"{ms:.1f} ms{route}"
+    return f"{ms:.2f} ms{route}"
 
 
 def tailscale_ip_pair(addresses: object) -> tuple[str, str]:

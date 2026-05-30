@@ -67,6 +67,7 @@ static const uint8_t WS2812_BRIGHTNESS = 24;
 static const float VEML7700_LUX_PER_COUNT = 0.0576f;
 static const uint32_t LIGHT_SAMPLE_INTERVAL_MS = 1000;
 static const float LIGHT_SMOOTH_ALPHA = 0.18f;
+static const float LIGHT_DARKEN_SMOOTH_ALPHA = 0.65f;
 static const float LIGHT_REPORT_SMALL_DELTA_LUX = 6.0f;
 static const float LIGHT_REPORT_LARGE_RATIO = 0.45f;
 static const float LIGHT_PEAK_RATIO = 1.20f;
@@ -429,7 +430,8 @@ static void update_light_sensor(bool force) {
     } else {
       light_spike_candidate_since = 0;
     }
-    smoothed_light_lux += LIGHT_SMOOTH_ALPHA * (light_lux - smoothed_light_lux);
+    const float alpha = light_lux < smoothed_light_lux ? LIGHT_DARKEN_SMOOTH_ALPHA : LIGHT_SMOOTH_ALPHA;
+    smoothed_light_lux += alpha * (light_lux - smoothed_light_lux);
   }
   light_sample_valid = true;
   update_brightness_targets();
@@ -468,7 +470,7 @@ static void update_brightness_targets() {
   } else if (target > current_screen_brightness) {
     current_screen_brightness++;
   } else if (target < current_screen_brightness) {
-    current_screen_brightness--;
+    current_screen_brightness = target;
   }
   current_keyboard_brightness = keyboard_brightness_for_screen(current_screen_brightness);
 }

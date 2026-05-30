@@ -348,6 +348,8 @@ install_mapper() {
   fi
   if ! grep -Eq '^ASR_RETRY_COUNT=' "${config_dir}/voice.env"; then
     printf 'ASR_RETRY_COUNT=3\n' >> "${config_dir}/voice.env"
+  elif grep -Eq '^ASR_RETRY_COUNT=1$' "${config_dir}/voice.env"; then
+    perl -0pi -e 's/^ASR_RETRY_COUNT=1$/ASR_RETRY_COUNT=2/m' "${config_dir}/voice.env"
   fi
   if ! grep -Eq '^ASR_RETRY_DELAY=' "${config_dir}/voice.env"; then
     printf 'ASR_RETRY_DELAY=0.35\n' >> "${config_dir}/voice.env"
