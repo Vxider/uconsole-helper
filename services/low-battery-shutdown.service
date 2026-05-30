@@ -1,0 +1,6 @@
+[Unit]
+Description=Power off when battery is critically low
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/low-battery-shutdown

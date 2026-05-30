@@ -1,0 +1,11 @@
+[Unit]
+Description=Check battery level for critical shutdown
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=15s
+Unit=low-battery-shutdown.service
+
+[Install]
+WantedBy=timers.target

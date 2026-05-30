@@ -1,0 +1,104 @@
+#!/bin/sh
+set -eu
+
+BATTERY=${LOW_BATTERY_SYSFS_BATTERY:-/sys/class/power_supply/axp20x-battery}
+AC=${LOW_BATTERY_SYSFS_AC:-/sys/class/power_supply/axp22x-ac}
+THRESHOLD=${LOW_BATTERY_CAPACITY_THRESHOLD:-5}
+VOLTAGE_THRESHOLD_UV=${LOW_BATTERY_VOLTAGE_THRESHOLD_UV:-3200000}
+REQUIRED_SAMPLES=${LOW_BATTERY_REQUIRED_SAMPLES:-2}
+STATE_FILE=${LOW_BATTERY_STATE_FILE:-/run/low-battery-shutdown.low_count}
+LOG_FILE=${LOW_BATTERY_LOG_FILE:-/var/log/uconsole-battery.log}
+
+read_field() {
+    path="$1"
+    if [ -r "$path" ]; then
+        cat "$path" 2>/dev/null || true
+    fi
+}
+
+is_uint() {
+    case "$1" in
+        ''|*[!0-9]*)
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+log_sample() {
+    decision="$1"
+    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+    printf '%s capacity=%s status=%s ac_online=%s voltage_now=%s current_now=%s energy_now=%s energy_full=%s calibrate=%s low_count=%s decision=%s\n' \
+        "$(date -Is)" \
+        "${capacity:-}" \
+        "${status:-}" \
+        "${online:-}" \
+        "${voltage_now:-}" \
+        "${current_now:-}" \
+        "${energy_now:-}" \
+        "${energy_full:-}" \
+        "${calibrate:-}" \
+        "${low_count:-0}" \
+        "$decision" >>"$LOG_FILE" 2>/dev/null || true
+}
+
+[ -r "$BATTERY/capacity" ] || exit 0
+[ -r "$BATTERY/status" ] || exit 0
+
+capacity=$(read_field "$BATTERY/capacity")
+status=$(read_field "$BATTERY/status")
+voltage_now=$(read_field "$BATTERY/voltage_now")
+current_now=$(read_field "$BATTERY/current_now")
+energy_now=$(read_field "$BATTERY/energy_now")
+energy_full=$(read_field "$BATTERY/energy_full")
+calibrate=$(read_field "$BATTERY/calibrate")
+online=0
+
+if [ -r "$AC/online" ]; then
+    online=$(read_field "$AC/online")
+fi
+
+if ! is_uint "$capacity"; then
+    rm -f "$STATE_FILE"
+    log_sample "invalid-capacity"
+    exit 0
+fi
+
+if [ "$online" = "1" ] || [ "$status" = "Charging" ] || [ "$status" = "Full" ]; then
+    rm -f "$STATE_FILE"
+    log_sample "charging-or-ac"
+    exit 0
+fi
+
+low=0
+if [ "$capacity" -lt "$THRESHOLD" ]; then
+    low=1
+fi
+if is_uint "$voltage_now" && [ "$voltage_now" -lt "$VOLTAGE_THRESHOLD_UV" ]; then
+    low=1
+fi
+
+if [ "$low" -ne 1 ]; then
+    rm -f "$STATE_FILE"
+    log_sample "ok"
+    exit 0
+fi
+
+low_count=1
+if [ -r "$STATE_FILE" ]; then
+    previous=$(cat "$STATE_FILE" 2>/dev/null || true)
+    if is_uint "$previous"; then
+        low_count=$((previous + 1))
+    fi
+fi
+printf '%s\n' "$low_count" >"$STATE_FILE"
+
+if [ "$low_count" -lt "$REQUIRED_SAMPLES" ]; then
+    log_sample "low-pending"
+    exit 0
+fi
+
+logger -t low-battery-shutdown "Battery critical: capacity=${capacity}% voltage=${voltage_now:-unknown}uV AC offline, shutting down"
+log_sample "shutdown"
+sync
+systemctl poweroff

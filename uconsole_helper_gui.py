@@ -83,6 +83,25 @@ MCU_FIRMWARE_EVENT_LABELS = {
     "freefall": "姿态变化",
     "impact": "姿态变化",
 }
+
+
+@dataclass(frozen=True)
+class BatteryInfo:
+    capacity: int
+    status: str
+    voltage_uv: int | None
+    current_ua: int | None
+    energy_now: int | None
+    energy_full: int | None
+    calibrate: int | None
+
+    @property
+    def voltage_v(self) -> float | None:
+        if self.voltage_uv is None:
+            return None
+        return self.voltage_uv / 1_000_000
+
+
 MCU_POSE_LABELS = {
     "face_up": "正面朝上",
     "face_down": "正面朝下",
@@ -2353,9 +2372,10 @@ class UConsoleHelperWindow(Gtk.Window):
         self.app_power_store.append(["Collecting sample...", "-", "-", "-", "-"])
 
     def refresh_utils_status(self) -> None:
-        capacity = battery_capacity_percent()
-        if capacity >= 0:
-            self.utils_battery_label.set_text(f"{capacity}%")
+        battery = battery_info()
+        capacity = battery.capacity if battery is not None else -1
+        if battery is not None:
+            self.utils_battery_label.set_text(battery_diagnostics_label(battery))
         else:
             self.utils_battery_label.set_text("Unknown")
         self.utils_calibrate_button.set_sensitive(capacity == 100)
@@ -5671,6 +5691,51 @@ def battery_power_label() -> str:
     return "-"
 
 
+def read_int(*paths: Path) -> int | None:
+    value = read_number(*paths)
+    if value is None:
+        return None
+    return int(value)
+
+
+def battery_info() -> BatteryInfo | None:
+    for battery in battery_supplies():
+        capacity = read_number(battery / "capacity")
+        if capacity is None:
+            continue
+        return BatteryInfo(
+            capacity=int(max(0, min(100, capacity))),
+            status=read_first_existing(battery / "status").lower(),
+            voltage_uv=read_int(battery / "voltage_now"),
+            current_ua=read_int(battery / "current_now"),
+            energy_now=read_int(battery / "energy_now"),
+            energy_full=read_int(battery / "energy_full", battery / "energy_full_design"),
+            calibrate=read_int(battery / "calibrate"),
+        )
+    return None
+
+
+def battery_voltage_label(info: BatteryInfo | None = None) -> str:
+    info = info or battery_info()
+    if info is None or info.voltage_v is None:
+        return "-"
+    return f"{info.voltage_v:.2f} V"
+
+
+def battery_diagnostics_label(info: BatteryInfo | None = None) -> str:
+    info = info or battery_info()
+    if info is None:
+        return "Unknown"
+    parts = [f"{info.capacity}%"]
+    if info.voltage_v is not None:
+        parts.append(f"{info.voltage_v:.2f} V")
+    if info.status:
+        parts.append(info.status)
+    if info.calibrate is not None:
+        parts.append(f"cal {info.calibrate}")
+    return " / ".join(parts)
+
+
 def ac_power_label() -> str:
     for supply in mains_supplies():
         rate = read_number(supply / "power_now")
@@ -5697,18 +5762,15 @@ def mains_supplies() -> list[Path]:
 
 
 def battery_capacity_label() -> str:
-    capacity = battery_capacity_percent()
-    if capacity >= 0:
-        return f"{capacity}%"
+    info = battery_info()
+    if info is not None:
+        return f"{info.capacity}%"
     return "-"
 
 
 def battery_capacity_percent() -> int:
-    for battery in battery_supplies():
-        capacity = read_number(battery / "capacity")
-        if capacity is not None:
-            return int(max(0, min(100, capacity)))
-    return -1
+    info = battery_info()
+    return info.capacity if info is not None else -1
 
 
 def power_state_label(state: object) -> str:
@@ -5722,6 +5784,9 @@ def power_state_label(state: object) -> str:
 def power_meter_label(state: object, percent: int) -> str:
     label = str(state or "-").upper()
     if percent >= 0:
+        voltage = battery_voltage_label()
+        if voltage != "-":
+            return f"{label} {percent}% {voltage}"
         return f"{label} {percent}%"
     return label
 

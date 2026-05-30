@@ -98,11 +98,15 @@ EOF
 
 install_service() {
   local bin_file="/usr/local/bin/uconsole-helper-service"
+  local low_battery_file="/usr/local/sbin/low-battery-shutdown"
   local config_dir="/etc/uconsole-helper"
   local config_file="${config_dir}/uconsole-helper.conf"
   local service_file="/etc/systemd/system/uconsole-helper.service"
+  local low_battery_service_file="/etc/systemd/system/low-battery-shutdown.service"
+  local low_battery_timer_file="/etc/systemd/system/low-battery-shutdown.timer"
 
   sudo install -m 0755 "${APP_DIR}/uconsole_helper_service.py" "${bin_file}"
+  sudo install -m 0755 "${APP_DIR}/scripts/system/low-battery-shutdown" "${low_battery_file}"
   sudo install -d -m 0755 "${config_dir}"
   if [[ ! -f "${config_file}" ]]; then
     sudo install -m 0644 "${APP_DIR}/config/uconsole-helper.conf" "${config_file}"
@@ -144,9 +148,12 @@ install_service() {
     ensure_config_key "${config_file}" "POWERSAVER_PERFORMANCE_AUTO_AC_PUTDOWN_TIMEOUT_SEC" "300"
   fi
   sudo install -m 0644 "${APP_DIR}/services/uconsole-helper.service" "${service_file}"
+  sudo install -m 0644 "${APP_DIR}/services/low-battery-shutdown.service" "${low_battery_service_file}"
+  sudo install -m 0644 "${APP_DIR}/services/low-battery-shutdown.timer" "${low_battery_timer_file}"
   sudo systemctl daemon-reload
   if [[ "${START_SERVICE}" -eq 1 ]]; then
     sudo systemctl enable --now uconsole-helper.service
+    sudo systemctl enable --now low-battery-shutdown.timer
   fi
 
   local sudoers_file="/etc/sudoers.d/uconsole-helper-service-write-config"
@@ -164,6 +171,9 @@ install_service() {
   echo "  ${service_file}"
   echo "Installed service runner:"
   echo "  ${bin_file}"
+  echo "Installed low-battery shutdown:"
+  echo "  ${low_battery_file}"
+  echo "  ${low_battery_timer_file}"
   echo "Config:"
   echo "  ${config_file}"
 }
