@@ -7325,12 +7325,13 @@ def format_light_label(snapshot: McuStateSnapshot) -> str:
     if lux is not None:
         suggested = snapshot.suggested_backlight
         smooth_text = f"{smoothed_lux:.1f}" if smoothed_lux is not None else "-"
+        age_text = f"{max(0.0, time.time() - snapshot.last_update):.1f}s"
         if suggested is None:
             suggest_text = "-"
         else:
             level = light_level_by_backlight(suggested)
             suggest_text = f"{level[1]} {suggested}/9"
-        suffix = f" / 滤波 {smooth_text} lx / 建议 {suggest_text} / 实际 {actual_backlight}"
+        suffix = f" / 滤波 {smooth_text} lx / 建议 {suggest_text} / 实际 {actual_backlight} / 样本 {age_text}"
         if raw is not None:
             return f"原始 {lux:.1f} lx (raw {raw}){suffix}"
         return f"原始 {lux:.1f} lx{suffix}"

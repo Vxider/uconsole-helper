@@ -30,6 +30,9 @@ DISPLAY_STATUS_ACTIVE_POLL_SECONDS = 10
 DISPLAY_STATUS_OFF_POLL_SECONDS = 2
 AUTO_MCU_STALE_SECONDS = 20
 AUTO_PICKUP_WAKE_ENABLED = False
+AUTO_BRIGHTNESS_RAISE_STABLE_SECONDS = 1.5
+AUTO_BRIGHTNESS_LOWER_STABLE_SECONDS = 4.0
+AUTO_BRIGHTNESS_MANUAL_GRACE_SECONDS = 45.0
 LED_POWER_POLL_SECONDS = 30
 TMUX_NOTIFY_POLL_SECONDS = 5
 TMUX_NOTIFY_MARKER = Path(f"/run/user/{os.getuid()}/uconsole-helper-tmux-notify")
@@ -153,6 +156,10 @@ class McuSerialReader:
 class AutoBrightnessState:
     def __init__(self) -> None:
         self.current_backlight: int | None = None
+        self.pending_backlight: int | None = None
+        self.pending_keyboard_level: int | None = None
+        self.pending_since: float = 0.0
+        self.manual_override_until: float = 0.0
 
 
 class HostInputMonitor:
@@ -649,6 +656,21 @@ def brightness_targets_from_sample(sample: dict[str, object]) -> tuple[int | Non
     return screen, keyboard
 
 
+def light_log_fields(sample: dict[str, object]) -> str:
+    light = sample.get("light")
+    if not isinstance(light, dict):
+        return "raw=- lux=- smooth=- sampleAge=-"
+    raw = light.get("raw", "-")
+    lux = light.get("lux", "-")
+    smooth = light.get("smoothed_lux", "-")
+    received_at = sample.get("_received_at")
+    if isinstance(received_at, (int, float)):
+        age = f"{max(0.0, time.time() - float(received_at)):.1f}s"
+    else:
+        age = "-"
+    return f"raw={raw} lux={lux} smooth={smooth} sampleAge={age}"
+
+
 def start_swayidle(timeout_sec: int) -> subprocess.Popen[str] | None:
     if timeout_sec <= 0:
         return None
@@ -754,11 +776,48 @@ def maybe_apply_auto_brightness(
     actual_backlight = read_display_brightness()
     current_backlight = actual_backlight if actual_backlight is not None else state.current_backlight
     current_keyboard_level = read_keyboard_backlight()
+    now = time.time()
+    if (
+        actual_backlight is not None
+        and state.current_backlight is not None
+        and actual_backlight != state.current_backlight
+        and actual_backlight != suggested
+    ):
+        state.current_backlight = actual_backlight
+        state.pending_backlight = None
+        state.manual_override_until = now + AUTO_BRIGHTNESS_MANUAL_GRACE_SECONDS
+        print(
+            f"auto brightness manual override: actual={actual_backlight} "
+            f"suggested={suggested} hold={AUTO_BRIGHTNESS_MANUAL_GRACE_SECONDS:.0f}s "
+            f"{light_log_fields(sample)}",
+            flush=True,
+        )
+        return
+    if now < state.manual_override_until:
+        return
     if display_is_off_now and suggested == current_backlight:
         state.current_backlight = suggested
+        state.pending_backlight = None
         return
     if suggested == current_backlight and current_keyboard_level == keyboard_level:
         state.current_backlight = suggested
+        state.pending_backlight = None
+        return
+    if suggested != state.pending_backlight or keyboard_level != state.pending_keyboard_level:
+        state.pending_backlight = suggested
+        state.pending_keyboard_level = keyboard_level
+        state.pending_since = now
+        print(
+            f"auto brightness pending: screen={suggested} keyboard={keyboard_level} "
+            f"actual={actual_backlight if actual_backlight is not None else '-'} "
+            f"displayOff={int(display_is_off_now)} {light_log_fields(sample)}",
+            flush=True,
+        )
+        return
+    stable_seconds = AUTO_BRIGHTNESS_LOWER_STABLE_SECONDS
+    if current_backlight is None or suggested > current_backlight:
+        stable_seconds = AUTO_BRIGHTNESS_RAISE_STABLE_SECONDS
+    if now - state.pending_since < stable_seconds:
         return
     if suggested != current_backlight and not display_brightness(suggested):
         return
@@ -767,10 +826,11 @@ def maybe_apply_auto_brightness(
     print(
         f"auto brightness: screen={suggested} keyboard={keyboard_level} "
         f"actual={actual_backlight if actual_backlight is not None else '-'} "
-        f"displayOff={int(display_is_off_now)}",
+        f"displayOff={int(display_is_off_now)} {light_log_fields(sample)}",
         flush=True,
     )
     state.current_backlight = suggested
+    state.pending_backlight = None
 
 
 def main() -> int:

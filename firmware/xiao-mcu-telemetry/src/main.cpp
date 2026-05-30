@@ -73,6 +73,7 @@ static const float LIGHT_REPORT_LARGE_RATIO = 0.45f;
 static const float LIGHT_PEAK_RATIO = 1.20f;
 static const float LIGHT_SPIKE_RATIO = 3.5f;
 static const uint8_t LIGHT_ZERO_REINIT_SAMPLES = 3;
+static const uint8_t LIGHT_ZERO_STABLE_SAMPLES = 3;
 static const char *POSE_CALIBRATION_FILE = "/uconsole_pose.txt";
 
 static uint32_t last_sample_ms = 0;
@@ -206,23 +207,25 @@ static void update_status_pixel() {
   if (tmux_notify_active && now > tmux_notify_until) {
     tmux_notify_active = false;
   }
-  if (led_night_mode_enabled && light_ready && light_lux < 1.0f) {
-    set_status_pixel(0);
-    return;
-  }
-
   const bool battery_known = battery_percent >= 0;
   const bool charging = battery_status == "charging";
   const bool full = battery_status == "full" || (charging && battery_known && battery_percent >= 100);
   const bool discharging = !charging && !full;
+  const bool charging_visible = led_battery_enabled && charging && battery_known && battery_percent < 100;
+  const bool notify_visible = led_notify_enabled && tmux_notify_active;
+
+  if (led_night_mode_enabled && light_ready && light_lux < 1.0f && !host_screen_on) {
+    set_status_pixel(0);
+    return;
+  }
 
   if (led_battery_enabled && discharging && battery_known && battery_percent < 8) {
     set_status_pixel(flash_on(now, LED_FAST_FLASH_PERIOD_MS, LED_FAST_FLASH_PERIOD_MS / 2) ? scaled_color(255, 0, 0, WS2812_BRIGHTNESS) : 0);
   } else if (led_battery_enabled && discharging && battery_known && battery_percent < 15) {
     set_status_pixel(flash_on(now, LED_SLOW_FLASH_PERIOD_MS, LED_SLOW_FLASH_PERIOD_MS / 2) ? scaled_color(255, 0, 0, WS2812_BRIGHTNESS) : 0);
-  } else if (led_notify_enabled && tmux_notify_active) {
+  } else if (notify_visible) {
     set_status_pixel(double_flash_on(now) ? scaled_color(120, 0, 255, WS2812_BRIGHTNESS) : 0);
-  } else if (led_battery_enabled && charging && battery_known && battery_percent < 100) {
+  } else if (charging_visible) {
     set_status_pixel(
       flash_on(now, LED_CHARGING_FLASH_PERIOD_MS, LED_CHARGING_FLASH_ON_MS)
         ? battery_gradient_color(battery_percent, WS2812_BRIGHTNESS)
@@ -402,10 +405,17 @@ static void update_light_sensor(bool force) {
     if (light_zero_sample_count < LIGHT_ZERO_REINIT_SAMPLES) {
       light_zero_sample_count++;
     }
+    if (have_smoothed_light && smoothed_light_lux > 5.0f && light_zero_sample_count < LIGHT_ZERO_STABLE_SAMPLES) {
+      light_sample_valid = true;
+      update_brightness_targets();
+      return;
+    }
     if (light_zero_sample_count >= LIGHT_ZERO_REINIT_SAMPLES) {
       light_ready = init_light_sensor();
-      light_sample_valid = false;
-      return;
+      if (!light_ready) {
+        light_sample_valid = false;
+        return;
+      }
     }
   } else {
     light_zero_sample_count = 0;
