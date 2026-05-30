@@ -5344,7 +5344,7 @@ def default_asr_config() -> dict[str, str]:
         "ASR_TIMEOUT": "90",
         "ASR_REQUEST_ATTEMPT_TIMEOUT": "75",
         "ASR_CONNECT_TIMEOUT": "2",
-        "ASR_RETRY_COUNT": "1",
+        "ASR_RETRY_COUNT": "2",
         "ASR_RETRY_DELAY": "0.35",
         "ASR_PREVIEW_FINAL_WAIT_SECONDS": "1.5",
         "ASR_PREVIEW_WS_TIMEOUT": "2",
@@ -6752,7 +6752,12 @@ def read_mcu_snapshot(state: McuTelemetryState) -> McuStateSnapshot:
             recent_rows=(),
         )
 
-    sample = read_xiao_sample(device, state)
+    sample = read_shared_mcu_sample()
+    if sample is not None and state.serial_session is not None:
+        state.serial_session.close()
+        state.serial_session = None
+    if sample is None:
+        sample = read_xiao_sample(device, state)
     if sample is None:
         if state.samples:
             last_sample = state.samples[-1]
@@ -6883,6 +6888,23 @@ def read_xiao_sample(device: McuDeviceInfo, state: McuTelemetryState) -> McuTele
     state.serial_waiting = False
     state.last_error = ""
     return sample
+
+
+def read_shared_mcu_sample() -> McuTelemetrySample | None:
+    try:
+        stat = MCU_SHARED_SAMPLE_FILE.stat()
+    except OSError:
+        return None
+    if time.time() - stat.st_mtime > 5.0:
+        return None
+    try:
+        text = MCU_SHARED_SAMPLE_FILE.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    sample = parse_mcu_line(text)
+    if sample is None:
+        return None
+    return dataclasses.replace(sample, timestamp=stat.st_mtime, source="shared")
 
 
 def write_shared_mcu_line(line: str) -> None:

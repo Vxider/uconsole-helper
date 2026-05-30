@@ -25,6 +25,9 @@ import wave
 from pathlib import Path
 
 
+RETRYABLE_ASR_HTTP_STATUS_CODES = {502, 503, 504}
+
+
 def env_int(name: str, fallback: int) -> int:
     try:
         value = int(str(os.environ.get(name, "")).strip())
@@ -822,8 +825,16 @@ class SegmentingTranscriptionSession:
                 )
                 with urllib.request.urlopen(request, timeout=self.request_attempt_timeout) as response:
                     return response.read().decode("utf-8", "replace")
-            except urllib.error.HTTPError:
-                raise
+            except urllib.error.HTTPError as exc:
+                if exc.code not in RETRYABLE_ASR_HTTP_STATUS_CODES:
+                    raise
+                last_error = exc
+                append_log(
+                    f"final ASR request retryable HTTP error attempt={attempt}/{self.retry_count}: "
+                    f"HTTP {exc.code} {exc.reason}"
+                )
+                if attempt < self.retry_count and self.retry_delay > 0:
+                    time.sleep(self.retry_delay)
             except Exception as exc:
                 last_error = exc
                 append_log(f"final ASR request attempt failed attempt={attempt}/{self.retry_count}: {type(exc).__name__}: {exc}")
@@ -855,8 +866,16 @@ class SegmentingTranscriptionSession:
                 )
                 with urllib.request.urlopen(request, timeout=self.request_attempt_timeout) as response:
                     return response.read().decode("utf-8", "replace")
-            except urllib.error.HTTPError:
-                raise
+            except urllib.error.HTTPError as exc:
+                if exc.code not in RETRYABLE_ASR_HTTP_STATUS_CODES:
+                    raise
+                last_error = exc
+                append_log(
+                    f"streaming final text retryable HTTP error attempt={attempt}/{self.retry_count}: "
+                    f"HTTP {exc.code} {exc.reason}"
+                )
+                if attempt < self.retry_count and self.retry_delay > 0:
+                    time.sleep(self.retry_delay)
             except Exception as exc:
                 last_error = exc
                 append_log(f"streaming final text request attempt failed attempt={attempt}/{self.retry_count}: {type(exc).__name__}: {exc}")
@@ -892,6 +911,9 @@ class SegmentingTranscriptionSession:
         self.segment_index += 1
         request_id = self.request_id if final_segment else f"{self.request_id}_{self.segment_index}"
         audio_path = self.write_wav(pcm, request_id)
+        keep_audio = os.environ.get("VOICE_KEEP_AUDIO", "0") == "1"
+        keep_failed_audio = os.environ.get("VOICE_KEEP_FAILED_AUDIO", "1") == "1"
+        upload_failed = False
         try:
             append_log(
                 f"final ASR upload started requestId={request_id} bytes={len(pcm)} "
@@ -939,10 +961,13 @@ class SegmentingTranscriptionSession:
             else:
                 append_log(f"server ASR returned empty requestId={request_id}")
             return text
-        except Exception:
+        except Exception as exc:
+            upload_failed = True
+            if keep_failed_audio:
+                append_log(f"final ASR failed; kept audio path={audio_path} error={type(exc).__name__}: {exc}")
             raise
         finally:
-            if os.environ.get("VOICE_KEEP_AUDIO", "0") != "1":
+            if not keep_audio and not (upload_failed and keep_failed_audio):
                 try:
                     audio_path.unlink()
                 except FileNotFoundError:

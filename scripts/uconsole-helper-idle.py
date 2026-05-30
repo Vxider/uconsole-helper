@@ -743,8 +743,9 @@ def maybe_apply_auto_brightness(
     display_off_now: bool,
 ) -> None:
     actual_display_off = read_display_off_sysfs()
-    if sample is None or not auto_brightness_enabled(values) or display_off_now or actual_display_off is True:
+    if sample is None or not auto_brightness_enabled(values):
         return
+    display_is_off_now = display_off_now or actual_display_off is True
     suggested, keyboard_level = brightness_targets_from_sample(sample)
     if suggested is None:
         return
@@ -753,16 +754,20 @@ def maybe_apply_auto_brightness(
     actual_backlight = read_display_brightness()
     current_backlight = actual_backlight if actual_backlight is not None else state.current_backlight
     current_keyboard_level = read_keyboard_backlight()
+    if display_is_off_now and suggested == current_backlight:
+        state.current_backlight = suggested
+        return
     if suggested == current_backlight and current_keyboard_level == keyboard_level:
         state.current_backlight = suggested
         return
     if suggested != current_backlight and not display_brightness(suggested):
         return
-    if current_keyboard_level != keyboard_level:
+    if not display_is_off_now and current_keyboard_level != keyboard_level:
         set_keyboard_backlight(keyboard_level)
     print(
         f"auto brightness: screen={suggested} keyboard={keyboard_level} "
-        f"actual={actual_backlight if actual_backlight is not None else '-'}",
+        f"actual={actual_backlight if actual_backlight is not None else '-'} "
+        f"displayOff={int(display_is_off_now)}",
         flush=True,
     )
     state.current_backlight = suggested
