@@ -444,7 +444,10 @@ def read_text(path: Path) -> str:
 
 def power_supply_present(path: Path) -> bool:
     present = path / "present"
-    return not present.exists() or read_text(present) not in {"0", "false", "False"}
+    if not present.exists():
+        return True
+    value = read_text(present)
+    return bool(value) and value not in {"0", "false", "False"}
 
 
 def power_supply_online(path: Path) -> bool | None:
@@ -465,8 +468,11 @@ def power_state(power_supply_dir: Path = POWER_SUPPLY_DIR) -> str:
     for path in sorted(power_supply_dir.iterdir()):
         supply_type = read_text(path / "type")
         if supply_type == "Battery" and power_supply_present(path):
+            status = read_text(path / "status").lower()
+            if not status:
+                continue
             has_battery = True
-            if read_text(path / "status").lower() in {"charging", "full"}:
+            if status in {"charging", "full"}:
                 ac_online = True
         if supply_type in {"Mains", "USB", "USB_C", "USB_PD", "USB_DCP", "USB_CDP"}:
             if power_supply_online(path) is True:
@@ -488,6 +494,8 @@ def battery_led_state(power_supply_dir: Path = POWER_SUPPLY_DIR) -> tuple[int, s
         except ValueError:
             continue
         raw_status = read_text(path / "status").lower()
+        if not raw_status:
+            continue
         if raw_status == "full" or percent >= 100:
             status = "full"
         elif raw_status == "charging":
@@ -505,7 +513,16 @@ def timeout_for_state(values: dict[str, str], state: str) -> int:
     elif state == "ac":
         raw = values.get(f"POWERSAVER_{mode}_AC_SCREEN_TIMEOUT_SEC", "0")
     else:
-        raw = values.get(f"POWERSAVER_{mode}_BATTERY_SCREEN_TIMEOUT_SEC", "0")
+        action = values.get(
+            f"POWERSAVER_{mode}_UNKNOWN_POWER_ACTION",
+            values.get("POWERSAVER_UNKNOWN_POWER_ACTION", "restore"),
+        ).lower()
+        if action == "battery":
+            raw = values.get(f"POWERSAVER_{mode}_BATTERY_SCREEN_TIMEOUT_SEC", "0")
+        elif action == "ac":
+            raw = values.get(f"POWERSAVER_{mode}_AC_SCREEN_TIMEOUT_SEC", "0")
+        else:
+            raw = "0"
     try:
         return max(0, int(raw or "0"))
     except ValueError:
@@ -550,6 +567,16 @@ def auto_timeout_for_state(values: dict[str, str], state: str, pose: str) -> int
     profile = current_profile(values)
     if state == "ac":
         return int_config(values, f"POWERSAVER_{profile}_AUTO_AC_PUTDOWN_TIMEOUT_SEC", 120)
+    if state == "unknown":
+        action = values.get(
+            f"POWERSAVER_{profile}_UNKNOWN_POWER_ACTION",
+            values.get("POWERSAVER_UNKNOWN_POWER_ACTION", "restore"),
+        ).lower()
+        if action == "battery":
+            return int_config(values, f"POWERSAVER_{profile}_AUTO_BATTERY_PUTDOWN_TIMEOUT_SEC", 60)
+        if action == "ac":
+            return int_config(values, f"POWERSAVER_{profile}_AUTO_AC_PUTDOWN_TIMEOUT_SEC", 120)
+        return 0
     return int_config(values, f"POWERSAVER_{profile}_AUTO_BATTERY_PUTDOWN_TIMEOUT_SEC", 60)
 
 
@@ -677,6 +704,9 @@ def start_swayidle(timeout_sec: int) -> subprocess.Popen[str] | None:
     if shutil.which("swayidle") is None:
         print("warning: swayidle not found; install swayidle to enable screen timeout", flush=True)
         return None
+    if not os.environ.get("WAYLAND_DISPLAY"):
+        print("warning: WAYLAND_DISPLAY is not set; screen timeout disabled", flush=True)
+        return None
     command = [
         "swayidle",
         "-w",
@@ -687,7 +717,30 @@ def start_swayidle(timeout_sec: int) -> subprocess.Popen[str] | None:
         display_control_command("on"),
     ]
     print(f"idle timeout={timeout_sec}s", flush=True)
-    return subprocess.Popen(command, text=True)
+    try:
+        process = subprocess.Popen(
+            command,
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as exc:
+        print(f"warning: failed to start swayidle: {exc}", flush=True)
+        return None
+    time.sleep(0.2)
+    if process.poll() is not None:
+        error = ""
+        if process.stderr is not None:
+            try:
+                error = process.stderr.read().strip()
+            except OSError:
+                error = ""
+        if error:
+            print(f"warning: swayidle exited: {error}", flush=True)
+        else:
+            print(f"warning: swayidle exited with status {process.returncode}", flush=True)
+        return None
+    return process
 
 
 def stop_process(process: subprocess.Popen[str] | None, *, suppress_resume: bool = False) -> None:
@@ -876,9 +929,9 @@ def main() -> int:
         night_mode_enabled = config_enabled(values, "MCU_LED_NIGHT_MODE_ENABLED", "1")
         mcu_reader.configure_led_behavior(battery_led_enabled, notify_led_enabled, night_mode_enabled)
         if battery_led_enabled and now - last_led_power_update >= LED_POWER_POLL_SECONDS:
-            power_for_led = state if state in {"ac", "battery"} else "battery"
-            battery_for_led = battery_led_state(Path(values.get("POWERSAVER_POWER_SUPPLY_DIR", str(POWER_SUPPLY_DIR))))
-            mcu_reader.configure_led_power(power_for_led, battery_for_led)
+            if state in {"ac", "battery"}:
+                battery_for_led = battery_led_state(Path(values.get("POWERSAVER_POWER_SUPPLY_DIR", str(POWER_SUPPLY_DIR))))
+                mcu_reader.configure_led_power(state, battery_for_led)
             last_led_power_update = now
         tmux_state = terminal_bell_monitor.poll(enabled=notify_led_enabled)
         if tmux_state is not None:
