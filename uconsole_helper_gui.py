@@ -1186,8 +1186,9 @@ class UConsoleHelperWindow(Gtk.Window):
         balance_tree.set_size_request(920, -1)
         balance_toggle_renderer = Gtk.CellRendererToggle()
         balance_toggle_renderer.connect("toggled", self.on_cpa_provider_toggled)
+        cpa_enable_column_width = 96
         balance_toggle_column = Gtk.TreeViewColumn("Enable", balance_toggle_renderer, active=0)
-        configure_cpa_table_column(balance_toggle_column, 76)
+        configure_cpa_table_column(balance_toggle_column, cpa_enable_column_width)
         balance_tree.append_column(balance_toggle_column)
         balance_widths = (150, 96, 104, 82, 82, 300)
         for index, title in enumerate(("Provider", "Status", "Remain", "Used", "Total", "Note"), start=1):
@@ -1214,18 +1215,25 @@ class UConsoleHelperWindow(Gtk.Window):
         quota_tree = Gtk.TreeView(model=self.cpa_quota_store)
         quota_tree.set_headers_visible(True)
         quota_tree.set_hexpand(True)
-        quota_tree.set_size_request(1080, -1)
+        quota_tree.set_size_request(998, -1)
         toggle_renderer = Gtk.CellRendererToggle()
         toggle_renderer.connect("toggled", self.on_cpa_account_toggled)
         toggle_column = Gtk.TreeViewColumn("Enable", toggle_renderer, active=0)
-        configure_cpa_table_column(toggle_column, 76)
+        configure_cpa_table_column(toggle_column, cpa_enable_column_width)
         quota_tree.append_column(toggle_column)
-        quota_widths = (150, 96, 104, 82, 82, 82, 220)
-        for index, title in enumerate(("Account", "Status", "Plan", "5h", "5h Use", "7d", "Reset"), start=1):
+        quota_columns = (
+            (1, "Account", 150),
+            (2, "Status", 96),
+            (3, "Plan", 104),
+            (4, "5h", 82),
+            (6, "7d", 82),
+            (7, "Reset", 220),
+        )
+        for index, title, width in quota_columns:
             renderer = Gtk.CellRendererText()
             if index in {1, 3, 7}:
                 renderer.set_property("ellipsize", Pango.EllipsizeMode.END)
-            if index in {4, 5, 6}:
+            if index in {4, 6}:
                 renderer.set_property("xalign", 1.0)
             column = Gtk.TreeViewColumn(title, renderer, text=index)
             if index == 2:
@@ -1233,7 +1241,7 @@ class UConsoleHelperWindow(Gtk.Window):
             else:
                 column.set_cell_data_func(renderer, cpa_text_cell_data_func, (index, 0))
             column.set_resizable(True)
-            configure_cpa_table_column(column, quota_widths[index - 1], expand=index == 7)
+            configure_cpa_table_column(column, width, expand=index == 7)
             quota_tree.append_column(column)
         quota_card.pack_start(table_scroll(quota_tree, vexpand=True), True, True, 6)
 
@@ -1676,12 +1684,14 @@ class UConsoleHelperWindow(Gtk.Window):
             self.context_action_button.show()
             set_underlined_button_label(self.context_action_button, "Save", "V")
             action_context.add_class("action-ready")
+            self.update_refresh_button_state(page)
             return
 
         if page == "mcu":
             self.context_action_button.show()
             set_underlined_button_label(self.context_action_button, "Bootloader", "B")
             action_context.add_class("action-ready")
+            self.update_refresh_button_state(page)
             return
 
         if page == "lan" and self.scan_running:
@@ -1694,7 +1704,21 @@ class UConsoleHelperWindow(Gtk.Window):
             action_context.add_class("action-ready")
         else:
             self.context_action_button.hide()
+        self.update_refresh_button_state(page)
         self.update_dhcp_card_state()
+
+    def update_refresh_button_state(self, page: str) -> None:
+        context = self.header_refresh_button.get_style_context()
+        for class_name in ("action-ready", "action-active", "action-busy", "action-success"):
+            context.remove_class(class_name)
+        if page == "cpa" and self.cpa_refresh_running:
+            set_underlined_button_label(self.header_refresh_button, "Refreshing", "R")
+            self.header_refresh_button.set_sensitive(False)
+            context.add_class("action-busy")
+            return
+        set_underlined_button_label(self.header_refresh_button, "Refresh", "R")
+        self.header_refresh_button.set_sensitive(True)
+        context.add_class("action-ready")
 
     def update_dhcp_card_state(self) -> None:
         if self.dhcp_card is None:
@@ -1789,7 +1813,8 @@ class UConsoleHelperWindow(Gtk.Window):
             self.start_lan_scan()
 
     def run_refresh_action(self) -> None:
-        if self.refresh_page(self.stack.get_visible_child_name(), reload_config=True):
+        page = self.stack.get_visible_child_name()
+        if self.refresh_page(page, reload_config=True) and not (page == "cpa" and self.cpa_refresh_running):
             self.flash_header_button(self.header_refresh_button, "Refreshed", "R")
 
     def refresh_page(self, page: str | None, *, reload_config: bool = False) -> bool:
@@ -6694,9 +6719,8 @@ def display_optional_number(value: object) -> str:
     number = value_as_float(value)
     if number is None:
         return "-"
-    if abs(number) < 0.005:
-        number = 0.0
-    return f"{number:.0f}"
+    formatted = f"{number:.0f}"
+    return "0" if formatted == "-0" else formatted
 
 
 def display_percent_value(value: object) -> str:
