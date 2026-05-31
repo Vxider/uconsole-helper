@@ -36,6 +36,14 @@ def env_int(name: str, fallback: int) -> int:
     return value if value > 0 else fallback
 
 
+def env_nonnegative_int(name: str, fallback: int) -> int:
+    try:
+        value = int(str(os.environ.get(name, "")).strip())
+    except ValueError:
+        return fallback
+    return value if value >= 0 else fallback
+
+
 
 def env_bool(name: str, fallback: bool = False) -> bool:
     value = str(os.environ.get(name, "")).strip().lower()
@@ -625,7 +633,7 @@ class SegmentingTranscriptionSession:
         self.sample_rate = env_int("VOICE_SAMPLE_RATE", 16000)
         self.channels = env_int("VOICE_CHANNELS", 1)
         self.chunk_ms = env_int("VOICE_STREAM_SEND_INTERVAL_MS", 50)
-        self.max_record_ms = env_int("VOICE_MAX_RECORD_MS", 60000)
+        self.max_record_ms = env_nonnegative_int("VOICE_MAX_RECORD_MS", 60000)
         self.timeout = max(1.0, float(os.environ.get("ASR_TIMEOUT", "60") or 60))
         self.request_attempt_timeout = max(1.0, env_float("ASR_REQUEST_ATTEMPT_TIMEOUT", min(8.0, self.timeout)))
         self.connect_timeout = max(0.2, env_float("ASR_CONNECT_TIMEOUT", min(2.0, self.request_attempt_timeout)))
