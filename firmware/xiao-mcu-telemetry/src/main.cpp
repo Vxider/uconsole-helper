@@ -214,7 +214,7 @@ static void update_status_pixel() {
   const bool charging_visible = led_battery_enabled && charging && battery_known && battery_percent < 100;
   const bool notify_visible = led_notify_enabled && tmux_notify_active;
 
-  if (led_night_mode_enabled && light_ready && light_lux < 1.0f && !host_screen_on) {
+  if (led_night_mode_enabled && light_ready && light_lux < 1.0f) {
     set_status_pixel(0);
     return;
   }
