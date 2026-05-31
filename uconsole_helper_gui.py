@@ -9,6 +9,7 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 
 import array
+import dataclasses
 import fcntl
 import ipaddress
 import json as json_module
@@ -27,6 +28,8 @@ import time
 import select
 import termios
 import tomllib
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from html import escape
@@ -47,6 +50,7 @@ MAPPER_CONFIG = Path.home() / ".config/uconsole-helper-mapper/config.toml"
 MAPPER_DESKTOP_KEYBINDS_CONFIG = Path.home() / ".config/uconsole-helper-mapper/desktop-keybinds.toml"
 MAPPER_ASR_CONFIG = Path.home() / ".config/uconsole-helper-mapper/voice.env"
 MAPPER_GLOSSARY_FILE = Path.home() / ".config/uconsole-helper-mapper/voice-glossary.txt"
+CPA_GUI_CONFIG = Path.home() / ".config/uconsole-helper/cpa.env"
 MCU_SHARED_SAMPLE_FILE = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "uconsole-helper-mcu-latest.json"
 BATTERY_CALIBRATE_PATH = Path("/sys/class/power_supply/axp20x-battery/calibrate")
 DISPLAY_BACKLIGHT_BRIGHTNESS_PATH = Path("/sys/class/backlight/backlight@0/brightness")
@@ -370,6 +374,16 @@ class UConsoleHelperWindow(Gtk.Window):
         self.app_power_previous_time = 0.0
         self.mapper_desktop_store = Gtk.ListStore(str, str, str)
         self.mapper_binding_store = Gtk.ListStore(str, str, str)
+        self.cpa_controls: dict[str, Gtk.Widget] = {}
+        self.cpa_balance_store = Gtk.ListStore(bool, str, str, str, str, str, str, str, str, str, bool)
+        self.cpa_quota_store = Gtk.ListStore(bool, str, str, str, str, str, str, str, str, bool)
+        self.cpa_summary_label = Gtk.Label(label="-", xalign=0)
+        self.cpa_summary_label.get_style_context().add_class("muted")
+        self.cpa_status_label = Gtk.Label(label="", xalign=0)
+        self.cpa_status_label.get_style_context().add_class("muted")
+        self.cpa_refresh_running = False
+        self.cpa_last_refresh_at = 0.0
+        self.cpa_loaded_once = False
         self.asr_controls: dict[str, Gtk.Widget] = {}
         self.asr_status_label = Gtk.Label(label="", xalign=0)
         self.asr_status_label.get_style_context().add_class("muted")
@@ -407,6 +421,7 @@ class UConsoleHelperWindow(Gtk.Window):
         self.refresh_power_status()
         self.refresh_mcu_status()
         self.refresh_mapper_status()
+        self.load_cpa_config_controls()
         self.load_asr_config_controls()
         GLib.timeout_add_seconds(5, self.auto_refresh_visible_status)
         self.mcu_monitor_thread = threading.Thread(target=self._mcu_monitor_worker, daemon=True)
@@ -427,6 +442,7 @@ class UConsoleHelperWindow(Gtk.Window):
         self.stack.add_titled(scrolled_page(self._build_mcu_page()), "mcu", "MCU")
         self.stack.add_titled(scrolled_page(self._build_utils_page()), "utils", "Utils")
         self.stack.add_titled(scrolled_page(self._build_mapper_page()), "mapper", "Mapper")
+        self.stack.add_titled(scrolled_page(self._build_cpa_page()), "cpa", "CPA")
         self.stack.add_titled(scrolled_page(self._build_asr_page()), "asr", "ASR")
         self.stack.connect("notify::visible-child-name", self.on_visible_page_changed)
         self.connect("window-state-event", self.on_window_state_event)
@@ -488,7 +504,14 @@ class UConsoleHelperWindow(Gtk.Window):
         self.mapper_tab.get_style_context().add_class("tab-button")
         tabs.pack_start(self.mapper_tab, False, False, 0)
 
+        self.cpa_tab = underlined_button("CPA", "P")
+        self.cpa_tab.set_tooltip_text("Shortcut: P / Ctrl+8")
+        self.cpa_tab.connect("clicked", lambda _button: self.set_tab("cpa"))
+        self.cpa_tab.get_style_context().add_class("tab-button")
+        tabs.pack_start(self.cpa_tab, False, False, 0)
+
         self.asr_tab = underlined_button("ASR", "A")
+        self.asr_tab.set_tooltip_text("Shortcut: A / Ctrl+9")
         self.asr_tab.connect("clicked", lambda _button: self.set_tab("asr"))
         self.asr_tab.get_style_context().add_class("tab-button")
         tabs.pack_start(self.asr_tab, False, False, 0)
@@ -1127,6 +1150,96 @@ class UConsoleHelperWindow(Gtk.Window):
 
         return page
 
+    def _build_cpa_page(self) -> Gtk.Widget:
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        page.get_style_context().add_class("page")
+
+        config_card = card_box()
+        page.pack_start(config_card, False, False, 0)
+        config_box = Gtk.Grid(column_spacing=12, row_spacing=8)
+        config_box.set_hexpand(True)
+        config_card.pack_start(config_box, False, False, 0)
+        self.cpa_controls["CPA_BASE_URL"] = Gtk.Entry()
+        endpoint_row = asr_control_row("Endpoint", self.cpa_controls["CPA_BASE_URL"])
+        endpoint_row.set_hexpand(True)
+        config_box.attach(endpoint_row, 0, 0, 1, 1)
+        self.cpa_controls["CPA_MANAGEMENT_KEY"] = Gtk.Entry()
+        if isinstance(self.cpa_controls["CPA_MANAGEMENT_KEY"], Gtk.Entry):
+            self.cpa_controls["CPA_MANAGEMENT_KEY"].set_visibility(False)
+        key_row = asr_control_row("Key", self.cpa_controls["CPA_MANAGEMENT_KEY"])
+        key_row.set_hexpand(True)
+        config_box.attach(key_row, 1, 0, 1, 1)
+
+        summary_card = card_box()
+        page.pack_start(summary_card, False, False, 0)
+        self.cpa_summary_label.set_hexpand(True)
+        summary_card.pack_start(self.cpa_summary_label, False, False, 0)
+
+        balance_card = card_box()
+        page.pack_start(balance_card, False, False, 0)
+        balance_header = Gtk.Label(label="AI Provider Balances", xalign=0)
+        balance_header.get_style_context().add_class("muted")
+        balance_card.pack_start(balance_header, False, False, 0)
+        balance_tree = Gtk.TreeView(model=self.cpa_balance_store)
+        balance_tree.set_headers_visible(True)
+        balance_tree.set_hexpand(True)
+        balance_tree.set_size_request(920, -1)
+        balance_toggle_renderer = Gtk.CellRendererToggle()
+        balance_toggle_renderer.connect("toggled", self.on_cpa_provider_toggled)
+        balance_toggle_column = Gtk.TreeViewColumn("Enable", balance_toggle_renderer, active=0)
+        configure_cpa_table_column(balance_toggle_column, 76)
+        balance_tree.append_column(balance_toggle_column)
+        balance_widths = (150, 96, 104, 82, 82, 300)
+        for index, title in enumerate(("Provider", "Status", "Remain", "Used", "Total", "Note"), start=1):
+            renderer = Gtk.CellRendererText()
+            if index in {1, 6}:
+                renderer.set_property("ellipsize", Pango.EllipsizeMode.END)
+            if index in {3, 4, 5}:
+                renderer.set_property("xalign", 1.0)
+            column = Gtk.TreeViewColumn(title, renderer, text=index)
+            if index == 2:
+                column.set_cell_data_func(renderer, cpa_status_cell_data_func, (index, 0))
+            else:
+                column.set_cell_data_func(renderer, cpa_text_cell_data_func, (index, 0))
+            column.set_resizable(True)
+            configure_cpa_table_column(column, balance_widths[index - 1], expand=index == 6)
+            balance_tree.append_column(column)
+        balance_card.pack_start(table_scroll(balance_tree, vexpand=False), False, False, 6)
+
+        quota_card = card_box()
+        page.pack_start(quota_card, True, True, 0)
+        quota_header = Gtk.Label(label="Managed Quota Balances", xalign=0)
+        quota_header.get_style_context().add_class("muted")
+        quota_card.pack_start(quota_header, False, False, 0)
+        quota_tree = Gtk.TreeView(model=self.cpa_quota_store)
+        quota_tree.set_headers_visible(True)
+        quota_tree.set_hexpand(True)
+        quota_tree.set_size_request(1080, -1)
+        toggle_renderer = Gtk.CellRendererToggle()
+        toggle_renderer.connect("toggled", self.on_cpa_account_toggled)
+        toggle_column = Gtk.TreeViewColumn("Enable", toggle_renderer, active=0)
+        configure_cpa_table_column(toggle_column, 76)
+        quota_tree.append_column(toggle_column)
+        quota_widths = (150, 96, 104, 82, 82, 82, 220)
+        for index, title in enumerate(("Account", "Status", "Plan", "5h", "5h Use", "7d", "Reset"), start=1):
+            renderer = Gtk.CellRendererText()
+            if index in {1, 3, 7}:
+                renderer.set_property("ellipsize", Pango.EllipsizeMode.END)
+            if index in {4, 5, 6}:
+                renderer.set_property("xalign", 1.0)
+            column = Gtk.TreeViewColumn(title, renderer, text=index)
+            if index == 2:
+                column.set_cell_data_func(renderer, cpa_status_cell_data_func, (index, 0))
+            else:
+                column.set_cell_data_func(renderer, cpa_text_cell_data_func, (index, 0))
+            column.set_resizable(True)
+            configure_cpa_table_column(column, quota_widths[index - 1], expand=index == 7)
+            quota_tree.append_column(column)
+        quota_card.pack_start(table_scroll(quota_tree, vexpand=True), True, True, 6)
+
+        page.pack_start(self.cpa_status_label, False, False, 0)
+        return page
+
     def _attach_power_control(
         self,
         grid: Gtk.Grid,
@@ -1409,6 +1522,9 @@ class UConsoleHelperWindow(Gtk.Window):
                 border-color: #39e58a;
                 color: #ffffff;
             }
+            .mono-value {
+                font-family: "SauceCode Pro Mono", monospace;
+            }
             .mcu-event-pill {
                 background: #171b20;
                 border: 1px solid #33464c;
@@ -1524,6 +1640,7 @@ class UConsoleHelperWindow(Gtk.Window):
         toggle_style_class(self.power_tab, "tab-active", page == "power")
         toggle_style_class(self.utils_tab, "tab-active", page == "utils")
         toggle_style_class(self.mapper_tab, "tab-active", page == "mapper")
+        toggle_style_class(self.cpa_tab, "tab-active", page == "cpa")
         toggle_style_class(self.asr_tab, "tab-active", page == "asr")
         self.tailscale_reconnect_button.set_visible(page in {"lan", "tailscale", "power", "mapper"})
         self.tailscale_reconnect_button.set_sensitive(page != "tailscale" or not self.tailscale_reconnecting)
@@ -1555,7 +1672,7 @@ class UConsoleHelperWindow(Gtk.Window):
         for class_name in ("action-ready", "action-active", "action-busy"):
             action_context.remove_class(class_name)
 
-        if page in {"power", "mapper", "asr"}:
+        if page in {"power", "mapper", "cpa", "asr"}:
             self.context_action_button.show()
             set_underlined_button_label(self.context_action_button, "Save", "V")
             action_context.add_class("action-ready")
@@ -1655,6 +1772,13 @@ class UConsoleHelperWindow(Gtk.Window):
             else:
                 self.update_header()
             return
+        if page == "cpa":
+            self.set_header_button_busy(self.context_action_button, "Saving", "V")
+            if self.save_cpa_config():
+                self.flash_header_button(self.context_action_button, "Saved", "V")
+            else:
+                self.update_header()
+            return
         if page == "dashboard":
             self.refresh_dashboard()
             return
@@ -1685,6 +1809,11 @@ class UConsoleHelperWindow(Gtk.Window):
                 self.refresh_mapper_status()
             else:
                 self.update_header()
+        elif page == "cpa":
+            if reload_config:
+                self.load_cpa_config_controls()
+            if reload_config or not self.cpa_loaded_once:
+                self.refresh_cpa_status(force=True)
         elif page == "asr":
             if reload_config:
                 self.load_asr_config_controls()
@@ -1746,6 +1875,9 @@ class UConsoleHelperWindow(Gtk.Window):
             self.set_tab("mapper")
             return True
         if ctrl and key == "8":
+            self.set_tab("cpa")
+            return True
+        if ctrl and key == "9":
             self.set_tab("asr")
             return True
         if alt and key in {"Left", "Right"}:
@@ -1762,7 +1894,7 @@ class UConsoleHelperWindow(Gtk.Window):
         if key_lower == "t":
             self.set_tab("tailscale")
             return True
-        if key_lower == "p":
+        if key_lower == "w":
             self.set_tab("power")
             return True
         if key_lower == "u":
@@ -1770,6 +1902,9 @@ class UConsoleHelperWindow(Gtk.Window):
             return True
         if key_lower == "m":
             self.set_tab("mapper")
+            return True
+        if key_lower == "p":
+            self.set_tab("cpa")
             return True
         if key_lower == "a":
             self.set_tab("asr")
@@ -1780,13 +1915,15 @@ class UConsoleHelperWindow(Gtk.Window):
         if key_lower == "s" and self.stack.get_visible_child_name() == "lan":
             self.run_context_action()
             return True
-        if key_lower == "v" and self.stack.get_visible_child_name() in {"power", "mapper", "asr"}:
+        if key_lower == "v" and self.stack.get_visible_child_name() in {"power", "mapper", "cpa", "asr"}:
             self.run_context_action()
             return True
         if key_lower == "e" and self.stack.get_visible_child_name() == "tailscale":
             self.run_secondary_header_action()
             return True
         if key_lower == "c":
+            if self.stack.get_visible_child_name() == "mcu":
+                return False
             self.set_tab("mcu")
             return True
         if key in {"Return", "KP_Enter"}:
@@ -1795,7 +1932,7 @@ class UConsoleHelperWindow(Gtk.Window):
         return False
 
     def switch_tab(self, direction: int) -> None:
-        pages = ["dashboard", "lan", "tailscale", "power", "mcu", "utils", "mapper", "asr"]
+        pages = ["dashboard", "lan", "tailscale", "power", "mcu", "utils", "mapper", "cpa", "asr"]
         current = self.stack.get_visible_child_name()
         try:
             index = pages.index(current)
@@ -2117,6 +2254,8 @@ class UConsoleHelperWindow(Gtk.Window):
     def auto_refresh_visible_status(self) -> bool:
         self.gui_refresh_active = self.should_refresh_ui()
         if not self.should_refresh_ui():
+            return True
+        if self.stack.get_visible_child_name() == "cpa":
             return True
         self.refresh_page(self.stack.get_visible_child_name())
         return True
@@ -2461,6 +2600,187 @@ class UConsoleHelperWindow(Gtk.Window):
 
     def refresh_mapper_status(self) -> None:
         self.load_mapper_shortcuts()
+
+    def load_cpa_config_controls(self) -> None:
+        values = env_config(CPA_GUI_CONFIG, default_cpa_config())
+        for key, widget in self.cpa_controls.items():
+            if isinstance(widget, Gtk.Entry):
+                widget.set_text(values.get(key, ""))
+        self.cpa_status_label.set_text("")
+
+    def save_cpa_config(self) -> bool:
+        values = default_cpa_config()
+        for key, widget in self.cpa_controls.items():
+            values[key] = widget_text(widget)
+        if not values["CPA_BASE_URL"]:
+            self.show_error("CPA config error", "Endpoint is required.")
+            return False
+        try:
+            CPA_GUI_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+            CPA_GUI_CONFIG.write_text(cpa_config_text(values), encoding="utf-8")
+        except OSError as exc:
+            self.show_error("Save CPA failed", str(exc))
+            return False
+        pending = self.pending_cpa_enable_changes()
+        if pending:
+            self.cpa_status_label.set_text("Saving CPA changes...")
+            thread = threading.Thread(target=self._cpa_save_changes_worker, args=(pending,), daemon=True)
+            thread.start()
+        else:
+            self.cpa_status_label.set_text("CPA config saved.")
+            self.refresh_cpa_status(force=True)
+        return True
+
+    def pending_cpa_enable_changes(self) -> dict[str, list[tuple]]:
+        provider_changes: list[tuple[str, str, str, bool]] = []
+        account_changes: list[tuple[str, bool]] = []
+        for row in self.cpa_balance_store:
+            enabled = bool(row[0])
+            original_enabled = bool(row[10])
+            section = str(row[7] or "")
+            index = str(row[8] or "")
+            api_key = str(row[9] or "")
+            if section and index and enabled != original_enabled:
+                provider_changes.append((section, index, api_key, enabled))
+        for row in self.cpa_quota_store:
+            enabled = bool(row[0])
+            original_enabled = bool(row[9])
+            name = str(row[8] or "")
+            if name and enabled != original_enabled:
+                account_changes.append((name, enabled))
+        return {"providers": provider_changes, "accounts": account_changes}
+
+    def _cpa_save_changes_worker(self, pending: dict[str, list[tuple]]) -> None:
+        config = env_config(CPA_GUI_CONFIG, default_cpa_config())
+        base_url = config.get("CPA_BASE_URL", "").strip().rstrip("/")
+        management_key = config.get("CPA_MANAGEMENT_KEY", "").strip()
+        try:
+            for section, index, api_key, enabled in pending["providers"]:
+                cpa_set_provider_enabled(base_url, management_key, section, index, api_key, enabled)
+            for name, enabled in pending["accounts"]:
+                cpa_set_auth_file_enabled(base_url, management_key, name, enabled)
+        except Exception as exc:
+            GLib.idle_add(self.finish_cpa_save_changes_error, str(exc))
+            return
+        GLib.idle_add(self.finish_cpa_save_changes_success)
+
+    def finish_cpa_save_changes_error(self, error: str) -> bool:
+        self.cpa_status_label.set_text(f"CPA save failed: {compact_error(error)}")
+        self.refresh_cpa_status(force=True)
+        return False
+
+    def finish_cpa_save_changes_success(self) -> bool:
+        self.cpa_status_label.set_text("CPA changes saved.")
+        self.refresh_cpa_status(force=True)
+        return False
+
+    def refresh_cpa_status(self, *, force: bool = False) -> None:
+        if self.cpa_refresh_running:
+            return
+        if not force and self.cpa_loaded_once:
+            return
+        self.cpa_refresh_running = True
+        self.cpa_status_label.set_text("Refreshing CPA...")
+        self.cpa_balance_store.clear()
+        self.cpa_quota_store.clear()
+        self.cpa_balance_store.append([False, "...", "...", "-", "-", "-", "-", "", "", "", False])
+        self.cpa_quota_store.append([False, "...", "...", "-", "-", "-", "-", "-", "", False])
+        self.update_header()
+        thread = threading.Thread(target=self._cpa_refresh_worker, daemon=True)
+        thread.start()
+
+    def _cpa_refresh_worker(self) -> None:
+        try:
+            data = cpa_status(env_config(CPA_GUI_CONFIG, default_cpa_config()))
+        except Exception as exc:
+            GLib.idle_add(self.finish_cpa_refresh_error, str(exc))
+            return
+        GLib.idle_add(self.finish_cpa_refresh, data)
+
+    def finish_cpa_refresh_error(self, error: str) -> bool:
+        self.cpa_refresh_running = False
+        self.cpa_loaded_once = True
+        self.cpa_last_refresh_at = time.monotonic()
+        self.cpa_status_label.set_text("CPA refresh failed.")
+        self.cpa_balance_store.clear()
+        self.cpa_quota_store.clear()
+        self.cpa_balance_store.append([False, "-", "Err", "-", "-", "-", compact_error(error), "", "", "", False])
+        self.cpa_quota_store.append([False, "-", "Err", "-", "-", "-", "-", compact_error(error), "", False])
+        self.cpa_summary_label.set_text("CPA unavailable")
+        self.update_header()
+        return False
+
+    def finish_cpa_refresh(self, data: dict[str, object]) -> bool:
+        self.cpa_refresh_running = False
+        self.cpa_loaded_once = True
+        self.cpa_last_refresh_at = time.monotonic()
+        self.cpa_balance_store.clear()
+        for row in data.get("balances", []):
+            if isinstance(row, dict):
+                enabled = not bool(row.get("disabled"))
+                self.cpa_balance_store.append(
+                    [
+                        enabled,
+                        str(row.get("provider", "-")),
+                        str(row.get("status", "-")),
+                        display_optional_number(row.get("remaining")),
+                        display_optional_number(row.get("used")),
+                        display_optional_number(row.get("total")),
+                        str(row.get("note", "-")),
+                        str(row.get("section") or ""),
+                        str(row.get("index") if row.get("index") is not None else ""),
+                        str(row.get("api_key") or ""),
+                        enabled,
+                    ]
+                )
+        if len(self.cpa_balance_store) == 0:
+            self.cpa_balance_store.append([False, "-", "N/A", "-", "-", "-", "No providers", "", "", "", False])
+
+        self.cpa_quota_store.clear()
+        for row in data.get("quotas", []):
+            if isinstance(row, dict):
+                enabled = not bool(row.get("disabled"))
+                self.cpa_quota_store.append(
+                    [
+                        enabled,
+                        str(row.get("account", "-")),
+                        str(row.get("status", "-")),
+                        str(row.get("plan", "-")),
+                        display_percent_value(row.get("five_hour_remaining")),
+                        display_percent_value(row.get("five_hour_used")),
+                        display_percent_value(row.get("weekly_remaining")),
+                        str(row.get("reset", "-")),
+                        str(row.get("name") or ""),
+                        enabled,
+                    ]
+                )
+        if len(self.cpa_quota_store) == 0:
+            self.cpa_quota_store.append([False, "-", "N/A", "-", "-", "-", "-", "No accounts", "", False])
+
+        self.cpa_summary_label.set_text(str(data.get("summary", "-")))
+        self.cpa_status_label.set_text(f"Updated {time.strftime('%H:%M:%S')}")
+        self.update_header()
+        return False
+
+    def on_cpa_account_toggled(self, _renderer: Gtk.CellRendererToggle, path: str) -> None:
+        tree_iter = self.cpa_quota_store.get_iter(path)
+        enabled = bool(self.cpa_quota_store.get_value(tree_iter, 0))
+        name = str(self.cpa_quota_store.get_value(tree_iter, 8) or "")
+        if not name:
+            return
+        self.cpa_quota_store.set_value(tree_iter, 0, not enabled)
+        self.cpa_status_label.set_text("Unsaved CPA changes.")
+
+    def on_cpa_provider_toggled(self, _renderer: Gtk.CellRendererToggle, path: str) -> None:
+        tree_iter = self.cpa_balance_store.get_iter(path)
+        enabled = bool(self.cpa_balance_store.get_value(tree_iter, 0))
+        section = str(self.cpa_balance_store.get_value(tree_iter, 7) or "")
+        index = str(self.cpa_balance_store.get_value(tree_iter, 8) or "")
+        api_key = str(self.cpa_balance_store.get_value(tree_iter, 9) or "")
+        if not section or not index:
+            return
+        self.cpa_balance_store.set_value(tree_iter, 0, not enabled)
+        self.cpa_status_label.set_text("Unsaved CPA changes.")
 
     def load_asr_config_controls(self) -> None:
         values = env_config(MAPPER_ASR_CONFIG, default_asr_config())
@@ -3113,6 +3433,57 @@ def ellipsized_combo_text_from_values(values: tuple[str, ...], width_chars: int)
         combo.set_active(0)
         update_combo_model_tooltip(combo)
     return combo
+
+
+def cpa_status_cell_data_func(
+    _column: Gtk.TreeViewColumn,
+    renderer: Gtk.CellRendererText,
+    model: Gtk.TreeModel,
+    tree_iter: Gtk.TreeIter,
+    indexes: tuple[int, int],
+) -> None:
+    status_index, enabled_index = indexes
+    status = str(model.get_value(tree_iter, status_index) or "")
+    enabled = bool(model.get_value(tree_iter, enabled_index))
+    renderer.set_property("foreground", cpa_status_color(status) if enabled else "#7d8590")
+    renderer.set_property("weight", 700 if enabled and status in {"OK", "Err", "Limit"} else 400)
+
+
+def cpa_text_cell_data_func(
+    _column: Gtk.TreeViewColumn,
+    renderer: Gtk.CellRendererText,
+    model: Gtk.TreeModel,
+    tree_iter: Gtk.TreeIter,
+    indexes: tuple[int, int],
+) -> None:
+    text_index, enabled_index = indexes
+    renderer.set_property("text", str(model.get_value(tree_iter, text_index) or ""))
+    renderer.set_property("foreground", "#d8dee9" if bool(model.get_value(tree_iter, enabled_index)) else "#7d8590")
+    renderer.set_property("weight", 400)
+
+
+def configure_cpa_table_column(column: Gtk.TreeViewColumn, width: int, *, expand: bool = False) -> None:
+    column.set_sizing(Gtk.TreeViewColumnSizing.FIXED)
+    column.set_fixed_width(width)
+    column.set_min_width(width)
+    column.set_max_width(width)
+    column.set_resizable(True)
+    column.set_expand(expand)
+
+
+def cpa_status_color(status: str) -> str:
+    normalized = status.strip().lower()
+    if normalized == "ok":
+        return "#34c759"
+    if normalized in {"err", "error", "fail", "failed"}:
+        return "#ff5f57"
+    if normalized in {"limit", "limited", "warn", "warning"}:
+        return "#ffcc00"
+    if normalized == "disabled":
+        return "#8a8f98"
+    if normalized in {"...", "n/a", "na", "-"}:
+        return "#8a8f98"
+    return "#d6dde6"
 
 
 def update_combo_model_tooltip(combo: Gtk.ComboBox) -> None:
@@ -4127,7 +4498,7 @@ def tailscale_status_color(status: dict[str, object]) -> str:
 
 def power_tab_markup() -> str:
     color = power_service_status_color()
-    return f'<span foreground="{color}">●</span> {underlined_markup("Pwr", "P")}'
+    return f'<span foreground="{color}">●</span> {underlined_markup("Pwr", "w")}'
 
 
 def powersaver_enabled() -> bool:
@@ -5470,6 +5841,23 @@ def default_asr_config() -> dict[str, str]:
     }
 
 
+def default_cpa_config() -> dict[str, str]:
+    return {
+        "CPA_BASE_URL": "http://127.0.0.1:8317",
+        "CPA_MANAGEMENT_KEY": os.environ.get("CPA_MANAGEMENT_KEY", ""),
+    }
+
+
+def cpa_config_text(values: dict[str, str]) -> str:
+    return "\n".join(
+        [
+            f"CPA_BASE_URL={values.get('CPA_BASE_URL', '').strip()}",
+            f"CPA_MANAGEMENT_KEY={values.get('CPA_MANAGEMENT_KEY', '').strip()}",
+            "",
+        ]
+    )
+
+
 def asr_config_text(values: dict[str, str]) -> str:
     current_values = env_config(MAPPER_ASR_CONFIG, {})
     merged_values = current_values.copy()
@@ -5530,6 +5918,821 @@ def asr_config_text(values: dict[str, str]) -> str:
         if key not in emitted_keys
     ]
     return "\n".join(line.format(**merged_values) for line in lines + extra_lines)
+
+
+def cpa_status(config: dict[str, str]) -> dict[str, object]:
+    base_url = config.get("CPA_BASE_URL", "").strip().rstrip("/")
+    management_key = config.get("CPA_MANAGEMENT_KEY", "").strip()
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        providers_future = executor.submit(cpa_management_providers, base_url, management_key)
+        cli_future = executor.submit(cpa_status_from_cli, config)
+        quotas_future = executor.submit(query_cpa_quotas, base_url, management_key)
+        providers = providers_future.result()
+        cli_status = cli_future.result()
+        balances = cpa_balances_for_gui(providers, cli_status, base_url, management_key)
+        quotas = quotas_future.result()
+    summary = cpa_summary_text(balances, quotas)
+    return {"balances": balances, "quotas": quotas, "summary": summary}
+
+
+def cpa_balances_for_gui(
+    providers: list[dict[str, object]] | None,
+    cli_status: dict[str, object] | None,
+    base_url: str,
+    management_key: str,
+) -> list[dict[str, object]]:
+    if isinstance(cli_status, dict) and isinstance(cli_status.get("balances"), list):
+        balances = merge_cli_balances_with_providers(cli_status["balances"], providers or [])
+        if providers:
+            add_missing_disabled_provider_rows(balances, providers)
+        return balances
+    if providers is not None:
+        return query_cpa_balances(providers)
+    return query_cpa_provider_balances_from_management(base_url, management_key)
+
+
+def merge_cli_balances_with_providers(
+    cli_balances: list[object],
+    providers: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    provider_by_key = {
+        (str(provider.get("base_url") or "").rstrip("/"), cpa_mask_secret(str(provider.get("api_key") or ""))): provider
+        for provider in providers
+    }
+    rows: list[dict[str, object]] = []
+    for item in cli_balances:
+        if not isinstance(item, dict):
+            continue
+        row = dict(item)
+        key = (str(row.get("base_url") or "").rstrip("/"), str(row.get("api_key") or ""))
+        provider = provider_by_key.get(key)
+        if provider:
+            row.update(cpa_provider_metadata(provider))
+        rows.append(row)
+    return rows
+
+
+def add_missing_disabled_provider_rows(rows: list[dict[str, object]], providers: list[dict[str, object]]) -> None:
+    existing = {
+        (str(row.get("base_url") or "").rstrip("/"), str(row.get("api_key") or ""))
+        for row in rows
+    }
+    for provider in providers:
+        key = (str(provider.get("base_url") or "").rstrip("/"), cpa_mask_secret(str(provider.get("api_key") or "")))
+        if provider.get("disabled") and key not in existing:
+            rows.append(cpa_disabled_provider_row(provider))
+
+
+def cpa_status_from_cli(config: dict[str, str]) -> dict[str, object] | None:
+    command = shutil.which("cpa-usage") or str(Path.home() / ".local/bin/cpa-usage")
+    if not Path(command).exists() and shutil.which(command) is None:
+        return None
+    env = os.environ.copy()
+    env["CPA_BASE_URL"] = config.get("CPA_BASE_URL", "").strip()
+    env["CPA_MANAGEMENT_KEY"] = config.get("CPA_MANAGEMENT_KEY", "").strip()
+    try:
+        result = subprocess.run(
+            [command, "--json", "--timeout", "6"],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    balances = payload.get("balances")
+    quotas = payload.get("quotas")
+    if not isinstance(balances, list) or not isinstance(quotas, list):
+        return None
+    return {"balances": balances, "quotas": quotas, "summary": cpa_summary_text(balances, quotas)}
+
+
+def parse_cpa_providers(path: Path) -> list[dict[str, object]]:
+    return parse_cpa_providers_text(read_text(path))
+
+
+def parse_cpa_providers_text(text: str) -> list[dict[str, object]]:
+    providers: list[dict[str, object]] = []
+    current_section = ""
+    current: dict[str, object] | None = None
+    section_index = 0
+    for raw_line in text.splitlines():
+        line = strip_yaml_comment(raw_line)
+        if not line.strip():
+            continue
+        indent = len(raw_line) - len(raw_line.lstrip(" "))
+        stripped = line.strip()
+        if indent == 0 and stripped.endswith(":"):
+            if current_section and current:
+                provider = finish_cpa_provider(current_section, section_index, current)
+                if provider:
+                    providers.append(provider)
+                    section_index += 1
+            section = stripped[:-1]
+            current_section = section if section.endswith("-api-key") else ""
+            section_index = 0
+            current = None
+            continue
+        if not current_section:
+            continue
+        if indent <= 2 and stripped.startswith("- "):
+            if current:
+                provider = finish_cpa_provider(current_section, section_index, current)
+                if provider:
+                    providers.append(provider)
+                    section_index += 1
+            current = {}
+            key_value = parse_yaml_key_value(stripped[2:].strip())
+            if key_value:
+                current[key_value[0]] = key_value[1]
+            continue
+        if current is not None:
+            key_value = parse_yaml_key_value(stripped)
+            if key_value:
+                current[key_value[0]] = key_value[1]
+    if current_section and current:
+        provider = finish_cpa_provider(current_section, section_index, current)
+        if provider:
+            providers.append(provider)
+    seen: set[tuple[str, str, str]] = set()
+    unique: list[dict[str, object]] = []
+    for provider in providers:
+        key = (str(provider["section"]), str(provider["base_url"]), str(provider["api_key"]))
+        if key not in seen:
+            seen.add(key)
+            unique.append(provider)
+    return unique
+
+
+def strip_yaml_comment(line: str) -> str:
+    in_single = False
+    in_double = False
+    for index, char in enumerate(line):
+        if char == "'" and not in_double:
+            in_single = not in_single
+        elif char == '"' and not in_single:
+            in_double = not in_double
+        elif char == "#" and not in_single and not in_double:
+            return line[:index]
+    return line
+
+
+def parse_yaml_key_value(text: str) -> tuple[str, str] | None:
+    if ":" not in text:
+        return None
+    key, value = text.split(":", 1)
+    return key.strip(), unquote_scalar(value.strip())
+
+
+def unquote_scalar(value: str) -> str:
+    if len(value) >= 2 and ((value[0] == value[-1] == '"') or (value[0] == value[-1] == "'")):
+        return value[1:-1]
+    return value
+
+
+def finish_cpa_provider(section: str, index: int, item: dict[str, object]) -> dict[str, object] | None:
+    api_key = str(item.get("api-key") or item.get("api_key") or item.get("apiKey") or item.get("key") or "").strip()
+    if not api_key:
+        return None
+    base_url = str(item.get("base-url") or item.get("base_url") or item.get("baseURL") or item.get("baseUrl") or "https://api.openai.com").strip().rstrip("/")
+    disabled = str(item.get("disabled") or "").strip().lower() in {"true", "yes", "on", "1"}
+    balance_account = cpa_item_has_balance_note(item)
+    return {
+        "section": section,
+        "index": index,
+        "prefix": str(item.get("prefix") or item.get("name") or "").strip(),
+        "base_url": base_url,
+        "api_key": api_key,
+        "disabled": disabled,
+        "balance_account": balance_account,
+    }
+
+
+def cpa_item_has_balance_note(item: dict[str, object]) -> bool:
+    return any("余额" in str(item.get(key) or "") for key in ("note", "notes", "remark", "remarks", "description"))
+
+
+def query_cpa_balances(providers: list[dict[str, object]]) -> list[dict[str, object]]:
+    active = [provider for provider in providers if not provider.get("disabled")]
+    rows: list[dict[str, object]] = []
+    for provider in providers:
+        if provider.get("disabled"):
+            rows.append(cpa_disabled_provider_row(provider))
+    if active:
+        with ThreadPoolExecutor(max_workers=min(16, max(1, len(active)))) as executor:
+            futures = [executor.submit(query_cpa_balance, provider) for provider in active]
+            for future in as_completed(futures):
+                rows.append(future.result())
+    if not rows:
+        return [{"provider": "-", "status": "N/A", "remaining": None, "used": None, "total": None, "note": "No providers"}]
+    rows.sort(key=lambda row: (bool(row.get("disabled")), str(row.get("provider", "")).lower()))
+    return rows
+
+
+def cpa_provider_metadata(provider: dict[str, object]) -> dict[str, object]:
+    return {
+        "section": str(provider.get("section") or ""),
+        "index": provider.get("index"),
+        "api_key": str(provider.get("api_key") or ""),
+        "disabled": bool(provider.get("disabled")),
+        "balance_account": bool(provider.get("balance_account")),
+    }
+
+
+def cpa_disabled_provider_row(provider: dict[str, object]) -> dict[str, object]:
+    row = {
+        "provider": cpa_provider_display_name(provider),
+        "status": "Disabled",
+        "remaining": None,
+        "used": None,
+        "total": None,
+        "note": "disabled",
+    }
+    row.update(cpa_provider_metadata(provider))
+    return row
+
+
+def query_cpa_provider_balances_from_management(base_url: str, management_key: str) -> list[dict[str, object]]:
+    if not management_key:
+        return [{"provider": "-", "status": "N/A", "remaining": None, "used": None, "total": None, "note": "No mgmt key"}]
+    providers = cpa_management_providers(base_url, management_key)
+    if providers is None:
+        return [
+            {
+                "provider": "-",
+                "status": "N/A",
+                "remaining": None,
+                "used": None,
+                "total": None,
+                "note": "Provider list unavailable via Management API",
+            }
+        ]
+    return query_cpa_balances(providers)
+
+
+def cpa_management_providers(base_url: str, management_key: str) -> list[dict[str, object]] | None:
+    headers = {"Authorization": f"Bearer {management_key}"}
+    try:
+        data = http_json(f"{base_url.rstrip('/')}/v0/management/config", headers=headers, timeout=12)
+        providers = providers_from_config_payload(data)
+        if providers:
+            return providers
+    except Exception:
+        pass
+    try:
+        yaml_text = http_text(
+            f"{base_url.rstrip('/')}/v0/management/config.yaml",
+            headers={**headers, "Accept": "application/yaml, text/yaml, text/plain"},
+            timeout=12,
+        )
+        providers = parse_cpa_providers_text(yaml_text)
+        if providers:
+            return providers
+    except Exception:
+        pass
+    for path in ("/v0/management/providers", "/v0/management/api-keys"):
+        try:
+            data = http_json(f"{base_url.rstrip('/')}{path}", headers=headers, timeout=12)
+        except Exception:
+            continue
+        providers = providers_from_management_payload(data)
+        if providers:
+            return providers
+    return None
+
+
+def providers_from_config_payload(data: object) -> list[dict[str, object]]:
+    if not isinstance(data, dict):
+        return []
+    raw = data.get("raw") if isinstance(data.get("raw"), dict) else data
+    sections = {
+        "gemini-api-key": ("gemini-api-key", "geminiApiKey", "geminiApiKeys"),
+        "codex-api-key": ("codex-api-key", "codexApiKey", "codexApiKeys"),
+        "claude-api-key": ("claude-api-key", "claudeApiKey", "claudeApiKeys"),
+        "vertex-api-key": ("vertex-api-key", "vertexApiKey", "vertexApiKeys"),
+        "openai-compatibility": ("openai-compatibility", "openaiCompatibility"),
+    }
+    providers: list[dict[str, object]] = []
+    for section, names in sections.items():
+        value = None
+        for name in names:
+            value = raw.get(name)
+            if value is not None:
+                break
+        if not isinstance(value, list):
+            continue
+        section_providers = providers_from_config_section(section, value)
+        providers.extend(section_providers)
+    return unique_cpa_providers(providers)
+
+
+def providers_from_config_section(section: str, items: list[object]) -> list[dict[str, object]]:
+    providers: list[dict[str, object]] = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        disabled = bool(item.get("disabled"))
+        base_url = str(item.get("base-url") or item.get("base_url") or item.get("baseURL") or item.get("baseUrl") or "https://api.openai.com").strip().rstrip("/")
+        prefix = str(item.get("prefix") or item.get("name") or item.get("label") or "").strip()
+        entries = item.get("api-key-entries") or item.get("apiKeyEntries") or item.get("api_key_entries")
+        if isinstance(entries, list):
+            for entry_index, entry in enumerate(entries):
+                if not isinstance(entry, dict):
+                    continue
+                api_key = str(entry.get("api-key") or entry.get("api_key") or entry.get("apiKey") or entry.get("key") or "").strip()
+                if not api_key:
+                    continue
+                entry_base_url = str(entry.get("base-url") or entry.get("base_url") or entry.get("baseURL") or entry.get("baseUrl") or base_url).strip().rstrip("/")
+                entry_prefix = str(entry.get("prefix") or entry.get("name") or entry.get("label") or prefix or entry_index).strip()
+                providers.append(
+                    {
+                        "section": section,
+                        "index": index,
+                        "prefix": entry_prefix,
+                        "base_url": entry_base_url,
+                        "api_key": api_key,
+                        "disabled": disabled or bool(entry.get("disabled")),
+                        "balance_account": cpa_item_has_balance_note(item) or cpa_item_has_balance_note(entry),
+                    }
+                )
+            continue
+        api_keys = item.get("api-keys") or item.get("apiKeys") or item.get("api_keys")
+        if isinstance(api_keys, list):
+            for entry_index, api_key_value in enumerate(api_keys):
+                api_key = str(api_key_value or "").strip()
+                if not api_key:
+                    continue
+                providers.append(
+                    {
+                        "section": section,
+                        "index": index,
+                        "prefix": prefix or str(entry_index),
+                        "base_url": base_url,
+                        "api_key": api_key,
+                        "disabled": disabled,
+                        "balance_account": cpa_item_has_balance_note(item),
+                    }
+                )
+            continue
+        provider = finish_cpa_provider(section, index, item)
+        if provider:
+            providers.append(provider)
+    return providers
+
+
+def unique_cpa_providers(providers: list[dict[str, object]]) -> list[dict[str, object]]:
+    seen: set[tuple[str, str, str]] = set()
+    unique: list[dict[str, object]] = []
+    for provider in providers:
+        key = (str(provider["section"]), str(provider["base_url"]), str(provider["api_key"]))
+        if key not in seen:
+            seen.add(key)
+            unique.append(provider)
+    return unique
+
+
+def providers_from_management_payload(data: object) -> list[dict[str, object]]:
+    items: list[object] = []
+    if isinstance(data, list):
+        items = data
+    elif isinstance(data, dict):
+        for key in ("providers", "api_keys", "apiKeys", "keys", "items", "data"):
+            value = data.get(key)
+            if isinstance(value, list):
+                items = value
+                break
+    providers: list[dict[str, object]] = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        api_key = str(item.get("api_key") or item.get("api-key") or item.get("key") or item.get("apiKey") or "").strip()
+        base_url = str(item.get("base_url") or item.get("base-url") or item.get("baseURL") or item.get("baseUrl") or "").strip().rstrip("/")
+        provider_name = str(item.get("provider") or item.get("section") or item.get("name") or "provider").strip()
+        if not api_key or not base_url:
+            continue
+        providers.append(
+            {
+                "section": provider_name,
+                "index": index,
+                "prefix": str(item.get("prefix") or item.get("label") or "").strip(),
+                "base_url": base_url,
+                "api_key": api_key,
+                "disabled": bool(item.get("disabled")),
+                "balance_account": cpa_item_has_balance_note(item),
+            }
+        )
+    return providers
+
+
+def query_cpa_balance(provider: dict[str, object]) -> dict[str, object]:
+    name = cpa_provider_display_name(provider)
+    api_key = str(provider.get("api_key", ""))
+    base_url = str(provider.get("base_url", "")).rstrip("/")
+    endpoints = (
+        ("/v1/usage", "usage"),
+        ("/v1/dashboard/billing/credit_grants", "credit"),
+        ("/dashboard/billing/credit_grants", "credit"),
+        ("/v1/dashboard/billing/subscription", "subscription"),
+        ("/dashboard/billing/subscription", "subscription"),
+    )
+    errors: list[str] = []
+    with ThreadPoolExecutor(max_workers=len(endpoints)) as executor:
+        futures = [
+            executor.submit(query_cpa_balance_endpoint, base_url, api_key, path, shape)
+            for path, shape in endpoints
+        ]
+        for future in as_completed(futures):
+            parsed, error = future.result()
+            if parsed is not None:
+                parsed.update({"provider": name, "status": "OK"})
+                parsed.update(cpa_provider_metadata(provider))
+                return parsed
+            if error:
+                errors.append(error)
+    row = {"provider": name, "status": "Err", "remaining": None, "used": None, "total": None, "note": errors[0] if errors else "No endpoint"}
+    row.update(cpa_provider_metadata(provider))
+    return row
+
+
+def query_cpa_balance_endpoint(base_url: str, api_key: str, path: str, shape: str) -> tuple[dict[str, object] | None, str | None]:
+    try:
+        data = http_json(f"{base_url}{path}", headers={"Authorization": f"Bearer {api_key}"}, timeout=5)
+    except Exception as exc:
+        return None, compact_error(str(exc))
+    parsed = parse_cpa_balance_data(data, shape)
+    if parsed is None:
+        return None, "Bad JSON"
+    return parsed, None
+
+def parse_cpa_balance_data(data: object, shape: str) -> dict[str, object] | None:
+    if shape == "usage":
+        remaining = find_first_number(data, ("remaining", "remain", "balance", "available", "quota_remaining", "total_available", "credit"))
+        used = find_first_number(data, ("total_used", "quota_used", "used"))
+        total = find_first_number(data, ("limit", "total", "quota", "granted"))
+        if remaining is None and total is not None and used is not None:
+            remaining = max(0.0, total - used)
+        note = find_first_string(data, ("message", "status", "planName", "plan")) or "-"
+    elif shape == "credit":
+        total = find_first_number(data, ("total_granted", "granted", "hard_limit_usd", "system_hard_limit_usd"))
+        used = find_first_number(data, ("total_used", "used"))
+        remaining = find_first_number(data, ("total_available", "available", "remaining"))
+        if remaining is None and total is not None and used is not None:
+            remaining = total - used
+        note = "-"
+    else:
+        total = find_first_number(data, ("hard_limit_usd", "system_hard_limit_usd"))
+        used = find_first_number(data, ("soft_limit_usd", "used"))
+        remaining = total - used if total is not None and used is not None else None
+        note = "subscription"
+    if remaining is None and used is None and total is None:
+        return None
+    return {"remaining": remaining, "used": used, "total": total, "note": note}
+
+
+def query_cpa_quotas(base_url: str, management_key: str) -> list[dict[str, object]]:
+    if not management_key:
+        return [{"account": "-", "status": "N/A", "plan": "-", "five_hour_remaining": None, "five_hour_used": None, "weekly_remaining": None, "reset": "-", "note": "No mgmt key"}]
+    try:
+        auth_files = http_json(f"{base_url.rstrip('/')}/v0/management/auth-files", headers={"Authorization": f"Bearer {management_key}"}, timeout=12)
+    except Exception as exc:
+        return [{"account": "-", "status": "Err", "plan": "-", "five_hour_remaining": None, "five_hour_used": None, "weekly_remaining": None, "reset": "-", "note": compact_error(str(exc))}]
+    files = auth_files.get("files", []) if isinstance(auth_files, dict) else []
+    tasks: list[dict[str, str]] = []
+    rows: list[dict[str, object]] = []
+    for item in files:
+        if not isinstance(item, dict) or not cpa_auth_file_is_codex(item):
+            continue
+        note = str(item.get("note") or item.get("notes") or item.get("remark") or item.get("remarks") or item.get("description") or "")
+        disabled = bool(item.get("disabled"))
+        name = str(item.get("name") or item.get("id") or "").strip()
+        if disabled or "余额" in note:
+            rows.append(
+                {
+                    "account": cpa_auth_label(item),
+                    "status": "Disabled" if disabled else "N/A",
+                    "plan": "-",
+                    "five_hour_remaining": None,
+                    "five_hour_used": None,
+                    "weekly_remaining": None,
+                    "reset": "-",
+                    "note": "disabled" if disabled else "balance note",
+                    "disabled": disabled,
+                    "name": name,
+                }
+            )
+            continue
+        auth_index = str(item.get("auth_index") or "").strip()
+        if not auth_index:
+            rows.append({"account": cpa_auth_label(item), "status": "Err", "plan": "-", "five_hour_remaining": None, "five_hour_used": None, "weekly_remaining": None, "reset": "-", "note": "missing auth_index", "disabled": disabled, "name": name})
+            continue
+        tasks.append({"auth_index": auth_index, "account": cpa_auth_label(item), "provider": str(item.get("provider") or item.get("type") or "codex"), "name": name})
+    if not tasks and not rows:
+        return [{"account": "-", "status": "N/A", "plan": "-", "five_hour_remaining": None, "five_hour_used": None, "weekly_remaining": None, "reset": "-", "note": "No Codex accounts"}]
+    with ThreadPoolExecutor(max_workers=min(16, max(1, len(tasks)))) as executor:
+        futures = [executor.submit(query_cpa_quota, base_url, management_key, task) for task in tasks]
+        for future in as_completed(futures):
+            rows.append(future.result())
+    rows.sort(key=lambda row: (bool(row.get("disabled")), -(float(row.get("five_hour_remaining") or -1)), str(row.get("account", "")).lower()))
+    return rows
+
+
+def query_cpa_quota(base_url: str, management_key: str, task: dict[str, str]) -> dict[str, object]:
+    payload = {
+        "authIndex": task["auth_index"],
+        "method": "GET",
+        "url": "https://chatgpt.com/backend-api/wham/usage",
+        "header": {"Authorization": "Bearer $TOKEN$", "Content-Type": "application/json", "User-Agent": "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64)"},
+    }
+    try:
+        api_call = http_json(
+            f"{base_url.rstrip('/')}/v0/management/api-call",
+            headers={"Authorization": f"Bearer {management_key}", "Content-Type": "application/json"},
+            data=json.dumps(payload).encode("utf-8"),
+            timeout=12,
+        )
+        body = api_call.get("body") if isinstance(api_call, dict) else None
+        usage = json.loads(body) if isinstance(body, str) else (body if isinstance(body, dict) else {})
+        rate_limit = usage.get("rate_limit") if isinstance(usage, dict) else {}
+        primary = rate_limit.get("primary_window") if isinstance(rate_limit, dict) else {}
+        secondary = rate_limit.get("secondary_window") if isinstance(rate_limit, dict) else {}
+        used = float(primary.get("used_percent"))
+        weekly_used = secondary.get("used_percent") if isinstance(secondary, dict) else None
+        limit_reached = rate_limit.get("limit_reached") is True if isinstance(rate_limit, dict) else False
+        return {
+            "account": task["account"],
+            "status": "Limit" if limit_reached else "OK",
+            "plan": usage.get("plan_type") or "-",
+            "five_hour_remaining": max(0.0, min(100.0, 100.0 - used)),
+            "five_hour_used": used,
+            "weekly_remaining": max(0.0, min(100.0, 100.0 - float(weekly_used))) if weekly_used is not None else None,
+            "reset": cpa_reset_label(primary),
+            "note": "limit reached" if limit_reached else "-",
+            "disabled": False,
+            "name": task.get("name", ""),
+        }
+    except Exception as exc:
+        return {"account": task["account"], "status": "Err", "plan": "-", "five_hour_remaining": None, "five_hour_used": None, "weekly_remaining": None, "reset": "-", "note": compact_error(str(exc)), "disabled": False, "name": task.get("name", "")}
+
+
+def http_json(url: str, headers: dict[str, str] | None = None, data: bytes | None = None, timeout: int = 12) -> object:
+    request = urllib.request.Request(url, data=data, headers=headers or {})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8", errors="replace"))
+
+
+def cpa_set_auth_file_enabled(base_url: str, management_key: str, name: str, enabled: bool) -> None:
+    if not base_url or not management_key:
+        raise ValueError("CPA endpoint and key are required")
+    payload = json.dumps({"name": name, "disabled": not enabled}).encode("utf-8")
+    request = urllib.request.Request(
+        f"{base_url.rstrip('/')}/v0/management/auth-files/status",
+        data=payload,
+        headers={"Authorization": f"Bearer {management_key}", "Content-Type": "application/json"},
+        method="PATCH",
+    )
+    with urllib.request.urlopen(request, timeout=12) as response:
+        response.read()
+
+
+def cpa_set_provider_enabled(
+    base_url: str,
+    management_key: str,
+    section: str,
+    index: str,
+    api_key: str,
+    enabled: bool,
+) -> None:
+    if not base_url or not management_key:
+        raise ValueError("CPA endpoint and key are required")
+    path_by_section = {
+        "codex-api-key": "/v0/management/codex-api-key",
+        "gemini-api-key": "/v0/management/gemini-api-key",
+        "claude-api-key": "/v0/management/claude-api-key",
+        "vertex-api-key": "/v0/management/vertex-api-key",
+        "openai-compatibility": "/v0/management/openai-compatibility",
+    }
+    path = path_by_section.get(section)
+    if not path:
+        raise ValueError(f"Unsupported provider section: {section}")
+    try:
+        provider_index = int(index)
+    except ValueError as exc:
+        raise ValueError("Provider index is missing") from exc
+
+    headers = {"Authorization": f"Bearer {management_key}"}
+    value: dict[str, object] = {"disabled": not enabled}
+    try:
+        data = http_json(f"{base_url.rstrip('/')}{path}", headers=headers, timeout=12)
+        items = cpa_provider_endpoint_items(data)
+        matched_index = cpa_match_provider_index(items, provider_index, api_key)
+        if matched_index is not None:
+            provider_index = matched_index
+            item = items[matched_index]
+            if isinstance(item, dict):
+                value = dict(item)
+                value["disabled"] = not enabled
+    except Exception:
+        pass
+
+    payload = json.dumps({"index": provider_index, "value": value}).encode("utf-8")
+    request = urllib.request.Request(
+        f"{base_url.rstrip('/')}{path}",
+        data=payload,
+        headers={"Authorization": f"Bearer {management_key}", "Content-Type": "application/json"},
+        method="PATCH",
+    )
+    with urllib.request.urlopen(request, timeout=12) as response:
+        response.read()
+
+
+def cpa_provider_endpoint_items(data: object) -> list[object]:
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ("items", "data", "providers", "keys", "apiKeys", "api_keys"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+    return []
+
+
+def cpa_match_provider_index(items: list[object], fallback_index: int, api_key: str) -> int | None:
+    if 0 <= fallback_index < len(items):
+        item = items[fallback_index]
+        if not api_key or not isinstance(item, dict) or cpa_item_api_key(item) == api_key:
+            return fallback_index
+    if api_key:
+        for index, item in enumerate(items):
+            if isinstance(item, dict) and cpa_item_api_key(item) == api_key:
+                return index
+    return fallback_index if fallback_index >= 0 else None
+
+
+def cpa_item_api_key(item: dict[str, object]) -> str:
+    return str(item.get("api-key") or item.get("api_key") or item.get("apiKey") or item.get("key") or "").strip()
+
+
+def http_text(url: str, headers: dict[str, str] | None = None, data: bytes | None = None, timeout: int = 12) -> str:
+    request = urllib.request.Request(url, data=data, headers=headers or {})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read().decode("utf-8", errors="replace")
+
+
+def cpa_summary_text(balances: list[dict[str, object]], quotas: list[dict[str, object]]) -> str:
+    quota_remaining = sum(float(row.get("five_hour_remaining") or 0) for row in quotas if row.get("status") == "OK")
+    today_balance = sum(
+        float(row.get("remaining") or 0)
+        for row in balances
+        if row.get("status") == "OK"
+        and not bool(row.get("balance_account"))
+        and "余额" not in str(row.get("note") or "")
+    )
+    total_balance = sum(float(row.get("remaining") or 0) for row in balances if row.get("status") == "OK")
+    return f"Available: {display_percent_value(quota_remaining)} | Today:{display_optional_number(today_balance)} Total:{display_optional_number(total_balance)}"
+
+
+def cpa_provider_display_name(provider: dict[str, object]) -> str:
+    section = str(provider.get("section") or "")
+    base_url = str(provider.get("base_url") or "")
+    name = provider_name_from_url(base_url) or section.removesuffix("-api-key") or "provider"
+    prefix = str(provider.get("prefix") or "").strip()
+    return f"{name}/{prefix}" if prefix else name
+
+
+def cpa_mask_secret(value: str) -> str:
+    value = value.strip()
+    if not value or value == "-":
+        return "-"
+    if len(value) <= 4:
+        return value
+    return f"{value[:2]}..{value[-2:]}"
+
+
+def provider_name_from_url(url: str) -> str:
+    match = re.search(r"https?://([^/:]+)", url)
+    host = match.group(1) if match else url
+    host = host.removeprefix("www.")
+    parts = [part for part in host.split(".") if part]
+    generic = {"api", "apis", "openai", "chat", "gateway", "proxy", "relay", "ai", "llm", "com", "cn", "net", "org", "io", "top", "cc", "vip"}
+    if len(parts) >= 2 and parts[-2] not in generic:
+        return parts[-2]
+    for part in reversed(parts):
+        if part not in generic:
+            return part
+    return parts[0] if parts else ""
+
+
+def cpa_auth_file_is_codex(item: dict[str, object]) -> bool:
+    value = str(item.get("provider") or item.get("type") or "")
+    return value.lower() == "codex"
+
+
+def cpa_auth_label(item: dict[str, object]) -> str:
+    raw = str(item.get("label") or item.get("email") or item.get("account") or item.get("name") or "unknown")
+    local = raw.split("@", 1)[0].strip()
+    compact = "".join(char for char in local if char.isascii() and char.isalnum()) or local
+    if len(compact) <= 8:
+        return compact
+    return f"{compact[:6]}..{compact[-2:]}"
+
+
+def find_first_number(value: object, keys: tuple[str, ...]) -> float | None:
+    if isinstance(value, dict):
+        for key in keys:
+            number = value_as_float(value.get(key))
+            if number is not None:
+                return number
+        for child in value.values():
+            number = find_first_number(child, keys)
+            if number is not None:
+                return number
+    elif isinstance(value, list):
+        for child in value:
+            number = find_first_number(child, keys)
+            if number is not None:
+                return number
+    return None
+
+
+def find_first_string(value: object, keys: tuple[str, ...]) -> str | None:
+    if isinstance(value, dict):
+        for key in keys:
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate:
+                return candidate
+        for child in value.values():
+            candidate = find_first_string(child, keys)
+            if candidate:
+                return candidate
+    elif isinstance(value, list):
+        for child in value:
+            candidate = find_first_string(child, keys)
+            if candidate:
+                return candidate
+    return None
+
+
+def value_as_float(value: object) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def display_optional_number(value: object) -> str:
+    number = value_as_float(value)
+    if number is None:
+        return "-"
+    if abs(number) < 0.005:
+        number = 0.0
+    return f"{number:.0f}"
+
+
+def display_percent_value(value: object) -> str:
+    number = value_as_float(value)
+    if number is None:
+        return "-"
+    return f"{display_optional_number(number)}%"
+
+
+def cpa_reset_label(primary: object) -> str:
+    if not isinstance(primary, dict):
+        return "-"
+    reset_at = value_as_float(primary.get("reset_at"))
+    if reset_at is None:
+        seconds = value_as_float(primary.get("reset_after_seconds"))
+        if seconds is not None:
+            reset_at = time.time() + seconds
+    if reset_at is None:
+        return "-"
+    return time.strftime("%m-%d %H:%M", time.localtime(reset_at))
+
+
+def compact_error(message: str) -> str:
+    text = str(message).strip()
+    lowered = text.lower()
+    if "timed out" in lowered or "timeout" in lowered:
+        return "Timeout"
+    if "unauthorized" in lowered or "forbidden" in lowered or "401" in lowered or "403" in lowered:
+        return "Auth"
+    if "connection refused" in lowered:
+        return "Refused"
+    if "name or service not known" in lowered or "temporary failure" in lowered:
+        return "DNS"
+    if len(text) > 32:
+        return text[:29] + "..."
+    return text or "Error"
 
 
 def audio_input_options() -> list[str]:
