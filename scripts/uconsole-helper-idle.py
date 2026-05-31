@@ -949,7 +949,7 @@ def main() -> int:
             reported_display_off = was_display_off
         power_state_changed = active_power_state is not None and state != active_power_state
         screen_mode_changed = active_screen_mode is not None and screen_mode != active_screen_mode
-        restore_display_off = was_display_off or (power_state_changed and last_display_off is True)
+        restore_display_off = state != "unknown" and (was_display_off or (power_state_changed and last_display_off is True))
         if screen_mode_changed:
             auto_last_active_at = time.time()
         if timeout_sec != active_timeout or screen_mode_changed or (process is not None and process.poll() is not None):
@@ -974,15 +974,19 @@ def main() -> int:
                 max(0, auto_timeout_for_state(values, state, "")),
                 state == "ac" and stand_mode_enabled(values),
             )
-            auto_last_active_at, auto_last_sample_at, new_display_off = auto_screen_tick(
-                values,
-                state,
-                sample,
-                auto_last_active_at,
-                auto_last_sample_at,
-                host_last_active_at,
-                was_display_off,
-            )
+            if state == "unknown":
+                new_display_off = None
+                auto_last_active_at = time.time()
+            else:
+                auto_last_active_at, auto_last_sample_at, new_display_off = auto_screen_tick(
+                    values,
+                    state,
+                    sample,
+                    auto_last_active_at,
+                    auto_last_sample_at,
+                    host_last_active_at,
+                    was_display_off,
+                )
         else:
             mcu_reader.configure_lock_policy(0, state == "ac" and stand_mode_enabled(values))
             new_display_off = None
