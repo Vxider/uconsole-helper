@@ -781,7 +781,7 @@ class SegmentingTranscriptionSession:
         fields = {
             "requestId": request_id,
             "language": os.environ.get("ASR_LANGUAGE", os.environ.get("VOICE_LANGUAGE", "zh")),
-            "correctionMode": os.environ.get("ASR_CORRECTION_MODE", "auto"),
+            "correctionMode": os.environ.get("ASR_CORRECTION_MODE", "cleanup"),
         }
         prompt = os.environ.get("ASR_PROMPT", "")
         if prompt:

@@ -1073,7 +1073,7 @@ class UConsoleHelperWindow(Gtk.Window):
 
         self.asr_controls["ASR_LANGUAGE"] = combo_text_from_values(("zh", "en", "ja", "auto"))
         self._attach_asr_flow_control(options_flow, "Language", self.asr_controls["ASR_LANGUAGE"])
-        self.asr_controls["ASR_CORRECTION_MODE"] = combo_text_from_values(("auto", "on", "off"))
+        self.asr_controls["ASR_CORRECTION_MODE"] = combo_text_from_values(("cleanup", "auto", "on", "off"))
         self.asr_controls["ASR_CORRECTION_MODE"].connect("changed", lambda _combo: self.sync_asr_tmux_context_state())
         self._attach_asr_flow_control(options_flow, "Correction", self.asr_controls["ASR_CORRECTION_MODE"])
         stream_preview = Gtk.Switch()
@@ -5967,7 +5967,7 @@ def default_asr_config() -> dict[str, str]:
         "ASR_PREVIEW_WS_URL": "ws://dgx-spark.tail97583.ts.net:3300/api/asr-preview/ws",
         "ASR_AUTH_TOKEN": "",
         "ASR_LANGUAGE": "zh",
-        "ASR_CORRECTION_MODE": "auto",
+        "ASR_CORRECTION_MODE": "cleanup",
         "ASR_TIMEOUT": "90",
         "ASR_REQUEST_ATTEMPT_TIMEOUT": "75",
         "ASR_CONNECT_TIMEOUT": "2",

@@ -63,7 +63,7 @@ Supported variables:
                          ~/.config/uconsole-helper-mapper/voice-glossary.txt
   ASR_CONTEXT_FIELD  multipart field for tmux context, default: contextText
   ASR_CORRECTION_MODE
-                         off | on | auto, default: auto
+                         off | auto | on | cleanup, default: cleanup
   ASR_NO_PROXY       1 disables proxy for ASR requests, default: 1
   ASR_TIMEOUT        ASR request timeout in seconds, default: 90; 0 disables
   ASR_REQUEST_ATTEMPT_TIMEOUT / ASR_CONNECT_TIMEOUT / ASR_RETRY_COUNT / ASR_RETRY_DELAY
@@ -1306,7 +1306,7 @@ ASR_PROMPT_GLOSSARY_FIELD=${ASR_PROMPT_GLOSSARY_FIELD:-promptGlossary}
 ASR_CONTEXT_FIELD=${ASR_CONTEXT_FIELD:-contextText}
 ASR_CORRECTION_MODE=${ASR_CORRECTION_MODE:-}
 if [[ -z "${ASR_CORRECTION_MODE}" ]]; then
-  ASR_CORRECTION_MODE=auto
+  ASR_CORRECTION_MODE=cleanup
 fi
 ASR_NO_PROXY=${ASR_NO_PROXY:-1}
 ASR_TIMEOUT=${ASR_TIMEOUT:-90}
