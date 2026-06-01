@@ -172,6 +172,7 @@ class McuTelemetrySample:
     az: float
     temperature: float | None = None
     light_lux: float | None = None
+    smoothed_light_lux: float | None = None
     light_raw: int | None = None
     light_screen: int | None = None
     light_keyboard: int | None = None
@@ -8203,11 +8204,12 @@ def read_mcu_snapshot(state: McuTelemetryState) -> McuStateSnapshot:
     motion = mcu_motion_label(sample.firmware_motion)
     event = mcu_event_label(sample.firmware_event)
     current_state = mcu_state_label(sample.firmware_state)
+    smoothed_light_lux = sample.smoothed_light_lux if sample.smoothed_light_lux is not None else sample.light_lux
     if sample.light_screen is not None:
-        state.smoothed_light_lux = sample.light_lux
+        state.smoothed_light_lux = smoothed_light_lux
         state.suggested_backlight = max(1, min(9, sample.light_screen))
     else:
-        state.smoothed_light_lux = sample.light_lux
+        state.smoothed_light_lux = smoothed_light_lux
         state.suggested_backlight = None
     state.last_state = current_state
     state.last_event = event
@@ -8385,17 +8387,20 @@ def parse_mcu_line(line: str) -> McuTelemetrySample | None:
                 mic_assist = None
             light = payload.get("light")
             light_lux = None
+            smoothed_light_lux = None
             light_raw = None
             light_screen = None
             light_keyboard = None
             light_ready = False
             if isinstance(light, dict):
                 lux_value = light.get("lux")
+                smoothed_lux_value = light.get("smoothed_lux")
                 raw_value = light.get("raw")
                 screen_value = light.get("screen")
                 keyboard_value = light.get("keyboard")
                 valid = bool(light.get("valid", lux_value is not None))
                 light_lux = float(lux_value) if lux_value is not None and valid else None
+                smoothed_light_lux = float(smoothed_lux_value) if smoothed_lux_value is not None and valid else None
                 light_raw = int(raw_value) if raw_value is not None else None
                 light_screen = int(screen_value) if screen_value is not None else None
                 light_keyboard = int(keyboard_value) if keyboard_value is not None else None
@@ -8407,6 +8412,7 @@ def parse_mcu_line(line: str) -> McuTelemetrySample | None:
                 az,
                 temperature,
                 light_lux=light_lux,
+                smoothed_light_lux=smoothed_light_lux,
                 light_raw=light_raw,
                 light_screen=light_screen,
                 light_keyboard=light_keyboard,

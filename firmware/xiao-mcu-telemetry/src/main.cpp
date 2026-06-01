@@ -22,6 +22,7 @@ static const uint32_t LIGHT_REPORT_FAST_INTERVAL_MS = 1000;
 static const uint32_t LIGHT_REPORT_SLOW_INTERVAL_MS = 30000;
 static const uint32_t LIGHT_REPORT_STABLE_MS = 800;
 static const uint32_t LIGHT_REPORT_BOOT_GRACE_MS = 5000;
+static const uint32_t VEML7700_STARTUP_MS = 120;
 static const uint32_t BRIGHTNESS_REPORT_MIN_INTERVAL_MS = 2500;
 static const uint32_t BRIGHTNESS_CHANGE_STABLE_MS = 2500;
 static const uint32_t LIGHT_PEAK_STABLE_MS = 2500;
@@ -393,7 +394,7 @@ static void update_light_sensor(bool force) {
     if (!light_ready) {
       return;
     }
-    delay(3);
+    delay(VEML7700_STARTUP_MS);
   }
   uint16_t value = 0;
   if (!veml7700_read16(VEML7700_REG_ALS_DATA, value)) {
@@ -414,8 +415,9 @@ static void update_light_sensor(bool force) {
       light_ready = init_light_sensor();
       if (!light_ready) {
         light_sample_valid = false;
-        return;
       }
+      light_sample_valid = false;
+      return;
     }
   } else {
     light_zero_sample_count = 0;
