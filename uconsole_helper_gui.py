@@ -575,6 +575,7 @@ class UConsoleHelperWindow(Gtk.Window):
             ("cpu", "CPU"),
             ("memory", "Memory"),
             ("storage", "Storage"),
+            ("nvme", "NVMe SMART"),
             ("network", "Network"),
             ("cellular", "Cellular"),
         ]
@@ -2369,12 +2370,12 @@ class UConsoleHelperWindow(Gtk.Window):
                         tilt_deg=estimate_tilt_deg(last_sample.ax, last_sample.ay, last_sample.az),
                         sample_rate_hz=estimate_sample_rate(state.samples),
                         pose=last_sample.firmware_pose or "-",
-                        light_lux=last_sample.light_lux,
-                        smoothed_light_lux=state.smoothed_light_lux,
-                        suggested_backlight=state.suggested_backlight,
-                        light_raw=last_sample.light_raw,
-                        light_ready=last_sample.light_ready,
-                        last_update=last_sample.timestamp,
+                        light_lux=None,
+                        smoothed_light_lux=None,
+                        suggested_backlight=None,
+                        light_raw=None,
+                        light_ready=False,
+                        last_update=time.time(),
                         raw_line=format_sample_line(last_sample),
                         last_error=str(exc),
                         mic_ready=last_sample.mic_ready,
@@ -4860,6 +4861,7 @@ def dashboard_status(
     power = power_status()
     memory = memory_metrics()
     storage = storage_metrics()
+    nvme = nvme_smart_metrics()
     cpu = cpu_metrics()
     power_percent = battery_capacity_percent()
     power_meter = power_meter_label(power.get("power", "-"), power_percent)
@@ -4884,6 +4886,7 @@ def dashboard_status(
         "cpu": dashboard_item(dashboard_cpu_summary(cpu), int(cpu.get("percent", 0)), cpu.get("meter", "CPU")),
         "memory": dashboard_item(dashboard_memory_summary(memory), int(memory.get("percent", 0)), memory.get("meter", "RAM")),
         "storage": dashboard_item(dashboard_storage_summary(), int(storage.get("percent", 0)), storage.get("meter", "DISK")),
+        "nvme": dashboard_item(dashboard_nvme_summary(nvme), int(nvme.get("percent", 0)), nvme.get("meter", "NVME")),
         "network": dashboard_item(
             dashboard_network_summary(net_rates),
             network_activity_percent(net_rates.get("rx", 0.0)),
@@ -5199,6 +5202,120 @@ def dashboard_storage_summary() -> str:
     for item in mounts[:4]:
         rows.append(metric_line(item["label"], int(item["used"]), int(item["total"]), unit="bytes"))
     return "\n".join(rows) if rows else "-"
+
+
+def dashboard_nvme_summary(metrics: dict[str, object] | None = None) -> str:
+    metrics = metrics or nvme_smart_metrics()
+    if not metrics.get("present"):
+        return "-"
+    lines = [
+        kv_line("MODEL", metrics.get("model", "-"), width=6),
+        kv_line("TEMP", metrics.get("composite", "-"), width=6),
+    ]
+    sensor2 = str(metrics.get("sensor2") or "")
+    if sensor2:
+        lines.append(kv_line("SENS2", sensor2, width=6))
+    warn_temp = str(metrics.get("warn", ""))
+    crit_temp = str(metrics.get("crit", ""))
+    if warn_temp:
+        lines.append(kv_line("WARN", warn_temp, width=6))
+    if crit_temp:
+        lines.append(kv_line("CRIT", crit_temp, width=6))
+    return "\n".join(lines)
+
+
+def nvme_smart_metrics() -> dict[str, object]:
+    device = first_nvme_device()
+    if device is None:
+        return {"present": False, "percent": 0, "meter": "NVME"}
+    hwmon = nvme_hwmon_for_device(device)
+    model = compact_nvme_model(read_first_existing(device / "model") or device.name)
+    if hwmon is None:
+        return {"present": True, "model": model, "percent": 0, "meter": "NVME"}
+    composite = read_hwmon_temp(hwmon, "Composite")
+    sensor2 = read_hwmon_temp(hwmon, "Sensor 2")
+    warn_temp = read_milli_c(hwmon / "temp1_max")
+    crit_temp = read_milli_c(hwmon / "temp1_crit")
+    percent = temperature_meter_percent(composite, warn_temp or crit_temp)
+    meter = f"{format_celsius(composite)}" if composite is not None else "NVME"
+    return {
+        "present": True,
+        "model": model,
+        "composite": format_celsius(composite),
+        "sensor2": format_celsius(sensor2) if sensor2 is not None else "",
+        "warn": format_celsius(warn_temp) if warn_temp is not None else "",
+        "crit": format_celsius(crit_temp) if crit_temp is not None else "",
+        "percent": percent,
+        "meter": meter,
+    }
+
+
+def first_nvme_device() -> Path | None:
+    for path in sorted(Path("/sys/class/nvme").glob("nvme*")):
+        if (path / "model").exists() or (path / "state").exists():
+            return path
+    return None
+
+
+def nvme_hwmon_for_device(device: Path) -> Path | None:
+    try:
+        device_real = device.resolve()
+    except OSError:
+        device_real = device
+    candidates: list[Path] = []
+    for path in sorted(Path("/sys/class/hwmon").glob("hwmon*")):
+        if read_first_existing(path / "name") != "nvme":
+            continue
+        try:
+            real = path.resolve()
+        except OSError:
+            real = path
+        if str(real).startswith(str(device_real)):
+            return path
+        candidates.append(path)
+    return candidates[0] if candidates else None
+
+
+def read_hwmon_temp(hwmon: Path, label: str) -> float | None:
+    fallback: float | None = None
+    for path in sorted(hwmon.glob("temp*_input")):
+        value = read_milli_c(path)
+        if fallback is None:
+            fallback = value
+        label_path = path.with_name(path.name.replace("_input", "_label"))
+        if read_first_existing(label_path) == label:
+            return value
+    return fallback if label == "Composite" else None
+
+
+def read_milli_c(path: Path) -> float | None:
+    try:
+        value = int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+    if value <= 0 or value > 200000:
+        return None
+    return value / 1000.0
+
+
+def format_celsius(value: float | None) -> str:
+    if value is None:
+        return "-"
+    return f"{value:.1f} C"
+
+
+def temperature_meter_percent(value: float | None, limit: float | None) -> int:
+    if value is None:
+        return 0
+    upper = limit if limit is not None and limit > 0 else 90.0
+    return int(max(0, min(100, value * 100 / upper)))
+
+
+def compact_nvme_model(model: str) -> str:
+    text = " ".join(model.split())
+    if len(text) <= 22:
+        return text
+    return text[:19] + "..."
 
 
 def storage_metrics() -> dict[str, object]:
@@ -8156,12 +8273,12 @@ def read_mcu_snapshot(state: McuTelemetryState) -> McuStateSnapshot:
                 tilt_deg=estimate_tilt_deg(last_sample.ax, last_sample.ay, last_sample.az),
                 sample_rate_hz=estimate_sample_rate(state.samples),
                 pose=last_sample.firmware_pose or "-",
-                light_lux=last_sample.light_lux,
-                smoothed_light_lux=state.smoothed_light_lux,
-                suggested_backlight=state.suggested_backlight,
-                light_raw=last_sample.light_raw,
-                light_ready=last_sample.light_ready,
-                last_update=last_sample.timestamp,
+                light_lux=None,
+                smoothed_light_lux=None,
+                suggested_backlight=None,
+                light_raw=None,
+                light_ready=False,
+                last_update=now,
                 raw_line=format_sample_line(last_sample),
                 last_error=state.last_error,
                 mic_ready=last_sample.mic_ready,

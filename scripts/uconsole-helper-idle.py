@@ -29,6 +29,7 @@ DISPLAY_STATUS_POLL_SECONDS = 30
 DISPLAY_STATUS_ACTIVE_POLL_SECONDS = 10
 DISPLAY_STATUS_OFF_POLL_SECONDS = 2
 AUTO_MCU_STALE_SECONDS = 20
+MCU_SERIAL_REOPEN_SECONDS = 75
 AUTO_PICKUP_WAKE_ENABLED = False
 AUTO_BRIGHTNESS_RAISE_STABLE_SECONDS = 1.5
 AUTO_BRIGHTNESS_LOWER_STABLE_SECONDS = 4.0
@@ -48,6 +49,7 @@ class McuSerialReader:
         self.path: Path | None = None
         self.buffer = ""
         self.last_shared_sample_mtime = 0.0
+        self.last_sample_at = time.time()
         self.lock_timeout_seconds: int | None = None
         self.stand_mode: bool | None = None
         self.led_power_state: str | None = None
@@ -88,11 +90,25 @@ class McuSerialReader:
             self.path = dev if self.fd is not None else None
             self.flush_pending_commands()
         if self.fd is None:
-            return read_shared_mcu_sample(self)
+            sample = read_shared_mcu_sample(self)
+            if sample is not None:
+                self.last_sample_at = time.time()
+            return sample
         sample = read_mcu_sample_from_fd(self.fd, self)
         if sample is not None:
+            self.last_sample_at = time.time()
             return sample
-        return read_shared_mcu_sample(self)
+        sample = read_shared_mcu_sample(self)
+        if sample is not None:
+            self.last_sample_at = time.time()
+            return sample
+        if time.time() - self.last_sample_at >= MCU_SERIAL_REOPEN_SECONDS:
+            print(
+                f"mcu serial stale for {MCU_SERIAL_REOPEN_SECONDS:.0f}s; reopening {self.path}",
+                flush=True,
+            )
+            self.close()
+        return None
 
     def write_command(self, command: str) -> None:
         if self.fd is None:
