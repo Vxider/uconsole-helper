@@ -1826,7 +1826,7 @@ class UConsoleHelperWindow(Gtk.Window):
             self.refresh_dhcp_defaults()
             self.refresh_status()
         elif page == "tailscale":
-            self.refresh_tailscale_status()
+            self.refresh_tailscale_status(refresh_latency=reload_config)
         elif page == "power":
             self.refresh_power_status(reload_config=reload_config)
         elif page == "utils":
@@ -2104,7 +2104,7 @@ class UConsoleHelperWindow(Gtk.Window):
             )
         self.select_scan_interface(selected_name or preferred_scan_interface(discover_scan_interfaces()))
 
-    def refresh_tailscale_status(self) -> None:
+    def refresh_tailscale_status(self, *, refresh_latency: bool = False) -> None:
         status = tailscale_status()
         self.tailscale_store.clear()
         if not status:
@@ -2135,7 +2135,8 @@ class UConsoleHelperWindow(Gtk.Window):
                     device["dns"],
                 ]
             )
-        self.refresh_tailscale_latency_async(devices)
+        if refresh_latency:
+            self.refresh_tailscale_latency_async(devices)
 
     def refresh_tailscale_latency_async(self, devices: list[dict[str, str]]) -> None:
         if self.tailscale_latency_running:
