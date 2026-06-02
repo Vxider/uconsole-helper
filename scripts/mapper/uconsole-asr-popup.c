@@ -65,13 +65,14 @@ static gdouble catchup_reveal_cps(gdouble base_cps, glong remaining) {
   return cps;
 }
 
-static gchar *read_popup_text(const gchar *path, gdouble *fraction, gdouble *volume, gboolean *pulse) {
+static gchar *read_popup_text(const gchar *path, gdouble *fraction, gdouble *volume, gboolean *pulse, gboolean *animate) {
   gchar *contents = NULL;
   gsize length = 0;
   GError *error = NULL;
   *fraction = -1.0;
   *volume = -1.0;
   *pulse = FALSE;
+  *animate = FALSE;
 
   if (!g_file_get_contents(path, &contents, &length, &error)) {
     if (error != NULL) {
@@ -107,6 +108,13 @@ static gchar *read_popup_text(const gchar *path, gdouble *fraction, gdouble *vol
                g_ascii_strcasecmp(value, "on") == 0;
       continue;
     }
+    if (g_str_has_prefix(line, "@animate=")) {
+      gchar *value = g_strstrip(line + 9);
+      *animate = g_strcmp0(value, "1") == 0 ||
+                 g_ascii_strcasecmp(value, "true") == 0 ||
+                 g_ascii_strcasecmp(value, "on") == 0;
+      continue;
+    }
     if (g_str_has_prefix(line, "#")) {
       line = g_strstrip(line + 1);
     }
@@ -136,7 +144,8 @@ static gboolean refresh_label(gpointer user_data) {
   gdouble fraction = -1.0;
   gdouble volume = -1.0;
   gboolean pulse = FALSE;
-  gchar *text = read_popup_text(state->path, &fraction, &volume, &pulse);
+  gboolean animate = FALSE;
+  gchar *text = read_popup_text(state->path, &fraction, &volume, &pulse, &animate);
   gchar *clock_text = NULL;
   gint64 now_us = g_get_monotonic_time();
 
@@ -155,7 +164,7 @@ static gboolean refresh_label(gpointer user_data) {
 
     g_free(state->target_text);
     state->target_text = g_strdup(text);
-    if (state->last_text == NULL) {
+    if (!animate || state->last_text == NULL) {
       state->visible_chars = target_chars;
     } else {
       state->visible_chars = prefix_chars;

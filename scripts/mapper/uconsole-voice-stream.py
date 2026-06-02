@@ -186,7 +186,7 @@ def append_log(message: str) -> None:
         pass
 
 
-def write_popup_text(value: str, *, volume: float | None = None) -> bool:
+def write_popup_text(value: str, *, volume: float | None = None, animate: bool = False) -> bool:
     text = normalize_text(value)
     if not text:
         return False
@@ -209,6 +209,8 @@ def write_popup_text(value: str, *, volume: float | None = None) -> bool:
             handle.write(f"# {text}\n")
             if volume is not None:
                 handle.write(f"@volume={max(0.0, min(1.0, volume)):.3f}\n")
+            if animate:
+                handle.write("@animate=1\n")
             temp_name = handle.name
         Path(temp_name).replace(popup_path)
         return True
@@ -217,11 +219,11 @@ def write_popup_text(value: str, *, volume: float | None = None) -> bool:
         return False
 
 
-def notify_text(value: str, *, progress: int = 50, notify_id: str | None = None) -> None:
+def notify_text(value: str, *, progress: int = 50, notify_id: str | None = None, animate: bool = False) -> None:
     text = normalize_text(value)
     if not text:
         return
-    if write_popup_text(text):
+    if write_popup_text(text, animate=animate):
         return
     notify_id = notify_id or os.environ.get("VOICE_NOTIFY_ID", "991199")
     if shutil_which("dunstify"):
@@ -536,7 +538,7 @@ class QwenAsrStreamingPreview:
                     self.last_notified_text = text
                     should_notify = True
             if should_notify:
-                notify_text(text, progress=35, notify_id=os.environ.get("VOICE_RECORDING_NOTIFY_ID", "991200"))
+                notify_text(text, progress=35, notify_id=os.environ.get("VOICE_RECORDING_NOTIFY_ID", "991200"), animate=True)
         if event_type in {"done", "end", "closed"} or bool(message.get("done")):
             self.done = True
         if message.get("error"):
@@ -691,7 +693,7 @@ class SegmentingTranscriptionSession:
         if now - self.last_popup_volume_update < 0.08:
             return
         self.last_popup_volume_update = now
-        write_popup_text(self.popup_text, volume=self.pcm_volume(data))
+        write_popup_text(self.popup_text, volume=self.pcm_volume(data), animate=bool(self.qwen_preview_text))
 
     def _signal_stop(self, _signum: int, _frame: object) -> None:
         self.stop_requested = True
@@ -1068,13 +1070,13 @@ class SegmentingTranscriptionSession:
                         )
                         break
                     recording.extend(data)
-                    self.update_recording_popup_volume(data)
                     qwen_preview_text = self.ensure_qwen_preview().accept_pcm(data)
                     if qwen_preview_text:
                         self.qwen_preview_text = qwen_preview_text
                         self.popup_text = qwen_preview_text
                         if not env_bool("VOICE_STREAM_NOTIFY_FROM_READER", True):
-                            notify_text(qwen_preview_text, progress=35, notify_id=os.environ.get("VOICE_RECORDING_NOTIFY_ID", "991200"))
+                            notify_text(qwen_preview_text, progress=35, notify_id=os.environ.get("VOICE_RECORDING_NOTIFY_ID", "991200"), animate=True)
+                    self.update_recording_popup_volume(data)
                 try:
                     if recorder.poll() is None:
                         self.drain_recorder_stdout(recorder, recording, frame_bytes)
