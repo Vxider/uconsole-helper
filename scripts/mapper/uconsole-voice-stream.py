@@ -179,8 +179,9 @@ def append_log(message: str) -> None:
         return
     try:
         log_file.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = time.strftime("%F %T") + f".{int((time.time() % 1) * 1000):03d}"
         with log_file.open("a", encoding="utf-8") as handle:
-            handle.write(f"[{time.strftime('%F %T')}] {message}\n")
+            handle.write(f"[{timestamp}] {message}\n")
     except Exception:
         pass
 
@@ -650,10 +651,15 @@ class SegmentingTranscriptionSession:
         self.last_popup_volume_update = 0.0
         self.last_request_id = self.request_id
         self.pending_segment = bytearray()
-        self.qwen_preview = QwenAsrStreamingPreview(sample_rate=self.sample_rate, channels=self.channels)
+        self.qwen_preview: QwenAsrStreamingPreview | None = None
         self.stop_drain_ms = env_int("VOICE_STOP_DRAIN_MS", 250)
         signal.signal(signal.SIGTERM, self._signal_stop)
         signal.signal(signal.SIGINT, self._signal_stop)
+
+    def ensure_qwen_preview(self) -> QwenAsrStreamingPreview:
+        if self.qwen_preview is None:
+            self.qwen_preview = QwenAsrStreamingPreview(sample_rate=self.sample_rate, channels=self.channels)
+        return self.qwen_preview
 
     def pcm_volume(self, data: bytes) -> float:
         if len(data) < 2:
@@ -1006,7 +1012,8 @@ class SegmentingTranscriptionSession:
                 break
             recording.extend(data)
             drained += len(data)
-            self.qwen_preview.accept_pcm(data)
+            if self.qwen_preview is not None:
+                self.qwen_preview.accept_pcm(data)
         if drained:
             append_log(
                 f"stream recorder drained tail bytes={drained} "
@@ -1038,6 +1045,8 @@ class SegmentingTranscriptionSession:
                     f"cmd={shlex.join(command)}"
                 )
                 recorder = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                append_log(f"stream recorder process started pid={recorder.pid}")
+                self.ensure_qwen_preview()
                 while not self.stop_requested and not self.stop_file.exists():
                     if deadline is not None and time.monotonic() >= deadline:
                         append_log(f"stream ASR max record reached requestId={self.request_id} maxMs={self.max_record_ms}")
@@ -1060,7 +1069,7 @@ class SegmentingTranscriptionSession:
                         break
                     recording.extend(data)
                     self.update_recording_popup_volume(data)
-                    qwen_preview_text = self.qwen_preview.accept_pcm(data)
+                    qwen_preview_text = self.ensure_qwen_preview().accept_pcm(data)
                     if qwen_preview_text:
                         self.qwen_preview_text = qwen_preview_text
                         self.popup_text = qwen_preview_text
@@ -1080,7 +1089,7 @@ class SegmentingTranscriptionSession:
                 if recording or self.stop_requested or self.stop_file.exists():
                     break
             self.stop_requested = True
-            qwen_text = self.qwen_preview.finish()
+            qwen_text = self.qwen_preview.finish() if self.qwen_preview is not None else ""
             if qwen_text:
                 self.qwen_preview_text = qwen_text
                 self.popup_text = qwen_text

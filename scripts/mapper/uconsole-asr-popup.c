@@ -9,12 +9,61 @@ typedef struct {
   GtkWidget *progress;
   gchar *path;
   gchar *last_text;
+  gchar *target_text;
+  glong visible_chars;
+  gint64 last_refresh_us;
+  gint64 last_target_update_us;
+  gdouble reveal_budget;
+  gdouble reveal_cps;
   gchar *last_clock_text;
   gdouble last_fraction;
   gdouble last_volume;
   gboolean pulse;
   gboolean fullscreen;
 } AppState;
+
+static glong common_prefix_chars(const gchar *left, const gchar *right) {
+  const gchar *left_iter = left;
+  const gchar *right_iter = right;
+  glong count = 0;
+
+  while (*left_iter != '\0' && *right_iter != '\0') {
+    gunichar left_char = g_utf8_get_char(left_iter);
+    gunichar right_char = g_utf8_get_char(right_iter);
+    if (left_char != right_char) {
+      break;
+    }
+    left_iter = g_utf8_next_char(left_iter);
+    right_iter = g_utf8_next_char(right_iter);
+    count++;
+  }
+  return count;
+}
+
+static gchar *utf8_prefix(const gchar *text, glong chars) {
+  const gchar *end = text;
+  for (glong i = 0; i < chars && *end != '\0'; i++) {
+    end = g_utf8_next_char(end);
+  }
+  return g_strndup(text, end - text);
+}
+
+static gdouble base_reveal_cps(gdouble observed_cps) {
+  gdouble cps = observed_cps > 0.0 ? observed_cps : 10.0;
+
+  return CLAMP(cps * 0.75, 5.5, 14.0);
+}
+
+static gdouble catchup_reveal_cps(gdouble base_cps, glong remaining) {
+  gdouble cps = base_cps;
+
+  if (remaining > 36) {
+    cps = MAX(cps, 17.0);
+  } else if (remaining > 20) {
+    cps = MAX(cps, 14.0);
+  }
+  return cps;
+}
 
 static gchar *read_popup_text(const gchar *path, gdouble *fraction, gdouble *volume, gboolean *pulse) {
   gchar *contents = NULL;
@@ -89,12 +138,54 @@ static gboolean refresh_label(gpointer user_data) {
   gboolean pulse = FALSE;
   gchar *text = read_popup_text(state->path, &fraction, &volume, &pulse);
   gchar *clock_text = NULL;
+  gint64 now_us = g_get_monotonic_time();
 
-  if (state->last_text == NULL || g_strcmp0(text, state->last_text) != 0) {
-    gtk_label_set_text(GTK_LABEL(state->label), text);
-    g_free(state->last_text);
-    state->last_text = g_strdup(text);
+  if (state->last_refresh_us == 0) {
+    state->last_refresh_us = now_us;
   }
+
+  if (state->target_text == NULL || g_strcmp0(text, state->target_text) != 0) {
+    glong prefix_chars = state->last_text != NULL ? common_prefix_chars(state->last_text, text) : 0;
+    glong target_chars = g_utf8_strlen(text, -1);
+    glong new_chars = MAX((glong)0, target_chars - prefix_chars);
+    gdouble elapsed_s = state->last_target_update_us > 0
+        ? (now_us - state->last_target_update_us) / 1000000.0
+        : 0.0;
+    gdouble observed_cps = elapsed_s > 0.05 ? new_chars / elapsed_s : 0.0;
+
+    g_free(state->target_text);
+    state->target_text = g_strdup(text);
+    if (state->last_text == NULL) {
+      state->visible_chars = target_chars;
+    } else {
+      state->visible_chars = prefix_chars;
+    }
+    state->last_target_update_us = now_us;
+    state->reveal_cps = base_reveal_cps(observed_cps);
+    state->reveal_budget = 0.0;
+  }
+  if (state->target_text != NULL) {
+    glong target_chars = g_utf8_strlen(state->target_text, -1);
+    if (state->visible_chars < target_chars) {
+      glong remaining = target_chars - state->visible_chars;
+      gdouble elapsed_s = MAX(0.0, (now_us - state->last_refresh_us) / 1000000.0);
+      gdouble cps = catchup_reveal_cps(state->reveal_cps, remaining);
+      state->reveal_budget += elapsed_s * cps;
+      if (state->reveal_budget >= 1.0) {
+        glong step = MIN((glong)state->reveal_budget, remaining);
+        state->visible_chars += step;
+        state->reveal_budget -= step;
+      }
+    }
+    gchar *visible_text = utf8_prefix(state->target_text, state->visible_chars);
+    if (state->last_text == NULL || g_strcmp0(visible_text, state->last_text) != 0) {
+      gtk_label_set_text(GTK_LABEL(state->label), visible_text);
+      g_free(state->last_text);
+      state->last_text = g_strdup(visible_text);
+    }
+    g_free(visible_text);
+  }
+  state->last_refresh_us = now_us;
   if (state->fullscreen && state->clock_label != NULL) {
     GDateTime *now = g_date_time_new_now_local();
     clock_text = g_date_time_format(now, "%H:%M");
@@ -150,6 +241,7 @@ static void app_state_free(gpointer user_data) {
   }
   g_free(state->path);
   g_free(state->last_text);
+  g_free(state->target_text);
   g_free(state->last_clock_text);
   g_free(state);
 }

@@ -374,7 +374,7 @@ format_status_body() {
 
 log_ptt() {
   mkdir -p "${VOICE_STATE_DIR:-${XDG_STATE_HOME:-${HOME}/.local/state}/uconsole-helper-mapper}"
-  printf '[%s] %s\n' "$(date '+%F %T')" "$*" >>"${VOICE_STATE_DIR:-${XDG_STATE_HOME:-${HOME}/.local/state}/uconsole-helper-mapper}/voice-ptt.log" 2>/dev/null || true
+  printf '[%s] %s\n' "$(date '+%F %T.%3N')" "$*" >>"${VOICE_STATE_DIR:-${XDG_STATE_HOME:-${HOME}/.local/state}/uconsole-helper-mapper}/voice-ptt.log" 2>/dev/null || true
 }
 
 get_fcitx5_state() {
@@ -875,10 +875,6 @@ start_recording() {
     rm -f "${STARTING_FILE}" >/dev/null 2>&1 || true
     return
   fi
-  close_recording_popup || true
-  stop_existing_recording_session
-  stop_orphan_recording_processes
-
   if [[ -z "${ASR_URL}" ]]; then
     echo "ASR_URL is required" >&2
     rm -f "${STARTING_FILE}" >/dev/null 2>&1 || true
@@ -891,7 +887,15 @@ start_recording() {
     show_status "uconsole voice" "未配置 ASR Token" "0" "1200"
     exit 1
   fi
-  show_recording_status || log_ptt "show_recording_status returned nonzero"
+
+  stop_existing_recording_session
+  stop_orphan_recording_processes
+  log_ptt "recording preflight cleanup done"
+
+  local recording_status_pid=
+  (show_recording_status || log_ptt "show_recording_status returned nonzero") &
+  recording_status_pid=$!
+  log_ptt "recording status launch requested pid=${recording_status_pid}"
 
   local context_text prompt_glossary_json
   log_ptt "building ASR context"
@@ -979,6 +983,11 @@ STARTED_AT_MS=$(date +%s%3N)
 EOF
   rm -f "${STARTING_FILE}" >/dev/null 2>&1 || true
   log_ptt "recording state written pid=${recorder_pid} state=${STATE_FILE}"
+
+  if [[ -n "${recording_status_pid}" ]]; then
+    wait "${recording_status_pid}" || true
+    log_ptt "recording status launch completed pid=${recording_status_pid}"
+  fi
 
   local popup_watch_pid=
   popup_watch_pid=$(start_popup_watchdog "${recorder_pid}" "${script_path}" || true)
