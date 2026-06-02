@@ -1083,6 +1083,8 @@ class SegmentingTranscriptionSession:
             qwen_text = self.qwen_preview.finish()
             if qwen_text:
                 self.qwen_preview_text = qwen_text
+                self.popup_text = qwen_text
+                write_popup_text(qwen_text)
             preferred_text = normalize_text(qwen_text)
             finalized_from_stream = False
             if preferred_text:

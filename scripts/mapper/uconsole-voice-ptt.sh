@@ -587,6 +587,11 @@ write_recording_popup_text() {
   mv -f "${tmp_file}" "${popup_text_file}" >/dev/null 2>&1 || true
 }
 
+write_recognition_popup_status() {
+  [[ "${VOICE_QWEN_ASR_STREAMING:-1}" == "1" ]] && return 0
+  write_recording_popup_text "识别中" 1
+}
+
 stop_orphan_recording_processes() {
   local state_dir_pattern
 
@@ -1080,7 +1085,7 @@ stop_recording() {
   rm -f "${STATE_FILE}"
   close_recording_notification
   if [[ "${suppress_asr_status}" != "1" ]]; then
-    write_recording_popup_text "识别中" 1
+    write_recognition_popup_status
   else
     close_recording_popup
   fi
@@ -1109,14 +1114,14 @@ stop_recording() {
     : >"${STREAM_STOP_FILE}" || true
   fi
   if [[ "${suppress_asr_status}" != "1" ]]; then
-    write_recording_popup_text "识别中" 1
+    write_recognition_popup_status
   fi
   if kill -0 "${RECORDER_PID}" >/dev/null 2>&1; then
     if ! wait_for_exit "${RECORDER_PID}" 3; then
       log_ptt "stop_recording interrupt stream pid=${RECORDER_PID}"
       terminate_process_group "${RECORDER_PID}" INT
       if [[ "${suppress_asr_status}" != "1" ]]; then
-        write_recording_popup_text "识别中" 1
+        write_recognition_popup_status
       fi
       wait_for_exit "${RECORDER_PID}" 120 || true
     fi
@@ -1146,7 +1151,7 @@ stop_recording() {
   fi
 
   if [[ "${suppress_asr_status}" != "1" ]]; then
-    write_recording_popup_text "识别中" 1
+    write_recognition_popup_status
   fi
 
   if [[ ! -s "${STREAM_RESULT_FILE:-}" ]]; then
@@ -1170,7 +1175,7 @@ stop_recording() {
 
   local stream_status stream_error
   if [[ "${suppress_asr_status}" != "1" ]]; then
-    write_recording_popup_text "识别中" 1
+    write_recognition_popup_status
   fi
   stream_status=$(jq -r '.status // empty' "${STREAM_RESULT_FILE}")
   stream_error=$(jq -r '.error // empty' "${STREAM_RESULT_FILE}")
