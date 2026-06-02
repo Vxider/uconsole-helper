@@ -3,11 +3,19 @@ set -eu
 
 BATTERY=${LOW_BATTERY_SYSFS_BATTERY:-/sys/class/power_supply/axp20x-battery}
 AC=${LOW_BATTERY_SYSFS_AC:-/sys/class/power_supply/axp22x-ac}
+CONFIG_FILE=${LOW_BATTERY_CONFIG_FILE:-/etc/uconsole-helper/uconsole-helper.conf}
 THRESHOLD=${LOW_BATTERY_CAPACITY_THRESHOLD:-5}
 VOLTAGE_THRESHOLD_UV=${LOW_BATTERY_VOLTAGE_THRESHOLD_UV:-3450000}
 REQUIRED_SAMPLES=${LOW_BATTERY_REQUIRED_SAMPLES:-2}
 STATE_FILE=${LOW_BATTERY_STATE_FILE:-/run/low-battery-shutdown.low_count}
 LOG_FILE=${LOW_BATTERY_LOG_FILE:-/var/log/uconsole-battery.log}
+SAVE_TMUX_USER=${LOW_BATTERY_SAVE_TMUX_USER:-vxider}
+SAVE_TMUX_SCRIPT=${LOW_BATTERY_SAVE_TMUX_SCRIPT:-/home/vxider/.local/bin/uconsole-save-tmux-layout}
+
+if [ -r "$CONFIG_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$CONFIG_FILE"
+fi
 
 read_field() {
     path="$1"
@@ -40,6 +48,22 @@ log_sample() {
         "${calibrate:-}" \
         "${low_count:-0}" \
         "$decision" >>"$LOG_FILE" 2>/dev/null || true
+}
+
+save_tmux_layout() {
+    case "${POWERSAVER_SAVE_TMUX_ON_SHUTDOWN:-1}" in
+        1|yes|true|on|enabled)
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+    [ -x "$SAVE_TMUX_SCRIPT" ] || return 0
+    if command -v runuser >/dev/null 2>&1; then
+        runuser -u "$SAVE_TMUX_USER" -- "$SAVE_TMUX_SCRIPT" >/dev/null 2>&1 || true
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo -n -u "$SAVE_TMUX_USER" "$SAVE_TMUX_SCRIPT" >/dev/null 2>&1 || true
+    fi
 }
 
 [ -r "$BATTERY/capacity" ] || exit 0
@@ -100,5 +124,6 @@ fi
 
 logger -t low-battery-shutdown "Battery critical: capacity=${capacity:-unknown}% voltage=${voltage_now:-unknown}uV AC offline or unreadable, shutting down"
 log_sample "shutdown"
+save_tmux_layout
 sync
 systemctl poweroff

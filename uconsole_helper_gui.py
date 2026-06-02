@@ -57,6 +57,7 @@ DISPLAY_BACKLIGHT_BRIGHTNESS_PATH = Path("/sys/class/backlight/backlight@0/brigh
 DISPLAY_BACKLIGHT_MAX_PATH = Path("/sys/class/backlight/backlight@0/max_brightness")
 SCREEN_TIMEOUT_OPTIONS = ("Default", "30s", "1min", "2min", "5min", "10min", "15min")
 AUTO_SCREEN_TIMEOUT_OPTIONS = ("5s", "10s", "15s", "30s", "1min", "2min", "5min", "10min", "15min", "30min", "Never")
+IDLE_SHUTDOWN_TIMEOUT_OPTIONS = ("Never", "15min", "30min", "1h", "2h", "4h", "8h")
 DHCP_LEASE_TIME_OPTIONS = ("1h", "2h", "4h", "8h", "12h", "24h", "48h")
 APP_POWER_MIN_CPU_PERCENT = 1.0
 APP_POWER_MIN_IO_BYTES_PER_SEC = 256 * 1024
@@ -755,6 +756,16 @@ class UConsoleHelperWindow(Gtk.Window):
             status_grid.attach(title_label, column, row, 1, 1)
             status_grid.attach(value_label, column + 1, row, 1, 1)
             self.power_labels[key] = value_label
+        save_tmux = Gtk.Switch()
+        self.power_controls["POWERSAVER_SAVE_TMUX_ON_SHUTDOWN"] = save_tmux
+        self._attach_power_control(
+            status_grid,
+            "POWERSAVER_SAVE_TMUX_ON_SHUTDOWN",
+            "Save Tmux",
+            save_tmux,
+            len(rows),
+            tooltip="Save tmux layout before helper-triggered shutdown.",
+        )
 
         app_power_card = card_box()
         page.pack_start(app_power_card, True, True, 0)
@@ -823,6 +834,16 @@ class UConsoleHelperWindow(Gtk.Window):
             auto_ac = combo_text_from_values(AUTO_SCREEN_TIMEOUT_OPTIONS)
             self.power_controls[f"POWERSAVER_{profile}_AUTO_AC_PUTDOWN_TIMEOUT_SEC"] = auto_ac
             self._attach_power_control(profile_grid, f"POWERSAVER_{profile}_AUTO_AC_PUTDOWN_TIMEOUT_SEC", "Put Down (AC)", auto_ac, 9)
+            idle_shutdown = combo_text_from_values(IDLE_SHUTDOWN_TIMEOUT_OPTIONS)
+            self.power_controls[f"POWERSAVER_{profile}_BATTERY_IDLE_SHUTDOWN_TIMEOUT_SEC"] = idle_shutdown
+            self._attach_power_control(
+                profile_grid,
+                f"POWERSAVER_{profile}_BATTERY_IDLE_SHUTDOWN_TIMEOUT_SEC",
+                "Batt Idle Off",
+                idle_shutdown,
+                10,
+                tooltip="Only applies while running on battery; ignored on AC or while charging.",
+            )
             stand_mode = Gtk.Switch()
             self.power_controls[f"POWERSAVER_{profile}_STAND_MODE"] = stand_mode
             self._attach_power_control(
@@ -830,7 +851,7 @@ class UConsoleHelperWindow(Gtk.Window):
                 f"POWERSAVER_{profile}_STAND_MODE",
                 "Bypass Stand",
                 stand_mode,
-                10,
+                11,
                 tooltip="Bypass put-down lock while the device is in stand pose.",
             )
 
@@ -2890,6 +2911,8 @@ class UConsoleHelperWindow(Gtk.Window):
                     value = unknown_action_display_value(value)
                 elif key.endswith("_SCREEN_TIMEOUT_SEC"):
                     value = screen_timeout_display_value(value)
+                elif key.endswith("_BATTERY_IDLE_SHUTDOWN_TIMEOUT_SEC"):
+                    value = idle_shutdown_timeout_display_value(value)
                 elif "_AUTO_" in key and key.endswith("_TIMEOUT_SEC"):
                     value = auto_screen_timeout_display_value(value)
                 set_combo_text(widget, value)
@@ -3004,6 +3027,7 @@ class UConsoleHelperWindow(Gtk.Window):
             stand_mode_key = f"POWERSAVER_{profile}_STAND_MODE"
             auto_battery_key = f"POWERSAVER_{profile}_AUTO_BATTERY_PUTDOWN_TIMEOUT_SEC"
             auto_ac_key = f"POWERSAVER_{profile}_AUTO_AC_PUTDOWN_TIMEOUT_SEC"
+            idle_shutdown_key = f"POWERSAVER_{profile}_BATTERY_IDLE_SHUTDOWN_TIMEOUT_SEC"
             values[battery_key] = widget_text(self.power_controls[battery_key])
             values[ac_key] = widget_text(self.power_controls[ac_key])
             values[battery_screen_key] = screen_timeout_config_value(widget_text(self.power_controls[battery_screen_key]))
@@ -3015,6 +3039,7 @@ class UConsoleHelperWindow(Gtk.Window):
             values[stand_mode_key] = "1" if self.power_controls[stand_mode_key].get_active() else "0"
             values[auto_battery_key] = auto_screen_timeout_config_value(widget_text(self.power_controls[auto_battery_key]))
             values[auto_ac_key] = auto_screen_timeout_config_value(widget_text(self.power_controls[auto_ac_key]))
+            values[idle_shutdown_key] = idle_shutdown_timeout_config_value(widget_text(self.power_controls[idle_shutdown_key]))
             validate_freq_pair(values[battery_key], f"{profile.title()} Battery MHz")
             if values[ac_key] != "restore":
                 validate_freq_pair(values[ac_key], f"{profile.title()} AC MHz")
@@ -3035,6 +3060,16 @@ class UConsoleHelperWindow(Gtk.Window):
                         raise ValueError
                 except ValueError as exc:
                     raise ValueError(f"{profile.title()} auto screen timeouts must be seconds or Never.") from exc
+            try:
+                if int(values[idle_shutdown_key]) < -1:
+                    raise ValueError
+            except ValueError as exc:
+                raise ValueError(f"{profile.title()} idle shutdown must be seconds or Never.") from exc
+        save_tmux = self.power_controls.get("POWERSAVER_SAVE_TMUX_ON_SHUTDOWN")
+        if isinstance(save_tmux, Gtk.Switch):
+            values["POWERSAVER_SAVE_TMUX_ON_SHUTDOWN"] = "1" if save_tmux.get_active() else "0"
+        else:
+            values["POWERSAVER_SAVE_TMUX_ON_SHUTDOWN"] = helper_service_config().get("POWERSAVER_SAVE_TMUX_ON_SHUTDOWN", "1")
         values["POWERSAVER_UNKNOWN_POWER_ACTION"] = values["POWERSAVER_BALANCED_UNKNOWN_POWER_ACTION"]
         values["POWERSAVER_WWAN_POLICY"] = values["POWERSAVER_BALANCED_WWAN_POLICY"]
         if values["POWERSAVER_MODE"] not in {"eco", "balanced", "performance"}:
@@ -3692,6 +3727,30 @@ def auto_screen_timeout_config_value(value: str) -> str:
     }.get(value, value)
 
 
+def idle_shutdown_timeout_display_value(value: str) -> str:
+    return {
+        "-1": "Never",
+        "900": "15min",
+        "1800": "30min",
+        "3600": "1h",
+        "7200": "2h",
+        "14400": "4h",
+        "28800": "8h",
+    }.get(value, value)
+
+
+def idle_shutdown_timeout_config_value(value: str) -> str:
+    return {
+        "Never": "-1",
+        "15min": "900",
+        "30min": "1800",
+        "1h": "3600",
+        "2h": "7200",
+        "4h": "14400",
+        "8h": "28800",
+    }.get(value, value)
+
+
 def widget_text(widget: Gtk.Widget) -> str:
     if isinstance(widget, Gtk.Entry):
         return widget.get_text().strip()
@@ -3750,6 +3809,7 @@ def power_policy_config_text(values: dict[str, str]) -> str:
             f"POWERSAVER_ECO_STAND_MODE={values['POWERSAVER_ECO_STAND_MODE']}",
             f"POWERSAVER_ECO_AUTO_BATTERY_PUTDOWN_TIMEOUT_SEC={values['POWERSAVER_ECO_AUTO_BATTERY_PUTDOWN_TIMEOUT_SEC']}",
             f"POWERSAVER_ECO_AUTO_AC_PUTDOWN_TIMEOUT_SEC={values['POWERSAVER_ECO_AUTO_AC_PUTDOWN_TIMEOUT_SEC']}",
+            f"POWERSAVER_ECO_BATTERY_IDLE_SHUTDOWN_TIMEOUT_SEC={values['POWERSAVER_ECO_BATTERY_IDLE_SHUTDOWN_TIMEOUT_SEC']}",
             f"POWERSAVER_BALANCED_BATTERY_CPU_FREQ={values['POWERSAVER_BALANCED_BATTERY_CPU_FREQ']}",
             f"POWERSAVER_BALANCED_AC_CPU_FREQ={values['POWERSAVER_BALANCED_AC_CPU_FREQ']}",
             f"POWERSAVER_BALANCED_BATTERY_SCREEN_TIMEOUT_SEC={values['POWERSAVER_BALANCED_BATTERY_SCREEN_TIMEOUT_SEC']}",
@@ -3761,6 +3821,7 @@ def power_policy_config_text(values: dict[str, str]) -> str:
             f"POWERSAVER_BALANCED_STAND_MODE={values['POWERSAVER_BALANCED_STAND_MODE']}",
             f"POWERSAVER_BALANCED_AUTO_BATTERY_PUTDOWN_TIMEOUT_SEC={values['POWERSAVER_BALANCED_AUTO_BATTERY_PUTDOWN_TIMEOUT_SEC']}",
             f"POWERSAVER_BALANCED_AUTO_AC_PUTDOWN_TIMEOUT_SEC={values['POWERSAVER_BALANCED_AUTO_AC_PUTDOWN_TIMEOUT_SEC']}",
+            f"POWERSAVER_BALANCED_BATTERY_IDLE_SHUTDOWN_TIMEOUT_SEC={values['POWERSAVER_BALANCED_BATTERY_IDLE_SHUTDOWN_TIMEOUT_SEC']}",
             f"POWERSAVER_PERFORMANCE_BATTERY_CPU_FREQ={values['POWERSAVER_PERFORMANCE_BATTERY_CPU_FREQ']}",
             f"POWERSAVER_PERFORMANCE_AC_CPU_FREQ={values['POWERSAVER_PERFORMANCE_AC_CPU_FREQ']}",
             f"POWERSAVER_PERFORMANCE_BATTERY_SCREEN_TIMEOUT_SEC={values['POWERSAVER_PERFORMANCE_BATTERY_SCREEN_TIMEOUT_SEC']}",
@@ -3772,6 +3833,13 @@ def power_policy_config_text(values: dict[str, str]) -> str:
             f"POWERSAVER_PERFORMANCE_STAND_MODE={values['POWERSAVER_PERFORMANCE_STAND_MODE']}",
             f"POWERSAVER_PERFORMANCE_AUTO_BATTERY_PUTDOWN_TIMEOUT_SEC={values['POWERSAVER_PERFORMANCE_AUTO_BATTERY_PUTDOWN_TIMEOUT_SEC']}",
             f"POWERSAVER_PERFORMANCE_AUTO_AC_PUTDOWN_TIMEOUT_SEC={values['POWERSAVER_PERFORMANCE_AUTO_AC_PUTDOWN_TIMEOUT_SEC']}",
+            f"POWERSAVER_PERFORMANCE_BATTERY_IDLE_SHUTDOWN_TIMEOUT_SEC={values['POWERSAVER_PERFORMANCE_BATTERY_IDLE_SHUTDOWN_TIMEOUT_SEC']}",
+            "",
+            "### Battery idle shutdown seconds per profile",
+            "### -1 disables it. This only applies while running on battery; AC/charging ignores it.",
+            "",
+            "### Shutdown behavior --- [1|0]",
+            f"POWERSAVER_SAVE_TMUX_ON_SHUTDOWN={values['POWERSAVER_SAVE_TMUX_ON_SHUTDOWN']}",
             "",
             "### POWERSAVER_UNKNOWN_POWER_ACTION --- [restore|battery|keep]",
             f"POWERSAVER_UNKNOWN_POWER_ACTION={values['POWERSAVER_UNKNOWN_POWER_ACTION']}",
@@ -5886,6 +5954,11 @@ def helper_service_config() -> dict[str, str]:
         "POWERSAVER_ECO_UNKNOWN_POWER_ACTION": "restore",
         "POWERSAVER_ECO_WWAN_POLICY": "ondemand",
         "POWERSAVER_ECO_AUTO_BRIGHTNESS": "0",
+        "POWERSAVER_ECO_SCREEN_MODE": "default",
+        "POWERSAVER_ECO_STAND_MODE": "0",
+        "POWERSAVER_ECO_AUTO_BATTERY_PUTDOWN_TIMEOUT_SEC": "30",
+        "POWERSAVER_ECO_AUTO_AC_PUTDOWN_TIMEOUT_SEC": "60",
+        "POWERSAVER_ECO_BATTERY_IDLE_SHUTDOWN_TIMEOUT_SEC": "-1",
         "POWERSAVER_BALANCED_BATTERY_CPU_FREQ": "1500,1500",
         "POWERSAVER_BALANCED_AC_CPU_FREQ": "restore",
         "POWERSAVER_BALANCED_BATTERY_SCREEN_TIMEOUT_SEC": "0",
@@ -5893,6 +5966,11 @@ def helper_service_config() -> dict[str, str]:
         "POWERSAVER_BALANCED_UNKNOWN_POWER_ACTION": "restore",
         "POWERSAVER_BALANCED_WWAN_POLICY": "ondemand",
         "POWERSAVER_BALANCED_AUTO_BRIGHTNESS": "0",
+        "POWERSAVER_BALANCED_SCREEN_MODE": "default",
+        "POWERSAVER_BALANCED_STAND_MODE": "0",
+        "POWERSAVER_BALANCED_AUTO_BATTERY_PUTDOWN_TIMEOUT_SEC": "60",
+        "POWERSAVER_BALANCED_AUTO_AC_PUTDOWN_TIMEOUT_SEC": "120",
+        "POWERSAVER_BALANCED_BATTERY_IDLE_SHUTDOWN_TIMEOUT_SEC": "-1",
         "POWERSAVER_PERFORMANCE_BATTERY_CPU_FREQ": "1500,2400",
         "POWERSAVER_PERFORMANCE_AC_CPU_FREQ": "restore",
         "POWERSAVER_PERFORMANCE_BATTERY_SCREEN_TIMEOUT_SEC": "0",

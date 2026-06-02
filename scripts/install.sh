@@ -124,6 +124,7 @@ install_service() {
     ensure_config_key "${config_file}" "POWERSAVER_ECO_STAND_MODE" "0"
     ensure_config_key "${config_file}" "POWERSAVER_ECO_AUTO_BATTERY_PUTDOWN_TIMEOUT_SEC" "30"
     ensure_config_key "${config_file}" "POWERSAVER_ECO_AUTO_AC_PUTDOWN_TIMEOUT_SEC" "60"
+    ensure_config_key "${config_file}" "POWERSAVER_ECO_BATTERY_IDLE_SHUTDOWN_TIMEOUT_SEC" "-1"
     ensure_config_key "${config_file}" "POWERSAVER_BALANCED_BATTERY_CPU_FREQ" "1500,1500"
     ensure_config_key "${config_file}" "POWERSAVER_BALANCED_AC_CPU_FREQ" "restore"
     ensure_config_key "${config_file}" "POWERSAVER_BALANCED_BATTERY_SCREEN_TIMEOUT_SEC" "0"
@@ -135,6 +136,7 @@ install_service() {
     ensure_config_key "${config_file}" "POWERSAVER_BALANCED_STAND_MODE" "0"
     ensure_config_key "${config_file}" "POWERSAVER_BALANCED_AUTO_BATTERY_PUTDOWN_TIMEOUT_SEC" "60"
     ensure_config_key "${config_file}" "POWERSAVER_BALANCED_AUTO_AC_PUTDOWN_TIMEOUT_SEC" "120"
+    ensure_config_key "${config_file}" "POWERSAVER_BALANCED_BATTERY_IDLE_SHUTDOWN_TIMEOUT_SEC" "-1"
     ensure_config_key "${config_file}" "POWERSAVER_PERFORMANCE_BATTERY_CPU_FREQ" "1500,2400"
     ensure_config_key "${config_file}" "POWERSAVER_PERFORMANCE_AC_CPU_FREQ" "restore"
     ensure_config_key "${config_file}" "POWERSAVER_PERFORMANCE_BATTERY_SCREEN_TIMEOUT_SEC" "0"
@@ -146,6 +148,8 @@ install_service() {
     ensure_config_key "${config_file}" "POWERSAVER_PERFORMANCE_STAND_MODE" "0"
     ensure_config_key "${config_file}" "POWERSAVER_PERFORMANCE_AUTO_BATTERY_PUTDOWN_TIMEOUT_SEC" "120"
     ensure_config_key "${config_file}" "POWERSAVER_PERFORMANCE_AUTO_AC_PUTDOWN_TIMEOUT_SEC" "300"
+    ensure_config_key "${config_file}" "POWERSAVER_PERFORMANCE_BATTERY_IDLE_SHUTDOWN_TIMEOUT_SEC" "-1"
+    ensure_config_key "${config_file}" "POWERSAVER_SAVE_TMUX_ON_SHUTDOWN" "1"
   fi
   sudo install -m 0644 "${APP_DIR}/services/uconsole-helper.service" "${service_file}"
   sudo install -m 0644 "${APP_DIR}/services/low-battery-shutdown.service" "${low_battery_service_file}"
@@ -312,6 +316,7 @@ install_mapper() {
   install -m 0755 "${APP_DIR}/scripts/mapper/uconsole-paste.sh" "${bin_dir}/uconsole-paste"
   install -m 0755 "${APP_DIR}/scripts/mapper/uconsole-voice-ptt.sh" "${bin_dir}/uconsole-voice-ptt"
   install -m 0755 "${APP_DIR}/scripts/mapper/uconsole-voice-stream.py" "${bin_dir}/uconsole-voice-stream"
+  install -m 0755 "${APP_DIR}/scripts/user/uconsole-save-tmux-layout" "${bin_dir}/uconsole-save-tmux-layout"
   if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists gtk+-3.0 gtk-layer-shell-0; then
     cc "${APP_DIR}/scripts/mapper/uconsole-asr-popup.c" -o "${bin_dir}/uconsole-asr-popup" $(pkg-config --cflags --libs gtk+-3.0 gtk-layer-shell-0)
     chmod 0755 "${bin_dir}/uconsole-asr-popup"

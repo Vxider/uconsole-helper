@@ -22,6 +22,7 @@ DISPLAY_CONTROL = "/usr/local/bin/uconsole-helper-mapper-display-control"
 DISPLAY_BACKLIGHT_POWER = Path("/sys/class/backlight/backlight@0/bl_power")
 DISPLAY_BACKLIGHT_BRIGHTNESS = Path("/sys/class/backlight/backlight@0/brightness")
 KEYBOARD_BACKLIGHT_SCRIPT = Path("~/WorkSpace/uconsole-keyboard/tools/keyboard_state.sh").expanduser()
+TMUX_SAVE_SCRIPT = Path("~/WorkSpace/uconsole-helper/scripts/user/uconsole-save-tmux-layout").expanduser()
 MCU_SHARED_SAMPLE_FILE = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "uconsole-helper-mcu-latest.json"
 POLL_SECONDS = 1
 CONFIG_POLL_SECONDS = 15
@@ -596,6 +597,49 @@ def auto_timeout_for_state(values: dict[str, str], state: str, pose: str) -> int
     return int_config(values, f"POWERSAVER_{profile}_AUTO_BATTERY_PUTDOWN_TIMEOUT_SEC", 60)
 
 
+def battery_idle_shutdown_timeout(values: dict[str, str], state: str) -> int:
+    if state != "battery":
+        return -1
+    return int_config(values, f"POWERSAVER_{current_profile(values)}_BATTERY_IDLE_SHUTDOWN_TIMEOUT_SEC", -1)
+
+
+def save_tmux_on_shutdown_enabled(values: dict[str, str]) -> bool:
+    return config_enabled(values, "POWERSAVER_SAVE_TMUX_ON_SHUTDOWN", "1")
+
+
+def save_tmux_layout(values: dict[str, str]) -> None:
+    if not save_tmux_on_shutdown_enabled(values):
+        return
+    script = Path(values.get("POWERSAVER_SAVE_TMUX_SCRIPT", str(TMUX_SAVE_SCRIPT))).expanduser()
+    if not script.exists():
+        script = Path.home() / ".local/bin/uconsole-save-tmux-layout"
+    if not script.exists():
+        return
+    try:
+        subprocess.run([str(script)], text=True, capture_output=True, timeout=12, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"warning: tmux layout save failed before shutdown: {exc}", flush=True)
+
+
+def request_poweroff(reason: str) -> None:
+    print(f"requesting poweroff: {reason}", flush=True)
+    try:
+        subprocess.run(["sync"], timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    commands = (["systemctl", "poweroff"], ["sudo", "-n", "systemctl", "poweroff"])
+    for command in commands:
+        try:
+            result = subprocess.run(command, text=True, capture_output=True, timeout=10, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(f"warning: {' '.join(command)} failed: {exc}", flush=True)
+            continue
+        if result.returncode == 0:
+            return
+        error = (result.stderr or result.stdout or "").strip()
+        print(f"warning: {' '.join(command)} exited {result.returncode}: {error}", flush=True)
+
+
 def find_xiao_tty() -> Path | None:
     ports = sorted(Path("/dev").glob("ttyACM*"))
     return ports[0] if ports else None
@@ -918,6 +962,7 @@ def main() -> int:
     reported_display_off: bool | None = None
     last_led_power_update = 0.0
     tmux_notify_active: bool | None = None
+    idle_shutdown_requested = False
     values = load_config()
     state = power_state(Path(values.get("POWERSAVER_POWER_SUPPLY_DIR", str(POWER_SUPPLY_DIR))))
     last_config_check = 0.0
@@ -939,6 +984,18 @@ def main() -> int:
         screen_mode = screen_mode_for_profile(values)
         needs_mcu_sample = True
         host_last_active_at = host_input.poll()
+        idle_shutdown_timeout = battery_idle_shutdown_timeout(values, state)
+        idle_seconds = max(0.0, now - host_last_active_at)
+        if idle_shutdown_timeout > 0 and idle_seconds >= idle_shutdown_timeout:
+            if not idle_shutdown_requested:
+                idle_shutdown_requested = True
+                save_tmux_layout(values)
+                request_poweroff(
+                    f"battery idle for {idle_seconds:.0f}s >= {idle_shutdown_timeout}s "
+                    f"profile={current_profile(values).lower()}"
+                )
+        else:
+            idle_shutdown_requested = False
         sample = mcu_reader.read_sample(needs_mcu_sample)
         battery_led_enabled = config_enabled(values, "MCU_LED_BATTERY_ENABLED", "1")
         notify_led_enabled = config_enabled(values, "MCU_LED_LXTERMINAL_BELL_ENABLED", "1")
