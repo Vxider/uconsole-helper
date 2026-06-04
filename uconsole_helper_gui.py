@@ -17,6 +17,7 @@ import math
 import json
 import os
 import platform
+import queue
 import re
 import shutil
 import socket
@@ -51,6 +52,7 @@ MAPPER_DESKTOP_KEYBINDS_CONFIG = Path.home() / ".config/uconsole-helper-mapper/d
 MAPPER_ASR_CONFIG = Path.home() / ".config/uconsole-helper-mapper/voice.env"
 MAPPER_GLOSSARY_FILE = Path.home() / ".config/uconsole-helper-mapper/voice-glossary.txt"
 CPA_GUI_CONFIG = Path.home() / ".config/uconsole-helper/cpa.env"
+CPA_STATUS_CACHE = Path.home() / ".cache/uconsole-helper/cpa-status.json"
 MCU_SHARED_SAMPLE_FILE = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "uconsole-helper-mcu-latest.json"
 BATTERY_CALIBRATE_PATH = Path("/sys/class/power_supply/axp20x-battery/calibrate")
 DISPLAY_BACKLIGHT_BRIGHTNESS_PATH = Path("/sys/class/backlight/backlight@0/brightness")
@@ -105,6 +107,17 @@ class BatteryInfo:
         if self.voltage_uv is None:
             return None
         return self.voltage_uv / 1_000_000
+
+    @property
+    def estimated_capacity(self) -> int | None:
+        return battery_percent_from_voltage(self.voltage_uv)
+
+    @property
+    def display_capacity(self) -> int:
+        if self.status in {"discharging", "charging"} and self.estimated_capacity is not None:
+            if self.capacity - self.estimated_capacity >= 15:
+                return self.estimated_capacity
+        return self.capacity
 
 
 MCU_POSE_LABELS = {
@@ -248,6 +261,9 @@ class McuTelemetryState:
     last_status_requested_at: float
     smoothed_light_lux: float | None
     suggested_backlight: int | None
+    light_lux: float | None
+    light_raw: int | None
+    light_ready: bool
 
     def __init__(self) -> None:
         self.samples = []
@@ -263,6 +279,9 @@ class McuTelemetryState:
         self.last_status_requested_at = 0.0
         self.smoothed_light_lux = None
         self.suggested_backlight = None
+        self.light_lux = None
+        self.light_raw = None
+        self.light_ready = False
 
 
 @dataclass
@@ -1656,7 +1675,7 @@ class UConsoleHelperWindow(Gtk.Window):
         if entering_power:
             self.reset_app_power_ranking()
         self.stack.set_visible_child_name(name)
-        self.refresh_page(name, reload_config=True)
+        self.refresh_page(name, reload_config=name != "cpa")
 
     def update_header(self) -> None:
         page = self.stack.get_visible_child_name() or "dashboard"
@@ -1858,10 +1877,12 @@ class UConsoleHelperWindow(Gtk.Window):
             else:
                 self.update_header()
         elif page == "cpa":
-            if reload_config:
-                self.load_cpa_config_controls()
             if reload_config or not self.cpa_loaded_once:
+                self.load_cpa_config_controls()
+            if reload_config:
                 self.refresh_cpa_status(force=True)
+            elif not self.cpa_loaded_once:
+                self.load_cpa_status_cache()
         elif page == "asr":
             if reload_config:
                 self.load_asr_config_controls()
@@ -2392,11 +2413,11 @@ class UConsoleHelperWindow(Gtk.Window):
                         tilt_deg=estimate_tilt_deg(last_sample.ax, last_sample.ay, last_sample.az),
                         sample_rate_hz=estimate_sample_rate(state.samples),
                         pose=last_sample.firmware_pose or "-",
-                        light_lux=None,
-                        smoothed_light_lux=None,
-                        suggested_backlight=None,
-                        light_raw=None,
-                        light_ready=False,
+                        light_lux=state.light_lux,
+                        smoothed_light_lux=state.smoothed_light_lux,
+                        suggested_backlight=state.suggested_backlight,
+                        light_raw=state.light_raw,
+                        light_ready=state.light_ready,
                         last_update=time.time(),
                         raw_line=format_sample_line(last_sample),
                         last_error=str(exc),
@@ -2420,11 +2441,11 @@ class UConsoleHelperWindow(Gtk.Window):
                     tilt_deg=0.0,
                     sample_rate_hz=0.0,
                     pose="-",
-                    light_lux=None,
+                    light_lux=state.light_lux,
                     smoothed_light_lux=state.smoothed_light_lux,
                     suggested_backlight=state.suggested_backlight,
-                    light_raw=None,
-                    light_ready=False,
+                    light_raw=state.light_raw,
+                    light_ready=state.light_ready,
                     last_update=time.time(),
                     raw_line="",
                     last_error=str(exc),
@@ -2732,19 +2753,25 @@ class UConsoleHelperWindow(Gtk.Window):
         self.cpa_status_label.set_text("Refreshing CPA...")
         self.cpa_balance_store.clear()
         self.cpa_quota_store.clear()
-        self.cpa_balance_store.append([False, "...", "...", "-", "-", "-", "-", "", "", "", False])
-        self.cpa_quota_store.append([False, "...", "...", "-", "-", "-", "-", "-", "", False])
         self.update_header()
         thread = threading.Thread(target=self._cpa_refresh_worker, daemon=True)
         thread.start()
 
     def _cpa_refresh_worker(self) -> None:
+        balances: list[dict[str, object]] = []
+        quotas: list[dict[str, object]] = []
         try:
-            data = cpa_status(env_config(CPA_GUI_CONFIG, default_cpa_config()))
+            for kind, row in cpa_status_rows(env_config(CPA_GUI_CONFIG, default_cpa_config())):
+                if kind == "balance":
+                    balances.append(row)
+                    GLib.idle_add(self.append_cpa_balance_row, row)
+                elif kind == "quota":
+                    quotas.append(row)
+                    GLib.idle_add(self.append_cpa_quota_row, row)
         except Exception as exc:
             GLib.idle_add(self.finish_cpa_refresh_error, str(exc))
             return
-        GLib.idle_add(self.finish_cpa_refresh, data)
+        GLib.idle_add(self.finish_cpa_refresh, {"balances": balances, "quotas": quotas, "summary": cpa_summary_text(balances, quotas)})
 
     def finish_cpa_refresh_error(self, error: str) -> bool:
         self.cpa_refresh_running = False
@@ -2763,52 +2790,101 @@ class UConsoleHelperWindow(Gtk.Window):
         self.cpa_refresh_running = False
         self.cpa_loaded_once = True
         self.cpa_last_refresh_at = time.monotonic()
-        self.cpa_balance_store.clear()
-        for row in data.get("balances", []):
-            if isinstance(row, dict):
-                enabled = not bool(row.get("disabled"))
-                self.cpa_balance_store.append(
-                    [
-                        enabled,
-                        str(row.get("provider", "-")),
-                        str(row.get("status", "-")),
-                        display_optional_number(row.get("remaining")),
-                        display_optional_number(row.get("used")),
-                        display_optional_number(row.get("total")),
-                        str(row.get("note", "-")),
-                        str(row.get("section") or ""),
-                        str(row.get("index") if row.get("index") is not None else ""),
-                        str(row.get("api_key") or ""),
-                        enabled,
-                    ]
-                )
+        self.save_cpa_status_cache(data)
         if len(self.cpa_balance_store) == 0:
             self.cpa_balance_store.append([False, "-", "N/A", "-", "-", "-", "No providers", "", "", "", False])
-
-        self.cpa_quota_store.clear()
-        for row in data.get("quotas", []):
-            if isinstance(row, dict):
-                enabled = not bool(row.get("disabled"))
-                self.cpa_quota_store.append(
-                    [
-                        enabled,
-                        str(row.get("account", "-")),
-                        str(row.get("status", "-")),
-                        str(row.get("plan", "-")),
-                        display_percent_value(row.get("five_hour_remaining")),
-                        display_percent_value(row.get("five_hour_used")),
-                        display_percent_value(row.get("weekly_remaining")),
-                        str(row.get("reset", "-")),
-                        str(row.get("name") or ""),
-                        enabled,
-                    ]
-                )
         if len(self.cpa_quota_store) == 0:
             self.cpa_quota_store.append([False, "-", "N/A", "-", "-", "-", "-", "No accounts", "", False])
 
         self.cpa_summary_label.set_text(str(data.get("summary", "-")))
         self.cpa_status_label.set_text(f"Updated {time.strftime('%H:%M:%S')}")
         self.update_header()
+        return False
+
+    def load_cpa_status_cache(self) -> None:
+        try:
+            data = json.loads(CPA_STATUS_CACHE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            self.cpa_loaded_once = True
+            self.cpa_summary_label.set_text("No CPA history. Click Refresh to load.")
+            self.cpa_status_label.set_text("CPA history unavailable.")
+            self.update_header()
+            return
+        if not isinstance(data, dict):
+            self.cpa_loaded_once = True
+            return
+        self.render_cpa_status_data(data)
+        self.cpa_loaded_once = True
+        refreshed_at = data.get("refreshed_at")
+        if isinstance(refreshed_at, (int, float)) and refreshed_at > 0:
+            self.cpa_status_label.set_text(f"History {time.strftime('%H:%M:%S', time.localtime(refreshed_at))}")
+        else:
+            self.cpa_status_label.set_text("Showing CPA history.")
+        self.update_header()
+
+    def save_cpa_status_cache(self, data: dict[str, object]) -> None:
+        cache_data = dict(data)
+        cache_data["refreshed_at"] = time.time()
+        try:
+            CPA_STATUS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            CPA_STATUS_CACHE.write_text(json.dumps(cache_data, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            pass
+
+    def render_cpa_status_data(self, data: dict[str, object]) -> None:
+        self.cpa_balance_store.clear()
+        self.cpa_quota_store.clear()
+        balances = data.get("balances", [])
+        quotas = data.get("quotas", [])
+        if isinstance(balances, list):
+            for row in balances:
+                if isinstance(row, dict):
+                    self.append_cpa_balance_row(row)
+        if isinstance(quotas, list):
+            for row in quotas:
+                if isinstance(row, dict):
+                    self.append_cpa_quota_row(row)
+        if len(self.cpa_balance_store) == 0:
+            self.cpa_balance_store.append([False, "-", "N/A", "-", "-", "-", "No providers", "", "", "", False])
+        if len(self.cpa_quota_store) == 0:
+            self.cpa_quota_store.append([False, "-", "N/A", "-", "-", "-", "-", "No accounts", "", False])
+        self.cpa_summary_label.set_text(str(data.get("summary", "-")))
+
+    def append_cpa_balance_row(self, row: dict[str, object]) -> bool:
+        enabled = not bool(row.get("disabled"))
+        self.cpa_balance_store.append(
+            [
+                enabled,
+                str(row.get("provider", "-")),
+                str(row.get("status", "-")),
+                display_optional_number(row.get("remaining")),
+                display_optional_number(row.get("used")),
+                display_optional_number(row.get("total")),
+                str(row.get("note", "-")),
+                str(row.get("section") or ""),
+                str(row.get("index") if row.get("index") is not None else ""),
+                str(row.get("api_key") or ""),
+                enabled,
+            ]
+        )
+        return False
+
+    def append_cpa_quota_row(self, row: dict[str, object]) -> bool:
+        enabled = not bool(row.get("disabled"))
+        self.cpa_quota_store.append(
+            [
+                enabled,
+                str(row.get("account", "-")),
+                str(row.get("status", "-")),
+                str(row.get("plan", "-")),
+                display_percent_value(row.get("five_hour_remaining")),
+                display_percent_value(row.get("five_hour_used")),
+                display_percent_value(row.get("weekly_remaining")),
+                str(row.get("reset", "-")),
+                str(row.get("name") or ""),
+                enabled,
+            ]
+        )
         return False
 
     def on_cpa_account_toggled(self, _renderer: Gtk.CellRendererToggle, path: str) -> None:
@@ -5978,6 +6054,12 @@ def helper_service_config() -> dict[str, str]:
         "POWERSAVER_PERFORMANCE_UNKNOWN_POWER_ACTION": "restore",
         "POWERSAVER_PERFORMANCE_WWAN_POLICY": "ondemand",
         "POWERSAVER_PERFORMANCE_AUTO_BRIGHTNESS": "0",
+        "POWERSAVER_PERFORMANCE_SCREEN_MODE": "default",
+        "POWERSAVER_PERFORMANCE_STAND_MODE": "0",
+        "POWERSAVER_PERFORMANCE_AUTO_BATTERY_PUTDOWN_TIMEOUT_SEC": "120",
+        "POWERSAVER_PERFORMANCE_AUTO_AC_PUTDOWN_TIMEOUT_SEC": "300",
+        "POWERSAVER_PERFORMANCE_BATTERY_IDLE_SHUTDOWN_TIMEOUT_SEC": "-1",
+        "POWERSAVER_SAVE_TMUX_ON_SHUTDOWN": "1",
         "POWERSAVER_UNKNOWN_POWER_ACTION": "restore",
         "POWERSAVER_WWAN_POLICY": "ondemand",
         "POWERSAVER_POLL_INTERVAL_SEC": "5",
@@ -6143,18 +6225,64 @@ def asr_config_text(values: dict[str, str]) -> str:
 
 
 def cpa_status(config: dict[str, str]) -> dict[str, object]:
+    balances: list[dict[str, object]] = []
+    quotas: list[dict[str, object]] = []
+    for kind, row in cpa_status_rows(config):
+        if kind == "balance":
+            balances.append(row)
+        elif kind == "quota":
+            quotas.append(row)
+    return {"balances": balances, "quotas": quotas, "summary": cpa_summary_text(balances, quotas)}
+
+
+def cpa_status_rows(config: dict[str, str]):
     base_url = config.get("CPA_BASE_URL", "").strip().rstrip("/")
     management_key = config.get("CPA_MANAGEMENT_KEY", "").strip()
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        providers_future = executor.submit(cpa_management_providers, base_url, management_key)
-        cli_future = executor.submit(cpa_status_from_cli, config)
-        quotas_future = executor.submit(query_cpa_quotas, base_url, management_key)
-        providers = providers_future.result()
-        cli_status = cli_future.result()
-        balances = cpa_balances_for_gui(providers, cli_status, base_url, management_key)
-        quotas = quotas_future.result()
-    summary = cpa_summary_text(balances, quotas)
-    return {"balances": balances, "quotas": quotas, "summary": summary}
+    result_queue: queue.Queue[tuple[str, object]] = queue.Queue()
+
+    def produce_balances() -> None:
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                providers_future = executor.submit(cpa_management_providers, base_url, management_key)
+                cli_future = executor.submit(cpa_status_from_cli, config)
+                providers = providers_future.result()
+                cli_status = cli_future.result()
+            for row in cpa_balance_rows_for_gui(providers, cli_status, base_url, management_key):
+                result_queue.put(("balance", row))
+        except Exception as exc:
+            result_queue.put(("error", exc))
+        finally:
+            result_queue.put(("done", "balance"))
+
+    def produce_quotas() -> None:
+        try:
+            for row in query_cpa_quota_rows(base_url, management_key):
+                result_queue.put(("quota", row))
+        except Exception as exc:
+            result_queue.put(("error", exc))
+        finally:
+            result_queue.put(("done", "quota"))
+
+    producers = (
+        threading.Thread(target=produce_balances, daemon=True),
+        threading.Thread(target=produce_quotas, daemon=True),
+    )
+    for producer in producers:
+        producer.start()
+
+    remaining = len(producers)
+    first_error: Exception | None = None
+    while remaining > 0:
+        kind, payload = result_queue.get()
+        if kind == "done":
+            remaining -= 1
+        elif kind == "error":
+            if first_error is None and isinstance(payload, Exception):
+                first_error = payload
+        elif isinstance(payload, dict):
+            yield kind, payload
+    if first_error is not None:
+        raise first_error
 
 
 def cpa_balances_for_gui(
@@ -6171,6 +6299,24 @@ def cpa_balances_for_gui(
     if providers is not None:
         return query_cpa_balances(providers)
     return query_cpa_provider_balances_from_management(base_url, management_key)
+
+
+def cpa_balance_rows_for_gui(
+    providers: list[dict[str, object]] | None,
+    cli_status: dict[str, object] | None,
+    base_url: str,
+    management_key: str,
+):
+    if isinstance(cli_status, dict) and isinstance(cli_status.get("balances"), list):
+        balances = merge_cli_balances_with_providers(cli_status["balances"], providers or [])
+        if providers:
+            add_missing_disabled_provider_rows(balances, providers)
+        yield from balances
+        return
+    if providers is not None:
+        yield from query_cpa_balance_rows(providers)
+        return
+    yield from query_cpa_provider_balance_rows_from_management(base_url, management_key)
 
 
 def merge_cli_balances_with_providers(
@@ -6342,20 +6488,23 @@ def cpa_item_has_balance_note(item: dict[str, object]) -> bool:
 
 
 def query_cpa_balances(providers: list[dict[str, object]]) -> list[dict[str, object]]:
-    active = [provider for provider in providers if not provider.get("disabled")]
-    rows: list[dict[str, object]] = []
-    for provider in providers:
-        if provider.get("disabled"):
-            rows.append(cpa_disabled_provider_row(provider))
-    if active:
-        with ThreadPoolExecutor(max_workers=min(16, max(1, len(active)))) as executor:
-            futures = [executor.submit(query_cpa_balance, provider) for provider in active]
-            for future in as_completed(futures):
-                rows.append(future.result())
+    rows = list(query_cpa_balance_rows(providers))
     if not rows:
         return [{"provider": "-", "status": "N/A", "remaining": None, "used": None, "total": None, "note": "No providers"}]
     rows.sort(key=lambda row: (bool(row.get("disabled")), str(row.get("provider", "")).lower()))
     return rows
+
+
+def query_cpa_balance_rows(providers: list[dict[str, object]]):
+    active = [provider for provider in providers if not provider.get("disabled")]
+    for provider in providers:
+        if provider.get("disabled"):
+            yield cpa_disabled_provider_row(provider)
+    if active:
+        with ThreadPoolExecutor(max_workers=min(16, max(1, len(active)))) as executor:
+            futures = [executor.submit(query_cpa_balance, provider) for provider in active]
+            for future in as_completed(futures):
+                yield future.result()
 
 
 def cpa_provider_metadata(provider: dict[str, object]) -> dict[str, object]:
@@ -6382,21 +6531,26 @@ def cpa_disabled_provider_row(provider: dict[str, object]) -> dict[str, object]:
 
 
 def query_cpa_provider_balances_from_management(base_url: str, management_key: str) -> list[dict[str, object]]:
+    rows = list(query_cpa_provider_balance_rows_from_management(base_url, management_key))
+    return rows or [{"provider": "-", "status": "N/A", "remaining": None, "used": None, "total": None, "note": "No providers"}]
+
+
+def query_cpa_provider_balance_rows_from_management(base_url: str, management_key: str):
     if not management_key:
-        return [{"provider": "-", "status": "N/A", "remaining": None, "used": None, "total": None, "note": "No mgmt key"}]
+        yield {"provider": "-", "status": "N/A", "remaining": None, "used": None, "total": None, "note": "No mgmt key"}
+        return
     providers = cpa_management_providers(base_url, management_key)
     if providers is None:
-        return [
-            {
-                "provider": "-",
-                "status": "N/A",
-                "remaining": None,
-                "used": None,
-                "total": None,
-                "note": "Provider list unavailable via Management API",
-            }
-        ]
-    return query_cpa_balances(providers)
+        yield {
+            "provider": "-",
+            "status": "N/A",
+            "remaining": None,
+            "used": None,
+            "total": None,
+            "note": "Provider list unavailable via Management API",
+        }
+        return
+    yield from query_cpa_balance_rows(providers)
 
 
 def cpa_management_providers(base_url: str, management_key: str) -> list[dict[str, object]] | None:
@@ -6619,15 +6773,24 @@ def parse_cpa_balance_data(data: object, shape: str) -> dict[str, object] | None
 
 
 def query_cpa_quotas(base_url: str, management_key: str) -> list[dict[str, object]]:
+    rows = list(query_cpa_quota_rows(base_url, management_key))
+    if not rows:
+        return [{"account": "-", "status": "N/A", "plan": "-", "five_hour_remaining": None, "five_hour_used": None, "weekly_remaining": None, "reset": "-", "note": "No Codex accounts"}]
+    rows.sort(key=lambda row: (bool(row.get("disabled")), -(float(row.get("five_hour_remaining") or -1)), str(row.get("account", "")).lower()))
+    return rows
+
+
+def query_cpa_quota_rows(base_url: str, management_key: str):
     if not management_key:
-        return [{"account": "-", "status": "N/A", "plan": "-", "five_hour_remaining": None, "five_hour_used": None, "weekly_remaining": None, "reset": "-", "note": "No mgmt key"}]
+        yield {"account": "-", "status": "N/A", "plan": "-", "five_hour_remaining": None, "five_hour_used": None, "weekly_remaining": None, "reset": "-", "note": "No mgmt key"}
+        return
     try:
         auth_files = http_json(f"{base_url.rstrip('/')}/v0/management/auth-files", headers={"Authorization": f"Bearer {management_key}"}, timeout=12)
     except Exception as exc:
-        return [{"account": "-", "status": "Err", "plan": "-", "five_hour_remaining": None, "five_hour_used": None, "weekly_remaining": None, "reset": "-", "note": compact_error(str(exc))}]
+        yield {"account": "-", "status": "Err", "plan": "-", "five_hour_remaining": None, "five_hour_used": None, "weekly_remaining": None, "reset": "-", "note": compact_error(str(exc))}
+        return
     files = auth_files.get("files", []) if isinstance(auth_files, dict) else []
     tasks: list[dict[str, str]] = []
-    rows: list[dict[str, object]] = []
     for item in files:
         if not isinstance(item, dict) or not cpa_auth_file_is_codex(item):
             continue
@@ -6635,34 +6798,30 @@ def query_cpa_quotas(base_url: str, management_key: str) -> list[dict[str, objec
         disabled = bool(item.get("disabled"))
         name = str(item.get("name") or item.get("id") or "").strip()
         if disabled or "余额" in note:
-            rows.append(
-                {
-                    "account": cpa_auth_label(item),
-                    "status": "Disabled" if disabled else "N/A",
-                    "plan": "-",
-                    "five_hour_remaining": None,
-                    "five_hour_used": None,
-                    "weekly_remaining": None,
-                    "reset": "-",
-                    "note": "disabled" if disabled else "balance note",
-                    "disabled": disabled,
-                    "name": name,
-                }
-            )
+            yield {
+                "account": cpa_auth_label(item),
+                "status": "Disabled" if disabled else "N/A",
+                "plan": "-",
+                "five_hour_remaining": None,
+                "five_hour_used": None,
+                "weekly_remaining": None,
+                "reset": "-",
+                "note": "disabled" if disabled else "balance note",
+                "disabled": disabled,
+                "name": name,
+            }
             continue
         auth_index = str(item.get("auth_index") or "").strip()
         if not auth_index:
-            rows.append({"account": cpa_auth_label(item), "status": "Err", "plan": "-", "five_hour_remaining": None, "five_hour_used": None, "weekly_remaining": None, "reset": "-", "note": "missing auth_index", "disabled": disabled, "name": name})
+            yield {"account": cpa_auth_label(item), "status": "Err", "plan": "-", "five_hour_remaining": None, "five_hour_used": None, "weekly_remaining": None, "reset": "-", "note": "missing auth_index", "disabled": disabled, "name": name}
             continue
         tasks.append({"auth_index": auth_index, "account": cpa_auth_label(item), "provider": str(item.get("provider") or item.get("type") or "codex"), "name": name})
-    if not tasks and not rows:
-        return [{"account": "-", "status": "N/A", "plan": "-", "five_hour_remaining": None, "five_hour_used": None, "weekly_remaining": None, "reset": "-", "note": "No Codex accounts"}]
+    if not tasks:
+        return
     with ThreadPoolExecutor(max_workers=min(16, max(1, len(tasks)))) as executor:
         futures = [executor.submit(query_cpa_quota, base_url, management_key, task) for task in tasks]
         for future in as_completed(futures):
-            rows.append(future.result())
-    rows.sort(key=lambda row: (bool(row.get("disabled")), -(float(row.get("five_hour_remaining") or -1)), str(row.get("account", "")).lower()))
-    return rows
+            yield future.result()
 
 
 def query_cpa_quota(base_url: str, management_key: str, task: dict[str, str]) -> dict[str, object]:
@@ -7139,6 +7298,31 @@ def battery_info() -> BatteryInfo | None:
     return None
 
 
+def battery_percent_from_voltage(voltage_uv: int | None) -> int | None:
+    if voltage_uv is None or voltage_uv <= 0:
+        return None
+    voltage = voltage_uv / 1_000_000
+    points = (
+        (4.15, 100),
+        (4.05, 85),
+        (3.95, 70),
+        (3.85, 55),
+        (3.75, 40),
+        (3.65, 25),
+        (3.55, 12),
+        (3.45, 5),
+        (3.35, 0),
+    )
+    if voltage >= points[0][0]:
+        return points[0][1]
+    for (high_voltage, high_percent), (low_voltage, low_percent) in zip(points, points[1:]):
+        if voltage >= low_voltage:
+            span = high_voltage - low_voltage
+            ratio = (voltage - low_voltage) / span if span > 0 else 0.0
+            return int(round(low_percent + ratio * (high_percent - low_percent)))
+    return 0
+
+
 def battery_voltage_label(info: BatteryInfo | None = None) -> str:
     info = info or battery_info()
     if info is None or info.voltage_v is None:
@@ -7150,7 +7334,9 @@ def battery_diagnostics_label(info: BatteryInfo | None = None) -> str:
     info = info or battery_info()
     if info is None:
         return "Unknown"
-    parts = [f"{info.capacity}%"]
+    parts = [f"{info.display_capacity}%"]
+    if info.display_capacity != info.capacity:
+        parts.append(f"raw {info.capacity}%")
     if info.voltage_v is not None:
         parts.append(f"{info.voltage_v:.2f} V")
     if info.status:
@@ -7188,13 +7374,13 @@ def mains_supplies() -> list[Path]:
 def battery_capacity_label() -> str:
     info = battery_info()
     if info is not None:
-        return f"{info.capacity}%"
+        return f"{info.display_capacity}%"
     return "-"
 
 
 def battery_capacity_percent() -> int:
     info = battery_info()
-    return info.capacity if info is not None else -1
+    return info.display_capacity if info is not None else -1
 
 
 def power_state_label(state: object) -> str:
@@ -8352,11 +8538,11 @@ def read_mcu_snapshot(state: McuTelemetryState) -> McuStateSnapshot:
                 tilt_deg=estimate_tilt_deg(last_sample.ax, last_sample.ay, last_sample.az),
                 sample_rate_hz=estimate_sample_rate(state.samples),
                 pose=last_sample.firmware_pose or "-",
-                light_lux=None,
-                smoothed_light_lux=None,
-                suggested_backlight=None,
-                light_raw=None,
-                light_ready=False,
+                light_lux=state.light_lux,
+                smoothed_light_lux=state.smoothed_light_lux,
+                suggested_backlight=state.suggested_backlight,
+                light_raw=state.light_raw,
+                light_ready=state.light_ready,
                 last_update=now,
                 raw_line=format_sample_line(last_sample),
                 last_error=state.last_error,
@@ -8380,11 +8566,11 @@ def read_mcu_snapshot(state: McuTelemetryState) -> McuStateSnapshot:
             tilt_deg=0.0,
             sample_rate_hz=0.0,
             pose="-",
-            light_lux=None,
+            light_lux=state.light_lux,
             smoothed_light_lux=state.smoothed_light_lux,
             suggested_backlight=state.suggested_backlight,
-            light_raw=None,
-            light_ready=False,
+            light_raw=state.light_raw,
+            light_ready=state.light_ready,
             last_update=now,
             raw_line="",
             last_error=state.last_error,
@@ -8401,12 +8587,18 @@ def read_mcu_snapshot(state: McuTelemetryState) -> McuStateSnapshot:
     event = mcu_event_label(sample.firmware_event)
     current_state = mcu_state_label(sample.firmware_state)
     smoothed_light_lux = sample.smoothed_light_lux if sample.smoothed_light_lux is not None else sample.light_lux
+    if sample.light_lux is not None:
+        state.light_lux = sample.light_lux
+        state.light_ready = sample.light_ready or state.light_ready
+    elif sample.light_ready:
+        state.light_ready = True
+    if sample.light_raw is not None:
+        state.light_raw = sample.light_raw
+    if smoothed_light_lux is not None:
+        state.smoothed_light_lux = smoothed_light_lux
     if sample.light_screen is not None:
         state.smoothed_light_lux = smoothed_light_lux
         state.suggested_backlight = max(1, min(9, sample.light_screen))
-    else:
-        state.smoothed_light_lux = smoothed_light_lux
-        state.suggested_backlight = None
     state.last_state = current_state
     state.last_event = event
     state.last_motion = motion
@@ -8422,11 +8614,11 @@ def read_mcu_snapshot(state: McuTelemetryState) -> McuStateSnapshot:
         tilt_deg=tilt_deg,
         sample_rate_hz=sample_rate_hz,
         pose=sample.firmware_pose or "-",
-        light_lux=sample.light_lux,
+        light_lux=state.light_lux,
         smoothed_light_lux=state.smoothed_light_lux,
         suggested_backlight=state.suggested_backlight,
-        light_raw=sample.light_raw,
-        light_ready=sample.light_ready,
+        light_raw=state.light_raw,
+        light_ready=state.light_ready,
         last_update=now,
         raw_line=format_sample_line(sample),
         last_error="",
@@ -8744,8 +8936,15 @@ def snapshot_to_telemetry_state(snapshot: McuStateSnapshot, state: McuTelemetryS
     state.last_event = snapshot.event
     state.last_motion = snapshot.motion
     state.last_error = snapshot.last_error
-    state.smoothed_light_lux = snapshot.smoothed_light_lux
-    state.suggested_backlight = snapshot.suggested_backlight
+    if snapshot.light_lux is not None:
+        state.light_lux = snapshot.light_lux
+    if snapshot.smoothed_light_lux is not None:
+        state.smoothed_light_lux = snapshot.smoothed_light_lux
+    if snapshot.suggested_backlight is not None:
+        state.suggested_backlight = snapshot.suggested_backlight
+    if snapshot.light_raw is not None:
+        state.light_raw = snapshot.light_raw
+    state.light_ready = snapshot.light_ready or state.light_ready
     return state
 
 

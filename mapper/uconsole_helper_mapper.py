@@ -1104,8 +1104,6 @@ class KeyboardWatcher:
             return
 
         if self.lock_controller.locked:
-            if value == 1:
-                self.lock_controller.wake_screen()
             return
 
         is_pressed = value != 0

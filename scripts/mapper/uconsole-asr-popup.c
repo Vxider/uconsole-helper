@@ -48,19 +48,26 @@ static gchar *utf8_prefix(const gchar *text, glong chars) {
   return g_strndup(text, end - text);
 }
 
+static gboolean text_has_prefix_chars(const gchar *text, const gchar *prefix, glong prefix_chars) {
+  if (prefix == NULL) {
+    return FALSE;
+  }
+  return common_prefix_chars(text, prefix) == prefix_chars;
+}
+
 static gdouble base_reveal_cps(gdouble observed_cps) {
   gdouble cps = observed_cps > 0.0 ? observed_cps : 10.0;
 
-  return CLAMP(cps * 0.75, 5.5, 14.0);
+  return CLAMP(cps * 1.25, 9.0, 24.0);
 }
 
 static gdouble catchup_reveal_cps(gdouble base_cps, glong remaining) {
   gdouble cps = base_cps;
 
   if (remaining > 36) {
-    cps = MAX(cps, 17.0);
+    cps = MAX(cps, 30.0);
   } else if (remaining > 20) {
-    cps = MAX(cps, 14.0);
+    cps = MAX(cps, 24.0);
   }
   return cps;
 }
@@ -155,8 +162,14 @@ static gboolean refresh_label(gpointer user_data) {
 
   if (state->target_text == NULL || g_strcmp0(text, state->target_text) != 0) {
     glong prefix_chars = state->last_text != NULL ? common_prefix_chars(state->last_text, text) : 0;
+    glong visible_text_chars = state->last_text != NULL ? g_utf8_strlen(state->last_text, -1) : 0;
     glong target_chars = g_utf8_strlen(text, -1);
     glong new_chars = MAX((glong)0, target_chars - prefix_chars);
+    gboolean append_only = animate &&
+        state->last_text != NULL &&
+        prefix_chars == visible_text_chars &&
+        target_chars >= visible_text_chars &&
+        text_has_prefix_chars(text, state->last_text, visible_text_chars);
     gdouble elapsed_s = state->last_target_update_us > 0
         ? (now_us - state->last_target_update_us) / 1000000.0
         : 0.0;
@@ -164,7 +177,7 @@ static gboolean refresh_label(gpointer user_data) {
 
     g_free(state->target_text);
     state->target_text = g_strdup(text);
-    if (!animate || state->last_text == NULL) {
+    if (state->last_text == NULL || !append_only) {
       state->visible_chars = target_chars;
     } else {
       state->visible_chars = prefix_chars;
