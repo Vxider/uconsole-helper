@@ -32,9 +32,8 @@ DISPLAY_STATUS_OFF_POLL_SECONDS = 2
 AUTO_MCU_STALE_SECONDS = 20
 MCU_SERIAL_REOPEN_SECONDS = 75
 AUTO_PICKUP_WAKE_ENABLED = False
-AUTO_BRIGHTNESS_RAISE_STABLE_SECONDS = 1.5
-AUTO_BRIGHTNESS_LOWER_STABLE_SECONDS = 4.0
 AUTO_BRIGHTNESS_MANUAL_GRACE_SECONDS = 45.0
+AUTO_BRIGHTNESS_APPLY_EVENTS = {"brightness_changed", "light_changed", "screen_on_ack"}
 LED_POWER_POLL_SECONDS = 30
 TMUX_NOTIFY_POLL_SECONDS = 5
 TMUX_NOTIFY_MARKER = Path(f"/run/user/{os.getuid()}/uconsole-helper-tmux-notify")
@@ -173,10 +172,12 @@ class McuSerialReader:
 class AutoBrightnessState:
     def __init__(self) -> None:
         self.current_backlight: int | None = None
-        self.pending_backlight: int | None = None
-        self.pending_keyboard_level: int | None = None
-        self.pending_since: float = 0.0
         self.manual_override_until: float = 0.0
+        self.current_keyboard_level: int | None = None
+        self.force_apply_until: float = 0.0
+
+    def request_screen_on_apply(self) -> None:
+        self.force_apply_until = time.time() + AUTO_MCU_STALE_SECONDS
 
 
 class HostInputMonitor:
@@ -403,31 +404,6 @@ def set_keyboard_backlight(level: int) -> None:
     if result.returncode != 0:
         print(f"warning: keyboard backlight set failed: {result.stderr.strip()}", flush=True)
         return
-
-
-def read_keyboard_backlight() -> int | None:
-    if not KEYBOARD_BACKLIGHT_SCRIPT.exists():
-        return None
-    try:
-        result = subprocess.run(
-            ["sudo", "-n", "bash", str(KEYBOARD_BACKLIGHT_SCRIPT), "get"],
-            check=False,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=4,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if result.returncode != 0:
-        return None
-    for token in result.stdout.split():
-        if token.startswith("backlight="):
-            try:
-                return int(token.split("=", 1)[1])
-            except ValueError:
-                return None
-    return None
 
 
 def display_control_command(action: str) -> str:
@@ -877,10 +853,22 @@ def maybe_apply_auto_brightness(
     state: AutoBrightnessState,
     display_off_now: bool,
 ) -> None:
-    actual_display_off = read_display_off_sysfs()
     if sample is None or not auto_brightness_enabled(values):
         return
+    event = str(sample.get("event") or "")
+    now = time.time()
+    force_apply = now <= state.force_apply_until
+    actual_display_off = read_display_off_sysfs()
     display_is_off_now = display_off_now or actual_display_off is True
+    screen_on_keyboard_restore = not display_is_off_now and state.current_keyboard_level == 0
+    should_apply = (
+        force_apply
+        or event in AUTO_BRIGHTNESS_APPLY_EVENTS
+        or state.current_backlight is None
+        or screen_on_keyboard_restore
+    )
+    if not should_apply:
+        return
     suggested, keyboard_level = brightness_targets_from_sample(sample)
     if suggested is None:
         return
@@ -888,16 +876,14 @@ def maybe_apply_auto_brightness(
         keyboard_level = keyboard_backlight_level(suggested)
     actual_backlight = read_display_brightness()
     current_backlight = actual_backlight if actual_backlight is not None else state.current_backlight
-    current_keyboard_level = read_keyboard_backlight()
-    now = time.time()
     if (
         actual_backlight is not None
         and state.current_backlight is not None
         and actual_backlight != state.current_backlight
         and actual_backlight != suggested
+        and not force_apply
     ):
         state.current_backlight = actual_backlight
-        state.pending_backlight = None
         state.manual_override_until = now + AUTO_BRIGHTNESS_MANUAL_GRACE_SECONDS
         print(
             f"auto brightness manual override: actual={actual_backlight} "
@@ -906,44 +892,29 @@ def maybe_apply_auto_brightness(
             flush=True,
         )
         return
-    if now < state.manual_override_until:
+    if now < state.manual_override_until and not force_apply:
         return
-    if display_is_off_now and suggested == current_backlight:
+    if display_is_off_now:
         state.current_backlight = suggested
-        state.pending_backlight = None
+        state.current_keyboard_level = 0
         return
-    if suggested == current_backlight and current_keyboard_level == keyboard_level:
+    if suggested == current_backlight and state.current_keyboard_level == keyboard_level:
         state.current_backlight = suggested
-        state.pending_backlight = None
-        return
-    if suggested != state.pending_backlight or keyboard_level != state.pending_keyboard_level:
-        state.pending_backlight = suggested
-        state.pending_keyboard_level = keyboard_level
-        state.pending_since = now
-        print(
-            f"auto brightness pending: screen={suggested} keyboard={keyboard_level} "
-            f"actual={actual_backlight if actual_backlight is not None else '-'} "
-            f"displayOff={int(display_is_off_now)} {light_log_fields(sample)}",
-            flush=True,
-        )
-        return
-    stable_seconds = AUTO_BRIGHTNESS_LOWER_STABLE_SECONDS
-    if current_backlight is None or suggested > current_backlight:
-        stable_seconds = AUTO_BRIGHTNESS_RAISE_STABLE_SECONDS
-    if now - state.pending_since < stable_seconds:
+        state.force_apply_until = 0.0
         return
     if suggested != current_backlight and not display_brightness(suggested):
         return
-    if not display_is_off_now and current_keyboard_level != keyboard_level:
+    if not display_is_off_now and state.current_keyboard_level != keyboard_level:
         set_keyboard_backlight(keyboard_level)
+        state.current_keyboard_level = keyboard_level
     print(
-        f"auto brightness: screen={suggested} keyboard={keyboard_level} "
+        f"auto brightness event={event or '-'}: screen={suggested} keyboard={keyboard_level} "
         f"actual={actual_backlight if actual_backlight is not None else '-'} "
         f"displayOff={int(display_is_off_now)} {light_log_fields(sample)}",
         flush=True,
     )
     state.current_backlight = suggested
-    state.pending_backlight = None
+    state.force_apply_until = 0.0
 
 
 def main() -> int:
@@ -1017,6 +988,19 @@ def main() -> int:
         timeout_sec = timeout_for_state(values, state)
         status_interval = DISPLAY_STATUS_OFF_POLL_SECONDS if display_cache.off else DISPLAY_STATUS_POLL_SECONDS
         was_display_off = display_cache.get(interval=status_interval)
+        actual_display_off = read_display_off_sysfs()
+        if actual_display_off is True and not was_display_off:
+            display_cache.mark_off()
+            was_display_off = True
+        elif actual_display_off is False and was_display_off:
+            display_cache.mark_on()
+            was_display_off = False
+        if last_display_off is True and not was_display_off:
+            auto_brightness_state.request_screen_on_apply()
+            mcu_reader.write_command("screen on")
+            reported_display_off = False
+        elif last_display_off is False and was_display_off:
+            auto_brightness_state.current_keyboard_level = 0
         if needs_mcu_sample and reported_display_off != was_display_off:
             mcu_reader.write_command("screen off" if was_display_off else "screen on")
             reported_display_off = was_display_off
@@ -1031,10 +1015,12 @@ def main() -> int:
             if restore_display_off:
                 if display_off():
                     display_cache.mark_off()
+                    auto_brightness_state.current_keyboard_level = 0
             active_timeout = timeout_sec
         elif restore_display_off and not was_display_off:
             if display_off():
                 display_cache.mark_off()
+                auto_brightness_state.current_keyboard_level = 0
                 was_display_off = True
         maybe_apply_auto_brightness(
             values,
@@ -1065,9 +1051,11 @@ def main() -> int:
             new_display_off = None
         if new_display_off is True:
             display_cache.mark_off()
+            auto_brightness_state.current_keyboard_level = 0
             was_display_off = True
         elif new_display_off is False:
             display_cache.mark_on()
+            auto_brightness_state.request_screen_on_apply()
             was_display_off = False
         active_power_state = state
         active_screen_mode = screen_mode
