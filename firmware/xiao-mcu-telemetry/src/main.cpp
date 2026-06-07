@@ -35,12 +35,16 @@ static const uint32_t PUTDOWN_WITH_EVIDENCE_STABLE_MS = 1800;
 static const uint32_t PUTDOWN_SOUND_WINDOW_MS = 900;
 static const uint32_t PUTDOWN_EVIDENCE_WINDOW_MS = 1200;
 static const uint32_t MIC_ASSIST_WINDOW_MS = 1800;
-static const uint32_t LED_CHARGING_FLASH_PERIOD_MS = 3000;
-static const uint32_t LED_CHARGING_FLASH_ON_MS = 180;
 static const uint32_t LED_SLOW_FLASH_PERIOD_MS = 1600;
 static const uint32_t LED_FAST_FLASH_PERIOD_MS = 400;
 static const uint32_t LED_TMUX_NOTIFY_MS = 600000;
 static const uint32_t LED_TMUX_DOUBLE_FLASH_PERIOD_MS = 3000;
+static const uint32_t LED_CODEX_FLASH_PERIOD_MS = 1400;
+static const uint32_t LED_CODEX_FLASH_ON_MS = 820;
+static const uint32_t LED_LIGHT_SENSOR_GUARD_MS = 2200;
+static const uint32_t LED_AUTO_BRIGHTNESS_STEP_MS = 1000;
+static const uint8_t LED_AUTO_BRIGHTEN_STEP_PERCENT = 2;
+static const uint8_t LED_AUTO_DARKEN_STEP_PERCENT = 8;
 static const float PICKUP_DELTA_G = 0.10f;
 static const float PICKUP_START_DELTA_G = 0.10f;
 static const float PICKUP_CONFIRM_DELTA_G = 0.030f;
@@ -64,7 +68,8 @@ static const uint8_t VEML7700_ADDR = 0x10;
 static const uint8_t VEML7700_REG_ALS_CONF = 0x00;
 static const uint8_t VEML7700_REG_ALS_DATA = 0x04;
 static const uint16_t VEML7700_ALS_CONF = 0x0000;  // gain x1, 100 ms integration, ALS on.
-static const uint8_t WS2812_BRIGHTNESS = 24;
+static const uint8_t DEFAULT_WS2812_BRIGHTNESS_PERCENT = 30;
+static const uint8_t AUTO_WS2812_BRIGHTNESS_MAX_PERCENT = 70;
 static const float VEML7700_LUX_PER_COUNT = 0.0576f;
 static const uint32_t LIGHT_SAMPLE_INTERVAL_MS = 1000;
 static const float LIGHT_SMOOTH_ALPHA = 0.18f;
@@ -107,13 +112,19 @@ static bool host_power_ac = false;
 static bool led_battery_enabled = true;
 static bool led_notify_enabled = true;
 static bool led_night_mode_enabled = true;
+static uint8_t ws2812_brightness_percent = DEFAULT_WS2812_BRIGHTNESS_PERCENT;
+static bool ws2812_auto_brightness_enabled = false;
+static uint8_t current_ws2812_brightness_percent = DEFAULT_WS2812_BRIGHTNESS_PERCENT;
 static bool tmux_notify_active = false;
 static bool force_brightness_report = false;
 static int battery_percent = -1;
 static String device_state = "held";
 static String battery_status = "unknown";
+static String codex_led_state = "off";
 static uint32_t tmux_notify_until = 0;
 static uint32_t last_led_color = 0;
+static uint32_t led_visible_until = 0;
+static uint32_t last_led_brightness_step_ms = 0;
 
 static String stable_orientation = "unknown";
 static String resting_orientation = "unknown";
@@ -135,6 +146,7 @@ static uint32_t mic_assist_until = 0;
 static uint16_t light_raw = 0;
 static float light_lux = 0.0f;
 static float smoothed_light_lux = 0.0f;
+static float led_ambient_lux = 0.0f;
 static float last_reported_light_lux = -1.0f;
 static float light_report_candidate_lux = 0.0f;
 static float light_spike_candidate_lux = 0.0f;
@@ -145,6 +157,7 @@ static int last_reported_screen_brightness = 0;
 static int brightness_candidate = 0;
 static bool light_sample_valid = false;
 static bool have_smoothed_light = false;
+static bool have_led_ambient_lux = false;
 static bool storage_ready = false;
 
 struct Sample {
@@ -167,6 +180,9 @@ static uint32_t pixel_color(uint8_t red, uint8_t green, uint8_t blue) {
 }
 
 static void set_status_pixel(uint32_t color) {
+  if (color != 0) {
+    led_visible_until = millis() + LED_LIGHT_SENSOR_GUARD_MS;
+  }
   if (color == last_led_color) {
     return;
   }
@@ -183,6 +199,70 @@ static uint32_t scaled_color(uint8_t red, uint8_t green, uint8_t blue, uint8_t b
   return pixel_color(scale_channel(red, brightness), scale_channel(green, brightness), scale_channel(blue, brightness));
 }
 
+static uint8_t led_brightness_percent_from_lux(float lux) {
+  if (lux < 1.0f) {
+    return 4;
+  }
+  if (lux < 5.0f) {
+    return 8;
+  }
+  if (lux < 20.0f) {
+    return 14;
+  }
+  if (lux < 80.0f) {
+    return 24;
+  }
+  if (lux < 200.0f) {
+    return 38;
+  }
+  if (lux < 500.0f) {
+    return 55;
+  }
+  return AUTO_WS2812_BRIGHTNESS_MAX_PERCENT;
+}
+
+static uint8_t effective_led_brightness_percent() {
+  if (!ws2812_auto_brightness_enabled || !light_ready || !light_sample_valid || !have_smoothed_light) {
+    return ws2812_brightness_percent;
+  }
+  const float lux = have_led_ambient_lux ? led_ambient_lux : smoothed_light_lux;
+  return min(led_brightness_percent_from_lux(lux), AUTO_WS2812_BRIGHTNESS_MAX_PERCENT);
+}
+
+static void update_led_brightness_percent() {
+  const uint8_t next = effective_led_brightness_percent();
+  if (!ws2812_auto_brightness_enabled) {
+    if (next != current_ws2812_brightness_percent) {
+      current_ws2812_brightness_percent = next;
+      last_led_color = UINT32_MAX;
+    }
+    return;
+  }
+  if (next == current_ws2812_brightness_percent) {
+    return;
+  }
+  const uint32_t now = millis();
+  if (next > current_ws2812_brightness_percent) {
+    if (now - last_led_brightness_step_ms < LED_AUTO_BRIGHTNESS_STEP_MS) {
+      return;
+    }
+    current_ws2812_brightness_percent = min(next, (uint8_t)(current_ws2812_brightness_percent + LED_AUTO_BRIGHTEN_STEP_PERCENT));
+  } else {
+    current_ws2812_brightness_percent = max(next, (uint8_t)(current_ws2812_brightness_percent - min(current_ws2812_brightness_percent, LED_AUTO_DARKEN_STEP_PERCENT)));
+  }
+  last_led_brightness_step_ms = now;
+  last_led_color = UINT32_MAX;
+}
+
+static uint8_t led_brightness_value() {
+  update_led_brightness_percent();
+  return (uint16_t)current_ws2812_brightness_percent * 255 / 100;
+}
+
+static uint32_t led_color(uint8_t red, uint8_t green, uint8_t blue) {
+  return scaled_color(red, green, blue, led_brightness_value());
+}
+
 static bool flash_on(uint32_t now, uint32_t period_ms, uint32_t on_ms) {
   return now % period_ms < on_ms;
 }
@@ -192,15 +272,23 @@ static bool double_flash_on(uint32_t now) {
   return phase < 120 || (phase >= 260 && phase < 380);
 }
 
-static uint32_t battery_gradient_color(int percent, uint8_t brightness) {
-  percent = constrain(percent, 0, 100);
-  if (percent < 50) {
-    uint8_t green = (uint32_t)percent * 170 / 50;
-    return scaled_color(255, green, 0, brightness);
+static uint32_t codex_led_color(uint32_t now) {
+  if (!flash_on(now, LED_CODEX_FLASH_PERIOD_MS, LED_CODEX_FLASH_ON_MS)) {
+    return 0;
   }
-  uint8_t red = (uint32_t)(100 - percent) * 255 / 50;
-  uint8_t green = 170 + (uint32_t)(percent - 50) * 85 / 50;
-  return scaled_color(red, green, 0, brightness);
+  if (codex_led_state == "goal") {
+    return led_color(160, 80, 255);
+  }
+  if (codex_led_state == "approval") {
+    return led_color(255, 0, 0);
+  }
+  if (codex_led_state == "attention") {
+    return led_color(255, 191, 0);
+  }
+  if (codex_led_state == "working") {
+    return led_color(0, 255, 72);
+  }
+  return 0;
 }
 
 static void update_status_pixel() {
@@ -209,31 +297,23 @@ static void update_status_pixel() {
     tmux_notify_active = false;
   }
   const bool battery_known = battery_percent >= 0;
-  const bool charging = battery_status == "charging";
-  const bool full = battery_status == "full" || (charging && battery_known && battery_percent >= 100);
-  const bool discharging = !charging && !full;
-  const bool charging_visible = led_battery_enabled && charging && battery_known && battery_percent < 100;
   const bool notify_visible = led_notify_enabled && tmux_notify_active;
 
-  if (led_night_mode_enabled && light_ready && light_lux < 1.0f) {
-    set_status_pixel(0);
+  if (led_battery_enabled && battery_known && battery_percent < 8) {
+    set_status_pixel(flash_on(now, LED_FAST_FLASH_PERIOD_MS, LED_FAST_FLASH_PERIOD_MS / 2) ? led_color(255, 0, 0) : 0);
+    return;
+  }
+  if (led_battery_enabled && battery_known && battery_percent < 15) {
+    set_status_pixel(flash_on(now, LED_SLOW_FLASH_PERIOD_MS, LED_SLOW_FLASH_PERIOD_MS / 2) ? led_color(255, 0, 0) : 0);
     return;
   }
 
-  if (led_battery_enabled && discharging && battery_known && battery_percent < 8) {
-    set_status_pixel(flash_on(now, LED_FAST_FLASH_PERIOD_MS, LED_FAST_FLASH_PERIOD_MS / 2) ? scaled_color(255, 0, 0, WS2812_BRIGHTNESS) : 0);
-  } else if (led_battery_enabled && discharging && battery_known && battery_percent < 15) {
-    set_status_pixel(flash_on(now, LED_SLOW_FLASH_PERIOD_MS, LED_SLOW_FLASH_PERIOD_MS / 2) ? scaled_color(255, 0, 0, WS2812_BRIGHTNESS) : 0);
+  if (led_night_mode_enabled && light_ready && light_lux < 1.0f) {
+    set_status_pixel(0);
+  } else if (codex_led_state != "off") {
+    set_status_pixel(codex_led_color(now));
   } else if (notify_visible) {
-    set_status_pixel(double_flash_on(now) ? scaled_color(120, 0, 255, WS2812_BRIGHTNESS) : 0);
-  } else if (charging_visible) {
-    set_status_pixel(
-      flash_on(now, LED_CHARGING_FLASH_PERIOD_MS, LED_CHARGING_FLASH_ON_MS)
-        ? battery_gradient_color(battery_percent, WS2812_BRIGHTNESS)
-        : 0
-    );
-  } else if (led_battery_enabled && host_power_ac && (full || (battery_known && battery_percent >= 100))) {
-    set_status_pixel(scaled_color(0, 255, 64, WS2812_BRIGHTNESS));
+    set_status_pixel(double_flash_on(now) ? led_color(120, 0, 255) : 0);
   } else {
     set_status_pixel(0);
   }
@@ -446,6 +526,13 @@ static void update_light_sensor(bool force) {
     smoothed_light_lux += alpha * (light_lux - smoothed_light_lux);
   }
   light_sample_valid = true;
+  if (!have_led_ambient_lux) {
+    led_ambient_lux = smoothed_light_lux;
+    have_led_ambient_lux = true;
+  } else if (now > led_visible_until || smoothed_light_lux < led_ambient_lux) {
+    const float alpha = smoothed_light_lux < led_ambient_lux ? LIGHT_DARKEN_SMOOTH_ALPHA : LIGHT_SMOOTH_ALPHA;
+    led_ambient_lux += alpha * (smoothed_light_lux - led_ambient_lux);
+  }
   update_brightness_targets();
 }
 
@@ -886,6 +973,30 @@ static void handle_command(const Sample &sample) {
   } else if (command == "led night off") {
     led_night_mode_enabled = false;
     print_status("led_night_off", sample);
+  } else if (command == "led brightness auto on") {
+    ws2812_auto_brightness_enabled = true;
+    last_led_color = UINT32_MAX;
+    update_status_pixel();
+    print_status("led_brightness_auto_on", sample);
+  } else if (command == "led brightness auto off") {
+    ws2812_auto_brightness_enabled = false;
+    last_led_color = UINT32_MAX;
+    update_status_pixel();
+    print_status("led_brightness_auto_off", sample);
+  } else if (command.startsWith("led brightness ")) {
+    const int percent = command.substring(15).toInt();
+    ws2812_brightness_percent = constrain(percent, 0, 100);
+    ws2812_auto_brightness_enabled = false;
+    last_led_color = UINT32_MAX;
+    update_status_pixel();
+    print_status("led_brightness_ack", sample);
+  } else if (command.startsWith("led codex ")) {
+    String state = command.substring(10);
+    if (state != "off" && state != "goal" && state != "approval" && state != "attention" && state != "working") {
+      state = "off";
+    }
+    codex_led_state = state;
+    print_status("led_codex_ack", sample);
   } else if (command == "notify tmux") {
     if (led_notify_enabled) {
       tmux_notify_active = true;
@@ -905,7 +1016,7 @@ static void handle_command(const Sample &sample) {
     update_mic_power(millis());
     print_status("mic_assist_off", sample);
   } else if (command == "help") {
-    Serial.println("{\"commands\":[\"status\",\"sample\",\"calibrate pose\",\"screen on\",\"screen off\",\"lock timeout <seconds>\",\"stand mode on\",\"stand mode off\",\"power ac\",\"power battery\",\"battery <percent> <charging|discharging|full>\",\"led battery on\",\"led battery off\",\"led notify on\",\"led notify off\",\"led night on\",\"led night off\",\"notify tmux\",\"notify clear\",\"mic assist on\",\"mic assist off\",\"stream on\",\"stream off\",\"help\"]}");
+    Serial.println("{\"commands\":[\"status\",\"sample\",\"calibrate pose\",\"screen on\",\"screen off\",\"lock timeout <seconds>\",\"stand mode on\",\"stand mode off\",\"power ac\",\"power battery\",\"battery <percent> <charging|discharging|full>\",\"led battery on\",\"led battery off\",\"led notify on\",\"led notify off\",\"led night on\",\"led night off\",\"led brightness <0-100>\",\"led brightness auto on\",\"led brightness auto off\",\"led codex <off|goal|approval|attention|working>\",\"notify tmux\",\"notify clear\",\"mic assist on\",\"mic assist off\",\"stream on\",\"stream off\",\"help\"]}");
   }
 }
 
@@ -922,7 +1033,7 @@ static uint32_t heartbeat_interval(uint32_t now) {
 void setup() {
   Serial.begin(115200);
   status_pixel.begin();
-  status_pixel.setBrightness(WS2812_BRIGHTNESS);
+  status_pixel.setBrightness(255);
   set_status_pixel(pixel_color(0, 0, 16));
 
   // Do not block on Serial. The GUI may open the port after boot.

@@ -140,8 +140,7 @@ The Dashboard is the first tab. It uses compact monitor-style cards for:
 ## DHCP Server
 
 1. Select the wired interface to serve DHCP on.
-2. Set the local server address, netmask, address pool, lease time, and optional
-   gateway/DNS values.
+2. Set the local server address, netmask, and address pool.
 3. Click `Start`.
 4. Connect the selected interface to the target machine.
 5. Stop the server with `Stop` when finished.
@@ -261,6 +260,13 @@ firmware/xiao-mcu-telemetry
 
 Build it with `pio run`, enter UF2 bootloader mode from the MCU page, then run
 `firmware/xiao-mcu-telemetry/scripts/flash-uf2.sh`.
+
+The MCU LED Behavior section includes a Codex Indicator switch. When enabled,
+the user idle service polls the servers configured in the Codex tab at
+`/v1/status` and aggregates their sessions into the vibecoding signal-light
+states: red for permission/error, yellow for attention, a green-yellow-red
+working cycle while Codex is active, and green when all connected servers are
+idle.
 
 ## Debug Interface Detection
 

@@ -13,10 +13,14 @@ import struct
 import subprocess
 import time
 import termios
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 
 CONFIG_FILE = Path(os.environ.get("UCONSOLE_HELPER_CONFIG", "/etc/uconsole-helper/uconsole-helper.conf"))
+CODEX_BUDDY_CONFIG = Path.home() / ".config/codex-buddy/config.json"
+CODEX_DISMISSED_SESSIONS = Path.home() / ".cache/uconsole-helper/codex-dismissed-sessions.json"
 POWER_SUPPLY_DIR = Path("/sys/class/power_supply")
 DISPLAY_CONTROL = "/usr/local/bin/uconsole-helper-mapper-display-control"
 DISPLAY_BACKLIGHT_POWER = Path("/sys/class/backlight/backlight@0/bl_power")
@@ -36,6 +40,9 @@ AUTO_BRIGHTNESS_MANUAL_GRACE_SECONDS = 45.0
 AUTO_BRIGHTNESS_APPLY_EVENTS = {"brightness_changed", "light_changed", "screen_on_ack"}
 LED_POWER_POLL_SECONDS = 30
 TMUX_NOTIFY_POLL_SECONDS = 5
+CODEX_LED_POLL_SECONDS = 5
+CODEX_LED_REQUEST_TIMEOUT_SECONDS = 2
+CODEX_LED_REFRESH_SECONDS = 300
 TMUX_NOTIFY_MARKER = Path(f"/run/user/{os.getuid()}/uconsole-helper-tmux-notify")
 TMUX_CLEAR_MARKER = Path(f"/run/user/{os.getuid()}/uconsole-helper-tmux-clear")
 INPUT_EVENT_FORMAT = "llHHI"
@@ -57,6 +64,10 @@ class McuSerialReader:
         self.led_battery_enabled: bool | None = None
         self.led_notify_enabled: bool | None = None
         self.led_night_mode_enabled: bool | None = None
+        self.led_brightness_percent: int | None = None
+        self.led_brightness_auto: bool | None = None
+        self.codex_led_state: str | None = None
+        self.codex_led_sent_at = 0.0
         self.pending_commands: list[str] = []
 
     def close(self) -> None:
@@ -75,6 +86,10 @@ class McuSerialReader:
         self.led_battery_enabled = None
         self.led_notify_enabled = None
         self.led_night_mode_enabled = None
+        self.led_brightness_percent = None
+        self.led_brightness_auto = None
+        self.codex_led_state = None
+        self.codex_led_sent_at = 0.0
 
     def read_sample(self, enabled: bool) -> dict[str, object] | None:
         if not enabled:
@@ -149,18 +164,35 @@ class McuSerialReader:
             self.write_command(f"battery {percent} {status}")
             self.led_battery_state = battery
 
-    def configure_led_behavior(self, battery_enabled: bool, notify_enabled: bool, night_mode_enabled: bool) -> None:
+    def configure_led_behavior(self, battery_enabled: bool, night_mode_enabled: bool, brightness_percent: int, brightness_auto: bool) -> None:
+        brightness_percent = max(0, min(100, brightness_percent))
+        if self.led_brightness_auto is not brightness_auto:
+            self.write_command("led brightness auto on" if brightness_auto else "led brightness auto off")
+            self.led_brightness_auto = brightness_auto
+        if self.led_brightness_percent != brightness_percent:
+            self.write_command(f"led brightness {brightness_percent}")
+            self.led_brightness_percent = brightness_percent
+            if brightness_auto:
+                self.write_command("led brightness auto on")
         if self.led_battery_enabled is not battery_enabled:
             self.write_command("led battery on" if battery_enabled else "led battery off")
             self.led_battery_enabled = battery_enabled
-        if self.led_notify_enabled is not notify_enabled:
-            self.write_command("led notify on" if notify_enabled else "led notify off")
-            if not notify_enabled:
-                self.write_command("notify clear")
-            self.led_notify_enabled = notify_enabled
+        if self.led_notify_enabled is not False:
+            self.write_command("led notify off")
+            self.write_command("notify clear")
+            self.led_notify_enabled = False
         if self.led_night_mode_enabled is not night_mode_enabled:
             self.write_command("led night on" if night_mode_enabled else "led night off")
             self.led_night_mode_enabled = night_mode_enabled
+
+    def configure_codex_led(self, state: str) -> None:
+        if state not in {"off", "goal", "approval", "attention", "working"}:
+            state = "off"
+        now = time.time()
+        if self.codex_led_state != state or now - self.codex_led_sent_at >= CODEX_LED_REFRESH_SECONDS:
+            self.write_command(f"led codex {state}")
+            self.codex_led_state = state
+            self.codex_led_sent_at = now
 
     def notify_tmux(self) -> None:
         self.write_command("notify tmux")
@@ -435,6 +467,13 @@ def read_text(path: Path) -> str:
         return ""
 
 
+def read_int(path: Path) -> int | None:
+    try:
+        return int(float(read_text(path)))
+    except ValueError:
+        return None
+
+
 def power_supply_present(path: Path) -> bool:
     present = path / "present"
     if not present.exists():
@@ -487,16 +526,35 @@ def battery_led_state(power_supply_dir: Path = POWER_SUPPLY_DIR) -> tuple[int, s
         except ValueError:
             continue
         raw_status = read_text(path / "status").lower()
-        if not raw_status:
-            continue
-        if raw_status == "full" or percent >= 100:
-            status = "full"
-        elif raw_status == "charging":
-            status = "charging"
-        else:
-            status = "discharging"
-        return percent, status
+        estimated_percent = battery_percent_from_voltage(read_int(path / "voltage_now"))
+        if raw_status in {"discharging", "charging"} and estimated_percent is not None and percent - estimated_percent >= 15:
+            percent = estimated_percent
+        return percent, "discharging"
     return None
+
+
+def battery_percent_from_voltage(voltage_uv: int | None) -> int | None:
+    if voltage_uv is None or voltage_uv <= 0:
+        return None
+    points = (
+        (4_150_000, 100),
+        (4_050_000, 85),
+        (3_950_000, 70),
+        (3_850_000, 55),
+        (3_750_000, 40),
+        (3_650_000, 25),
+        (3_550_000, 12),
+        (3_450_000, 5),
+        (3_350_000, 0),
+    )
+    if voltage_uv >= points[0][0]:
+        return points[0][1]
+    for (high_voltage, high_percent), (low_voltage, low_percent) in zip(points, points[1:]):
+        if voltage_uv >= low_voltage:
+            span = high_voltage - low_voltage
+            ratio = (voltage_uv - low_voltage) / span if span > 0 else 0.0
+            return int(round(low_percent + ratio * (high_percent - low_percent)))
+    return 0
 
 
 def timeout_for_state(values: dict[str, str], state: str) -> int:
@@ -549,11 +607,147 @@ def config_enabled(values: dict[str, str], key: str, default: str = "1") -> bool
     return value in {"1", "yes", "true", "on", "enabled"}
 
 
+def codex_server_urls(values: dict[str, str]) -> list[str]:
+    urls = codex_server_urls_from_config()
+    if urls:
+        return urls
+    raw = values.get("MCU_LED_CODEX_SERVERS", "http://127.0.0.1:8787").strip()
+    return [item.strip().rstrip("/") for item in raw.replace("\n", ",").replace(" ", ",").split(",") if item.strip()]
+
+
+def codex_server_urls_from_config(path: Path = CODEX_BUDDY_CONFIG) -> list[str]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    urls: list[str] = []
+    seen: set[str] = set()
+    local_url = "http://127.0.0.1:8787"
+    urls.append(local_url)
+    seen.add(local_url)
+    uconsole = data.get("uconsole")
+    if isinstance(uconsole, dict):
+        uconsole_url = str(uconsole.get("server_url") or "").strip().rstrip("/")
+        if uconsole_url and uconsole_url not in seen:
+            urls.append(uconsole_url)
+            seen.add(uconsole_url)
+    remote_servers = data.get("remote_servers")
+    if isinstance(remote_servers, list):
+        for item in remote_servers:
+            if isinstance(item, dict):
+                url = str(item.get("base_url") or "").strip().rstrip("/")
+                if url and url not in seen:
+                    urls.append(url)
+                    seen.add(url)
+    return urls
+
+
+def codex_status_url(base_url: str) -> str:
+    if base_url.endswith("/v1/status") or base_url.endswith("/status"):
+        return base_url
+    return base_url.rstrip("/") + "/v1/status"
+
+
+def load_codex_status(base_url: str) -> dict[str, object]:
+    request = urllib.request.Request(codex_status_url(base_url), headers={"Accept": "application/json"})
+    with urllib.request.urlopen(request, timeout=CODEX_LED_REQUEST_TIMEOUT_SECONDS) as response:
+        data = response.read(256 * 1024)
+    payload = json.loads(data.decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("status response is not a JSON object")
+    return payload
+
+
+def codex_session_led_state(session: dict[str, object]) -> str:
+    state = str(session.get("state") or "").lower()
+    detail = str(session.get("state_detail") or "").lower()
+    reason = str(session.get("open_reason") or "").lower()
+    goal_state = str(session.get("goal_state") or "").lower()
+    if goal_state in {"achieved", "complete", "completed", "done", "success", "succeeded"}:
+        return "goal"
+    if bool(session.get("needs_approval")) or reason == "approval":
+        return "approval"
+    if "permissionrequest" in detail or "permission request" in detail:
+        return "approval"
+    if state not in {"idle", "ready", "run", "running", "running_bash"} and (
+        bool(session.get("needs_open")) or bool(str(session.get("open_reason") or "").strip())
+    ):
+        return "attention"
+    if state in {"run", "running", "running_bash"}:
+        return "working"
+    return "off"
+
+
+def codex_session_key(session: dict[str, object]) -> str:
+    server_url = str(session.get("server_url") or "").strip().rstrip("/")
+    session_id = str(session.get("session_id") or "").strip()
+    if not session_id:
+        return ""
+    return f"{server_url}|{session_id}"
+
+
+def codex_load_dismissed_sessions(path: Path = CODEX_DISMISSED_SESSIONS) -> set[str]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    if isinstance(data, dict):
+        return {str(key) for key in data}
+    if isinstance(data, list):
+        return {str(item) for item in data}
+    return set()
+
+
+def stronger_codex_state(current: str, candidate: str) -> str:
+    priority = {"off": 0, "working": 10, "attention": 20, "approval": 30, "goal": 40}
+    return candidate if priority.get(candidate, 0) > priority.get(current, 0) else current
+
+
+def aggregate_codex_led_state(values: dict[str, str]) -> str:
+    if not config_enabled(values, "MCU_LED_CODEX_ENABLED", "0"):
+        return "off"
+    urls = codex_server_urls(values)
+    if not urls:
+        return "off"
+    aggregate = "off"
+    connected = False
+    dismissed_sessions = codex_load_dismissed_sessions()
+    for url in urls:
+        try:
+            status = load_codex_status(url)
+        except (OSError, TimeoutError, ValueError, json.JSONDecodeError, urllib.error.URLError) as exc:
+            print(f"warning: codex-buddy status failed for {url}: {exc}", flush=True)
+            continue
+        connected = True
+        sessions = status.get("sessions")
+        if isinstance(sessions, list):
+            for session in sessions:
+                if isinstance(session, dict):
+                    if "server_url" not in session:
+                        session = {**session, "server_url": url.rstrip("/")}
+                    if codex_session_key(session) in dismissed_sessions:
+                        continue
+                    aggregate = stronger_codex_state(aggregate, codex_session_led_state(session))
+        else:
+            state = str(status.get("overall_state") or "").lower()
+            aggregate = stronger_codex_state(
+                aggregate,
+                "working" if state in {"run", "running", "running_bash"} else "attention" if state in {"open", "attention"} else "off",
+            )
+    return aggregate if connected else "off"
+
+
 def int_config(values: dict[str, str], key: str, default: int) -> int:
     try:
         return int(values.get(key, str(default)))
     except ValueError:
         return default
+
+
+def clamped_int_config(values: dict[str, str], key: str, default: int, minimum: int, maximum: int) -> int:
+    return max(minimum, min(maximum, int_config(values, key, default)))
 
 
 def auto_timeout_for_state(values: dict[str, str], state: str, pose: str) -> int:
@@ -928,11 +1122,10 @@ def main() -> int:
     auto_brightness_state = AutoBrightnessState()
     mcu_reader = McuSerialReader()
     host_input = HostInputMonitor()
-    terminal_bell_monitor = TerminalBellMonitor()
     display_cache = DisplayStateCache()
     reported_display_off: bool | None = None
     last_led_power_update = 0.0
-    tmux_notify_active: bool | None = None
+    last_codex_led_update = 0.0
     idle_shutdown_requested = False
     values = load_config()
     state = power_state(Path(values.get("POWERSAVER_POWER_SUPPLY_DIR", str(POWER_SUPPLY_DIR))))
@@ -969,22 +1162,18 @@ def main() -> int:
             idle_shutdown_requested = False
         sample = mcu_reader.read_sample(needs_mcu_sample)
         battery_led_enabled = config_enabled(values, "MCU_LED_BATTERY_ENABLED", "1")
-        notify_led_enabled = config_enabled(values, "MCU_LED_LXTERMINAL_BELL_ENABLED", "1")
         night_mode_enabled = config_enabled(values, "MCU_LED_NIGHT_MODE_ENABLED", "1")
-        mcu_reader.configure_led_behavior(battery_led_enabled, notify_led_enabled, night_mode_enabled)
+        led_brightness = clamped_int_config(values, "MCU_LED_BRIGHTNESS_PERCENT", 30, 0, 100)
+        led_brightness_auto = config_enabled(values, "MCU_LED_BRIGHTNESS_AUTO", "0")
+        mcu_reader.configure_led_behavior(battery_led_enabled, night_mode_enabled, led_brightness, led_brightness_auto)
+        if now - last_codex_led_update >= CODEX_LED_POLL_SECONDS:
+            mcu_reader.configure_codex_led(aggregate_codex_led_state(values))
+            last_codex_led_update = now
         if battery_led_enabled and now - last_led_power_update >= LED_POWER_POLL_SECONDS:
             if state in {"ac", "battery"}:
                 battery_for_led = battery_led_state(Path(values.get("POWERSAVER_POWER_SUPPLY_DIR", str(POWER_SUPPLY_DIR))))
                 mcu_reader.configure_led_power(state, battery_for_led)
             last_led_power_update = now
-        tmux_state = terminal_bell_monitor.poll(enabled=notify_led_enabled)
-        if tmux_state is not None:
-            tmux_triggered, tmux_active = tmux_state
-            if tmux_triggered:
-                mcu_reader.notify_tmux()
-            elif tmux_notify_active is not False and not tmux_active:
-                mcu_reader.notify_clear()
-            tmux_notify_active = tmux_active
         timeout_sec = timeout_for_state(values, state)
         status_interval = DISPLAY_STATUS_OFF_POLL_SECONDS if display_cache.off else DISPLAY_STATUS_POLL_SECONDS
         was_display_off = display_cache.get(interval=status_interval)

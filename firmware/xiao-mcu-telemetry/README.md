@@ -47,6 +47,10 @@ status
 sample
 ?
 calibrate pose
+led brightness <0-100>
+led brightness auto on
+led brightness auto off
+led codex <off|goal|approval|attention|working>
 stream on
 stream off
 help

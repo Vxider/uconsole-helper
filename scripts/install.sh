@@ -68,9 +68,12 @@ install_desktop() {
   local desktop_file="${desktop_dir}/${APP_ID}"
   local icon_dir="${XDG_DATA_HOME:-"${HOME}/.local/share"}/icons/hicolor/scalable/apps"
   local icon_file="${icon_dir}/${ICON_NAME}.svg"
+  local bin_dir="${HOME}/.local/bin"
+  local bin_file="${bin_dir}/uconsole-helper"
 
-  mkdir -p "${desktop_dir}" "${icon_dir}"
+  mkdir -p "${desktop_dir}" "${icon_dir}" "${bin_dir}"
   chmod +x "${APP_DIR}/run.sh" "${APP_DIR}/uconsole_helper_dhcp.py" "${APP_DIR}/uconsole_helper_service.py"
+  install -m 0755 "${APP_DIR}/uconsole_helper_gui.py" "${bin_file}"
   cp "${APP_DIR}/assets/uconsole-helper.svg" "${icon_file}"
 
   cat > "${desktop_file}" <<EOF
@@ -92,6 +95,8 @@ EOF
 
   echo "Installed ${APP_NAME} launcher:"
   echo "  ${desktop_file}"
+  echo "Installed GUI binary:"
+  echo "  ${bin_file}"
   echo "Installed icon:"
   echo "  ${icon_file}"
 }
@@ -150,6 +155,12 @@ install_service() {
     ensure_config_key "${config_file}" "POWERSAVER_PERFORMANCE_AUTO_AC_PUTDOWN_TIMEOUT_SEC" "300"
     ensure_config_key "${config_file}" "POWERSAVER_PERFORMANCE_BATTERY_IDLE_SHUTDOWN_TIMEOUT_SEC" "-1"
     ensure_config_key "${config_file}" "POWERSAVER_SAVE_TMUX_ON_SHUTDOWN" "1"
+    ensure_config_key "${config_file}" "MCU_LED_BATTERY_ENABLED" "1"
+    remove_config_key "${config_file}" "MCU_LED_LXTERMINAL_BELL_ENABLED"
+    ensure_config_key "${config_file}" "MCU_LED_NIGHT_MODE_ENABLED" "1"
+    ensure_config_key "${config_file}" "MCU_LED_CODEX_ENABLED" "0"
+    ensure_config_key "${config_file}" "MCU_LED_BRIGHTNESS_AUTO" "0"
+    ensure_config_key "${config_file}" "MCU_LED_BRIGHTNESS_PERCENT" "30"
   fi
   sudo install -m 0644 "${APP_DIR}/services/uconsole-helper.service" "${service_file}"
   sudo install -m 0644 "${APP_DIR}/services/low-battery-shutdown.service" "${low_battery_service_file}"
@@ -189,6 +200,12 @@ ensure_config_key() {
   if ! sudo grep -Eq "^${key}=" "${config_file}"; then
     printf '%s=%s\n' "${key}" "${value}" | sudo tee -a "${config_file}" >/dev/null
   fi
+}
+
+remove_config_key() {
+  local config_file="$1"
+  local key="$2"
+  sudo sed -i "/^${key}=/d" "${config_file}"
 }
 
 merge_default_rightshift_bindings() {

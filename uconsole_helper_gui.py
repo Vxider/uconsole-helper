@@ -30,6 +30,7 @@ import select
 import termios
 import tomllib
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -53,6 +54,8 @@ MAPPER_ASR_CONFIG = Path.home() / ".config/uconsole-helper-mapper/voice.env"
 MAPPER_GLOSSARY_FILE = Path.home() / ".config/uconsole-helper-mapper/voice-glossary.txt"
 CPA_GUI_CONFIG = Path.home() / ".config/uconsole-helper/cpa.env"
 CPA_STATUS_CACHE = Path.home() / ".cache/uconsole-helper/cpa-status.json"
+CODEX_BUDDY_CONFIG = Path.home() / ".config/codex-buddy/config.json"
+CODEX_DISMISSED_SESSIONS = Path.home() / ".cache/uconsole-helper/codex-dismissed-sessions.json"
 MCU_SHARED_SAMPLE_FILE = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "uconsole-helper-mcu-latest.json"
 BATTERY_CALIBRATE_PATH = Path("/sys/class/power_supply/axp20x-battery/calibrate")
 DISPLAY_BACKLIGHT_BRIGHTNESS_PATH = Path("/sys/class/backlight/backlight@0/brightness")
@@ -60,7 +63,6 @@ DISPLAY_BACKLIGHT_MAX_PATH = Path("/sys/class/backlight/backlight@0/max_brightne
 SCREEN_TIMEOUT_OPTIONS = ("Default", "30s", "1min", "2min", "5min", "10min", "15min")
 AUTO_SCREEN_TIMEOUT_OPTIONS = ("5s", "10s", "15s", "30s", "1min", "2min", "5min", "10min", "15min", "30min", "Never")
 IDLE_SHUTDOWN_TIMEOUT_OPTIONS = ("Never", "15min", "30min", "1h", "2h", "4h", "8h")
-DHCP_LEASE_TIME_OPTIONS = ("1h", "2h", "4h", "8h", "12h", "24h", "48h")
 APP_POWER_MIN_CPU_PERCENT = 1.0
 APP_POWER_MIN_IO_BYTES_PER_SEC = 256 * 1024
 APP_POWER_MIN_SCORE = 10.0
@@ -351,11 +353,33 @@ class UConsoleHelperWindow(Gtk.Window):
         self.mcu_mic_assist_updating = False
         self.mcu_led_controls: dict[str, Gtk.Switch] = {
             "MCU_LED_BATTERY_ENABLED": Gtk.Switch(),
-            "MCU_LED_LXTERMINAL_BELL_ENABLED": Gtk.Switch(),
             "MCU_LED_NIGHT_MODE_ENABLED": Gtk.Switch(),
+            "MCU_LED_CODEX_ENABLED": Gtk.Switch(),
+            "MCU_LED_BRIGHTNESS_AUTO": Gtk.Switch(),
         }
         for switch in self.mcu_led_controls.values():
             switch.connect("notify::active", self.on_mcu_led_config_changed)
+        self.mcu_led_brightness_adjustment = Gtk.Adjustment(
+            value=30,
+            lower=0,
+            upper=100,
+            step_increment=5,
+            page_increment=10,
+            page_size=0,
+        )
+        self.mcu_led_brightness_spin = Gtk.SpinButton(
+            adjustment=self.mcu_led_brightness_adjustment,
+            climb_rate=1,
+            digits=0,
+        )
+        self.mcu_led_brightness_spin.set_numeric(True)
+        self.mcu_led_brightness_spin.set_width_chars(4)
+        self.mcu_led_brightness_spin.set_tooltip_text("WS2812 brightness percentage.")
+        self.mcu_led_brightness_spin.connect("value-changed", self.on_mcu_led_config_changed)
+        self.mcu_led_save_button = Gtk.Button(label="Save LED")
+        self.mcu_led_save_button.get_style_context().add_class("suggested-action")
+        self.mcu_led_save_button.set_sensitive(False)
+        self.mcu_led_save_button.connect("clicked", lambda _button: self.save_mcu_led_config())
         self.mcu_led_config_updating = False
 
         self.message_label = Gtk.Label(label="", xalign=0)
@@ -363,11 +387,9 @@ class UConsoleHelperWindow(Gtk.Window):
         self.entries = {key: Gtk.Entry() for key in DEFAULTS}
         self.pool_prefix_labels: dict[str, Gtk.Label] = {}
         self.pool_suffix_entries: dict[str, Gtk.Entry] = {}
-        self.lease_time_combo = combo_text_from_values(DHCP_LEASE_TIME_OPTIONS)
         self.dhcp_defaults = dhcp_defaults()
         for key, entry in self.entries.items():
             entry.set_text(self.dhcp_defaults[key])
-        set_combo_text(self.lease_time_combo, self.dhcp_defaults["lease_time"])
         self.entries["server_ip"].connect("changed", lambda _entry: self.update_pool_address_controls())
         self.entries["netmask"].connect("changed", lambda _entry: self.update_pool_address_controls())
 
@@ -405,6 +427,28 @@ class UConsoleHelperWindow(Gtk.Window):
         self.cpa_refresh_running = False
         self.cpa_last_refresh_at = 0.0
         self.cpa_loaded_once = False
+        self.codex_server_store = Gtk.ListStore(str, str, str, str)
+        self.codex_session_store = Gtk.ListStore(str, str, str, str, str, str, str, str, bool, bool, str)
+        self.codex_notification_store = Gtk.ListStore(str, str, str, str, str, str, str, bool, str)
+        self.codex_server_tree: Gtk.TreeView | None = None
+        self.codex_session_tree: Gtk.TreeView | None = None
+        self.codex_notification_tree: Gtk.TreeView | None = None
+        self.codex_badge_label = Gtk.Label(label="OFFLINE")
+        self.codex_server_strip = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.codex_settings_card: Gtk.Widget | None = None
+        self.codex_settings_visible = False
+        self.codex_dismissed_sessions = codex_load_dismissed_sessions()
+        self.codex_settings_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.codex_open_section: Gtk.Widget | None = None
+        self.codex_open_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.codex_session_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.codex_last_data: dict[str, object] = {}
+        self.codex_summary_label = Gtk.Label(label="-", xalign=0)
+        self.codex_summary_label.get_style_context().add_class("muted")
+        self.codex_status_label = Gtk.Label(label="", xalign=0)
+        self.codex_status_label.get_style_context().add_class("muted")
+        self.codex_refresh_running = False
+        self.codex_loaded_once = False
         self.asr_controls: dict[str, Gtk.Widget] = {}
         self.asr_status_label = Gtk.Label(label="", xalign=0)
         self.asr_status_label.get_style_context().add_class("muted")
@@ -463,6 +507,7 @@ class UConsoleHelperWindow(Gtk.Window):
         self.stack.add_titled(scrolled_page(self._build_mcu_page()), "mcu", "MCU")
         self.stack.add_titled(scrolled_page(self._build_utils_page()), "utils", "Utils")
         self.stack.add_titled(scrolled_page(self._build_mapper_page()), "mapper", "Mapper")
+        self.stack.add_titled(scrolled_page(self._build_codex_page()), "codex", "Codex")
         self.stack.add_titled(scrolled_page(self._build_cpa_page()), "cpa", "CPA")
         self.stack.add_titled(scrolled_page(self._build_asr_page()), "asr", "ASR")
         self.stack.connect("notify::visible-child-name", self.on_visible_page_changed)
@@ -525,14 +570,20 @@ class UConsoleHelperWindow(Gtk.Window):
         self.mapper_tab.get_style_context().add_class("tab-button")
         tabs.pack_start(self.mapper_tab, False, False, 0)
 
+        self.codex_tab = underlined_button("Codex", "X")
+        self.codex_tab.set_tooltip_text("Shortcut: X / Ctrl+8")
+        self.codex_tab.connect("clicked", lambda _button: self.set_tab("codex"))
+        self.codex_tab.get_style_context().add_class("tab-button")
+        tabs.pack_start(self.codex_tab, False, False, 0)
+
         self.cpa_tab = underlined_button("CPA", "P")
-        self.cpa_tab.set_tooltip_text("Shortcut: P / Ctrl+8")
+        self.cpa_tab.set_tooltip_text("Shortcut: P / Ctrl+9")
         self.cpa_tab.connect("clicked", lambda _button: self.set_tab("cpa"))
         self.cpa_tab.get_style_context().add_class("tab-button")
         tabs.pack_start(self.cpa_tab, False, False, 0)
 
         self.asr_tab = underlined_button("ASR", "A")
-        self.asr_tab.set_tooltip_text("Shortcut: A / Ctrl+9")
+        self.asr_tab.set_tooltip_text("Shortcut: A / Ctrl+0")
         self.asr_tab.connect("clicked", lambda _button: self.set_tab("asr"))
         self.asr_tab.get_style_context().add_class("tab-button")
         tabs.pack_start(self.asr_tab, False, False, 0)
@@ -645,8 +696,6 @@ class UConsoleHelperWindow(Gtk.Window):
         self._attach_entry(grid, "子网掩码", "netmask", 2, 0)
         self._attach_pool_address(grid, "地址池起始", "pool_start", 0, 1)
         self._attach_pool_address(grid, "地址池结束", "pool_end", 2, 1)
-        self._attach_combo(grid, "租约时间", self.lease_time_combo, 0, 2)
-        self._attach_entry(grid, "网关(可选)", "gateway", 2, 2)
         self.update_pool_address_controls(self.dhcp_defaults)
 
         return config_card
@@ -1002,25 +1051,32 @@ class UConsoleHelperWindow(Gtk.Window):
 
         led_card = card_box()
         page.pack_start(led_card, False, False, 0)
+        led_header_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        led_card.pack_start(led_header_row, False, False, 0)
         led_header = Gtk.Label(label="LED Behavior", xalign=0)
         led_header.get_style_context().add_class("muted")
-        led_card.pack_start(led_header, False, False, 0)
+        led_header_row.pack_start(led_header, True, True, 0)
+        led_header_row.pack_start(self.mcu_led_save_button, False, False, 0)
         led_grid = Gtk.Grid(column_spacing=14, row_spacing=10)
         led_grid.set_margin_top(8)
         led_card.pack_start(led_grid, False, False, 0)
         led_rows = [
-            ("MCU_LED_BATTERY_ENABLED", "Battery", "Show low battery, charging, and full status."),
-            ("MCU_LED_LXTERMINAL_BELL_ENABLED", "LXTerminal Bell", "Flash on terminal bell from local shells, SSH, or remote tmux."),
+            ("MCU_LED_BATTERY_ENABLED", "Battery", "Show low battery warning only. This has the highest LED priority."),
             ("MCU_LED_NIGHT_MODE_ENABLED", "Night Mode", "Turn off LED indicators when ambient light is below 1 lux."),
+            ("MCU_LED_CODEX_ENABLED", "Codex Indicator", "Show aggregated codex-buddy status with vibecoding signal-light colors."),
+            ("MCU_LED_BRIGHTNESS_AUTO", "Auto Brightness", "Adjust LED brightness from ambient light. Maximum is 70%."),
+            ("MCU_LED_BRIGHTNESS_PERCENT", "Brightness", "WS2812 brightness percentage."),
         ]
-        for row, (key, title, tooltip) in enumerate(led_rows):
+        for index, (key, title, tooltip) in enumerate(led_rows):
+            column = (index % 2) * 2
+            row = index // 2
             label = Gtk.Label(label=title, xalign=0)
             label.get_style_context().add_class("muted")
             label.set_tooltip_text(tooltip)
-            switch = self.mcu_led_controls[key]
-            switch.set_tooltip_text(tooltip)
-            led_grid.attach(label, 0, row, 1, 1)
-            led_grid.attach(switch, 1, row, 1, 1)
+            control = self.mcu_led_brightness_spin if key == "MCU_LED_BRIGHTNESS_PERCENT" else self.mcu_led_controls[key]
+            control.set_tooltip_text(tooltip)
+            led_grid.attach(label, column, row, 1, 1)
+            led_grid.attach(control, column + 1, row, 1, 1)
 
         self.load_mcu_led_controls()
         self.mcu_page_ready = True
@@ -1290,6 +1346,229 @@ class UConsoleHelperWindow(Gtk.Window):
         page.pack_start(self.cpa_status_label, False, False, 0)
         return page
 
+    def _build_codex_page(self) -> Gtk.Widget:
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        page.get_style_context().add_class("page")
+
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        page.pack_start(header, False, False, 0)
+
+        self.codex_badge_label.set_xalign(0.5)
+        self.codex_badge_label.get_style_context().add_class("codex-main-badge")
+        header.pack_start(self.codex_badge_label, False, False, 0)
+
+        self.codex_server_strip.set_hexpand(True)
+        server_scroller = Gtk.ScrolledWindow()
+        server_scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
+        server_scroller.set_min_content_height(40)
+        server_scroller.add(self.codex_server_strip)
+        header.pack_start(server_scroller, True, True, 0)
+
+        self.codex_status_label.set_text("Updated -")
+        header.pack_start(self.codex_status_label, False, False, 0)
+
+        settings_card = self.codex_section_card("Servers", self.codex_settings_list)
+        self.codex_settings_card = settings_card
+        settings_card.hide()
+        page.pack_start(settings_card, False, False, 0)
+
+        self.codex_open_section = self.codex_section_card("Attention", self.codex_open_list)
+        page.pack_start(self.codex_open_section, False, False, 0)
+
+        sessions_card = self.codex_section_card("Sessions", self.codex_session_list)
+        page.pack_start(sessions_card, False, False, 0)
+        return page
+
+    def codex_section_card(self, title: str, content: Gtk.Widget) -> Gtk.Box:
+        card = card_box()
+        card.get_style_context().add_class("codex-card")
+        title_label = Gtk.Label(label=title, xalign=0)
+        title_label.get_style_context().add_class("codex-card-title")
+        card.pack_start(title_label, False, False, 0)
+        separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        card.pack_start(separator, False, False, 6)
+        card.pack_start(content, False, False, 0)
+        return card
+
+    def toggle_codex_settings(self) -> None:
+        if self.codex_settings_card is not None:
+            self.codex_settings_visible = not self.codex_settings_visible
+            self.codex_settings_card.set_visible(self.codex_settings_visible)
+
+    def sync_codex_settings_visibility(self) -> None:
+        if self.codex_settings_card is not None:
+            self.codex_settings_card.set_visible(self.codex_settings_visible)
+
+    def render_codex_page(self) -> None:
+        data = self.codex_last_data
+        sessions = [item for item in data.get("sessions", []) if isinstance(item, dict)]
+        self.codex_dismissed_sessions = codex_prune_dismissed_sessions(self.codex_dismissed_sessions, sessions)
+        notifications = [item for item in data.get("notifications", []) if isinstance(item, dict)]
+        data_servers = data.get("servers", [])
+        if isinstance(data_servers, list) and data_servers:
+            servers = [item for item in data_servers if isinstance(item, dict)]
+        else:
+            servers = [
+                {"id": str(row[0] or ""), "name": str(row[1] or ""), "base_url": str(row[2] or "")}
+                for row in self.codex_server_store
+                if str(row[2] or "").strip()
+            ]
+        connected_servers = set(data.get("connected_servers", [])) if isinstance(data.get("connected_servers"), list) else set()
+        open_sessions = []
+        dismissed_attention_sessions = []
+        other_sessions = []
+        for session in sessions:
+            if codex_needs_attention(session):
+                if codex_session_dismissed(session, self.codex_dismissed_sessions):
+                    muted_session = dict(session)
+                    muted_session["_codex_dismissed_attention"] = True
+                    dismissed_attention_sessions.append(muted_session)
+                else:
+                    open_sessions.append(session)
+            else:
+                other_sessions.append(session)
+        display_sessions = open_sessions + dismissed_attention_sessions + other_sessions
+        signal_state = codex_aggregate_signal_state(display_sessions)
+        badge_text, badge_class = codex_badge_style(signal_state)
+        replace_style_classes(self.codex_badge_label, {"codex-goal", "codex-approval", "codex-ready", "codex-working", "codex-offline"}, badge_class)
+        self.codex_badge_label.set_text(badge_text)
+        self.codex_summary_label.set_text(str(data.get("summary", "-")))
+        self.render_codex_server_strip(servers, connected_servers)
+        self.render_codex_settings([server for server in servers if str(server.get("built_in") or "") != "local"], connected_servers, data)
+        open_sessions.sort(key=codex_attention_session_sort_key, reverse=True)
+        other_sessions = dismissed_attention_sessions + other_sessions
+        other_sessions.sort(key=codex_session_list_sort_key, reverse=True)
+        self.render_codex_open_sessions(open_sessions)
+        self.render_codex_sessions(other_sessions, bool(open_sessions))
+        self.sync_codex_settings_visibility()
+
+    def render_codex_server_strip(self, servers: list[dict[str, str]], connected_servers: set[str]) -> None:
+        clear_box(self.codex_server_strip)
+        for server in servers:
+            server_id = str(server.get("id") or "")
+            base_url = str(server.get("base_url") or "").strip().rstrip("/")
+            name = codex_normalized_server_name(str(server.get("name") or ""), str(server.get("base_url") or ""))
+            style = codex_server_chip_class(server_id, base_url, connected_servers)
+            self.codex_server_strip.pack_start(codex_chip(name, style), False, False, 0)
+        self.codex_server_strip.show_all()
+
+    def render_codex_settings(self, servers: list[dict[str, str]], connected_servers: set[str], data: dict[str, object]) -> None:
+        clear_box(self.codex_settings_list)
+        summary = Gtk.Label(label=codex_settings_summary(servers), xalign=0)
+        summary.set_line_wrap(True)
+        summary.get_style_context().add_class("muted")
+        self.codex_settings_list.pack_start(summary, False, False, 0)
+        if not servers:
+            self.codex_settings_list.pack_start(Gtk.Label(label="No remote servers configured", xalign=0), False, False, 0)
+        else:
+            grid = Gtk.Grid(column_spacing=10, row_spacing=10)
+            grid.set_column_homogeneous(True)
+            for index, server in enumerate(servers):
+                grid.attach(self.codex_server_row(server, connected_servers), index % 2, index // 2, 1, 1)
+            self.codex_settings_list.pack_start(grid, False, False, 0)
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        add_button = Gtk.Button(label="Add Remote Server (N)")
+        add_button.connect("clicked", lambda _button: self.add_codex_server())
+        buttons.pack_start(add_button, False, False, 0)
+        self.codex_settings_list.pack_start(buttons, False, False, 0)
+        self.codex_settings_list.show_all()
+
+    def codex_server_row(self, server: dict[str, str], connected_servers: set[str]) -> Gtk.Widget:
+        row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        row.get_style_context().add_class("codex-row")
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        name = Gtk.Label(label=codex_normalized_server_name(str(server.get("name") or ""), str(server.get("base_url") or "")), xalign=0)
+        name.get_style_context().add_class("codex-title")
+        header.pack_start(name, True, True, 0)
+        online = str(server.get("id") or "") in connected_servers or str(server.get("base_url") or "") in connected_servers
+        header.pack_start(codex_chip("online" if online else "offline", "codex-chip-online" if online else "codex-chip-offline"), False, False, 0)
+        row.pack_start(header, False, False, 0)
+        updated = Gtk.Label(label=f"Updated {codex_relative_time(server.get('server_time'))}", xalign=0)
+        updated.get_style_context().add_class("muted")
+        row.pack_start(updated, False, False, 0)
+        editor = Gtk.Grid(column_spacing=8, row_spacing=6)
+        name_entry = Gtk.Entry()
+        name_entry.set_text(str(server.get("name") or ""))
+        url_entry = Gtk.Entry()
+        url_entry.set_text(str(server.get("base_url") or ""))
+        server_id = str(server.get("id") or "")
+        base_url = str(server.get("base_url") or "")
+        name_entry.connect("changed", lambda entry: self.on_codex_server_entry_changed(server_id, base_url, "name", entry.get_text()))
+        url_entry.connect("changed", lambda entry: self.on_codex_server_entry_changed(server_id, base_url, "base_url", entry.get_text()))
+        editor.attach(Gtk.Label(label="Name", xalign=0), 0, 0, 1, 1)
+        editor.attach(name_entry, 1, 0, 1, 1)
+        editor.attach(Gtk.Label(label="Server URL", xalign=0), 0, 1, 1, 1)
+        editor.attach(url_entry, 1, 1, 1, 1)
+        row.pack_start(editor, False, False, 0)
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        delete_button = Gtk.Button(label="Delete (X)")
+        delete_button.connect("clicked", lambda _button: self.delete_codex_server(str(server.get("id") or ""), str(server.get("base_url") or "")))
+        buttons.pack_start(delete_button, False, False, 0)
+        row.pack_start(buttons, False, False, 0)
+        return row
+
+    def render_codex_open_sessions(self, sessions: list[dict[str, object]]) -> None:
+        clear_box(self.codex_open_list)
+        if self.codex_open_section is not None:
+            self.codex_open_section.set_visible(bool(sessions))
+        for session in sessions:
+            self.codex_open_list.pack_start(self.codex_open_session_row(session), False, False, 0)
+        self.codex_open_list.show_all()
+
+    def render_codex_sessions(self, sessions: list[dict[str, object]], has_open_sessions: bool) -> None:
+        clear_box(self.codex_session_list)
+        if not sessions:
+            text = "No other sessions" if has_open_sessions else "No active sessions"
+            label = Gtk.Label(label=text, xalign=0)
+            self.codex_session_list.pack_start(label, False, False, 0)
+        for index, session in enumerate(sessions):
+            self.codex_session_list.pack_start(self.codex_session_cell(session, open_style=False), False, False, 0)
+            if index < len(sessions) - 1:
+                self.codex_session_list.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 0)
+        self.codex_session_list.show_all()
+
+    def codex_open_session_row(self, session: dict[str, object]) -> Gtk.Widget:
+        row = self.codex_session_cell(session, open_style=True)
+        row.get_style_context().add_class("codex-open-row")
+        return row
+
+    def codex_session_cell(self, session: dict[str, object], *, open_style: bool) -> Gtk.Box:
+        row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        row.set_hexpand(True)
+        row.get_style_context().add_class("codex-session-row")
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        dot = Gtk.Label(label="●")
+        dot.set_xalign(0.5)
+        dot.get_style_context().add_class("codex-signal-dot")
+        dot.get_style_context().add_class(codex_signal_dot_class(codex_session_signal_state(session)))
+        header.pack_start(dot, False, False, 0)
+        title = Gtk.Label(xalign=0)
+        title.set_markup(codex_session_title_markup(session))
+        title.set_ellipsize(Pango.EllipsizeMode.END)
+        title.get_style_context().add_class("codex-title")
+        header.pack_start(title, True, True, 0)
+        server_id = str(session.get("server_id") or "")
+        server_url = str(session.get("server_url") or "").strip().rstrip("/")
+        header.pack_start(codex_chip(str(session.get("server_name") or "-"), codex_server_chip_class(server_id, server_url)), False, False, 0)
+        signal_state = codex_session_signal_state(session)
+        header.pack_start(codex_chip(codex_session_badge_text(session), codex_signal_chip_class(signal_state)), False, False, 0)
+        if open_style:
+            if bool(session.get("can_continue")):
+                button = codex_action_button("Continue", "codex-chip-working")
+                button.connect("clicked", lambda _button, item=dict(session): self.codex_run_session_action(item, "continue"))
+                header.pack_start(button, False, False, 0)
+            button = codex_action_button("Close", "codex-chip-offline")
+            button.connect("clicked", lambda _button, item=dict(session): self.dismiss_codex_session_card(item))
+            header.pack_start(button, False, False, 0)
+        row.pack_start(header, False, False, 0)
+        summary_text = codex_session_summary(session, codex_session_fallback_summary(session, open_style))
+        if summary_text:
+            row.pack_start(codex_markdown_widget(summary_text), False, False, 0)
+        meta = Gtk.Label(label=f"Updated {codex_relative_time(session.get('updated_at'))}", xalign=0)
+        meta.get_style_context().add_class("muted")
+        row.pack_start(meta, False, False, 0)
+        return row
+
     def _attach_power_control(
         self,
         grid: Gtk.Grid,
@@ -1514,6 +1793,111 @@ class UConsoleHelperWindow(Gtk.Window):
                 border-radius: 8px;
                 padding: 5px;
             }
+            .codex-card {
+                border-radius: 18px;
+                padding: 10px;
+            }
+            .codex-card-title,
+            .codex-title {
+                font-weight: 700;
+                color: #f2f2f2;
+            }
+            .codex-main-badge {
+                min-height: 30px;
+                border-radius: 9px;
+                padding: 4px 10px;
+                color: #ffffff;
+                font-weight: 700;
+            }
+            .codex-goal { background: #7140c8; }
+            .codex-approval { background: #b63b2f; }
+            .codex-ready { background: #ffbf00; color: #101010; }
+            .codex-working { background: #2d7a52; }
+            .codex-offline { background: #4a4b50; }
+            .codex-chip {
+                min-height: 28px;
+                border-radius: 10px;
+                padding: 3px 9px;
+                color: #ffffff;
+                font-weight: 700;
+            }
+            .codex-chip-button {
+                border: none;
+                box-shadow: none;
+            }
+            .codex-chip-button:hover {
+                box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.25);
+            }
+            .codex-chip-online { background: #2d7a52; }
+            .codex-chip-local { background: #1f7a74; }
+            .codex-chip-offline { background: #4a4b50; color: #cfd4db; }
+            .codex-chip-ready { background: #587258; }
+            .codex-chip-open { background: #7a672d; }
+            .codex-chip-approval { background: #9d4f1d; }
+            .codex-chip-goal { background: #7140c8; }
+            .codex-chip-attention { background: #ffbf00; color: #101010; }
+            .codex-chip-working { background: #2d7a52; }
+            .codex-chip-error { background: #b63b2f; }
+            .codex-chip-source-a { background: #5a452a; }
+            .codex-chip-source-b { background: #5d343b; }
+            .codex-chip-source-c { background: #3e4c7a; }
+            .codex-chip-source-d { background: #3f5731; }
+            .codex-signal-dot {
+                color: transparent;
+                font-weight: 700;
+                min-width: 10px;
+            }
+            .codex-signal-goal {
+                color: #a050ff;
+            }
+            .codex-signal-approval {
+                color: #ff3b30;
+            }
+            .codex-signal-attention {
+                color: #ffbf00;
+            }
+            .codex-signal-working {
+                color: #30d158;
+            }
+            .codex-signal-off {
+                color: #6f737a;
+            }
+            .codex-row,
+            .codex-session-row {
+                padding: 8px;
+            }
+            .codex-open-row {
+                background: #17251f;
+                border-radius: 10px;
+            }
+            .codex-markdown {
+                color: #f0f0f0;
+            }
+            .codex-markdown-heading {
+                color: #f2f2f2;
+                font-weight: 700;
+            }
+            .codex-markdown-meta {
+                color: #b9c0cb;
+            }
+            .codex-markdown-code {
+                background: #1d252b;
+                border: 1px solid #33464c;
+                border-radius: 6px;
+                color: #d9f7ef;
+                font-family: "SauceCode Pro Mono", monospace;
+                padding: 6px;
+            }
+            .codex-markdown-quote {
+                color: #8fd6a7;
+            }
+            .codex-markdown-table-header {
+                color: #d9f7ef;
+                font-weight: 700;
+            }
+            .codex-markdown-table-cell {
+                color: #f0f0f0;
+            }
             .card.dhcp-running {
                 background: #142a25;
                 border-color: #39e58a;
@@ -1690,9 +2074,10 @@ class UConsoleHelperWindow(Gtk.Window):
         toggle_style_class(self.power_tab, "tab-active", page == "power")
         toggle_style_class(self.utils_tab, "tab-active", page == "utils")
         toggle_style_class(self.mapper_tab, "tab-active", page == "mapper")
+        toggle_style_class(self.codex_tab, "tab-active", page == "codex")
         toggle_style_class(self.cpa_tab, "tab-active", page == "cpa")
         toggle_style_class(self.asr_tab, "tab-active", page == "asr")
-        self.tailscale_reconnect_button.set_visible(page in {"lan", "tailscale", "power", "mapper"})
+        self.tailscale_reconnect_button.set_visible(page in {"lan", "tailscale", "power", "mapper", "codex"})
         self.tailscale_reconnect_button.set_sensitive(page != "tailscale" or not self.tailscale_reconnecting)
         reconnect_context = self.tailscale_reconnect_button.get_style_context()
         for class_name in ("action-ready", "action-active", "action-busy", "action-danger"):
@@ -1712,6 +2097,9 @@ class UConsoleHelperWindow(Gtk.Window):
             active = user_service_active(MAPPER_USER_SERVICE)
             set_underlined_button_label(self.tailscale_reconnect_button, "Disable" if active else "Enable", "E")
             reconnect_context.add_class("action-active" if active else "action-ready")
+        elif page == "codex":
+            set_underlined_button_label(self.tailscale_reconnect_button, "Settings", "S")
+            reconnect_context.add_class("action-active" if self.codex_settings_visible else "action-ready")
         elif self.tailscale_reconnecting:
             set_underlined_button_label(self.tailscale_reconnect_button, "Reconnecting", "E")
             reconnect_context.add_class("action-busy")
@@ -1722,7 +2110,7 @@ class UConsoleHelperWindow(Gtk.Window):
         for class_name in ("action-ready", "action-active", "action-busy"):
             action_context.remove_class(class_name)
 
-        if page in {"power", "mapper", "cpa", "asr"}:
+        if page in {"power", "mapper", "codex", "cpa", "asr"}:
             self.context_action_button.show()
             set_underlined_button_label(self.context_action_button, "Save", "V")
             action_context.add_class("action-ready")
@@ -1753,6 +2141,11 @@ class UConsoleHelperWindow(Gtk.Window):
         context = self.header_refresh_button.get_style_context()
         for class_name in ("action-ready", "action-active", "action-busy", "action-success"):
             context.remove_class(class_name)
+        if page == "codex" and self.codex_refresh_running:
+            set_underlined_button_label(self.header_refresh_button, "Refreshing", "R")
+            self.header_refresh_button.set_sensitive(False)
+            context.add_class("action-busy")
+            return
         if page == "cpa" and self.cpa_refresh_running:
             set_underlined_button_label(self.header_refresh_button, "Refreshing", "R")
             self.header_refresh_button.set_sensitive(False)
@@ -1802,6 +2195,9 @@ class UConsoleHelperWindow(Gtk.Window):
             self.toggle_powersaver_enabled()
         elif page == "mapper":
             self.toggle_user_service(MAPPER_USER_SERVICE, "Mapper service")
+        elif page == "codex":
+            self.toggle_codex_settings()
+            self.update_header()
 
     def run_context_action(self) -> None:
         page = self.stack.get_visible_child_name()
@@ -1834,6 +2230,13 @@ class UConsoleHelperWindow(Gtk.Window):
         if page == "asr":
             self.set_header_button_busy(self.context_action_button, "Saving", "V")
             if self.save_asr_config():
+                self.flash_header_button(self.context_action_button, "Saved", "V")
+            else:
+                self.update_header()
+            return
+        if page == "codex":
+            self.set_header_button_busy(self.context_action_button, "Saving", "V")
+            if self.save_codex_servers():
                 self.flash_header_button(self.context_action_button, "Saved", "V")
             else:
                 self.update_header()
@@ -1876,6 +2279,13 @@ class UConsoleHelperWindow(Gtk.Window):
                 self.refresh_mapper_status()
             else:
                 self.update_header()
+        elif page == "codex":
+            if reload_config or not self.codex_loaded_once:
+                self.load_codex_servers()
+            if reload_config:
+                self.refresh_codex_status(force=True)
+            elif not self.codex_loaded_once:
+                self.refresh_codex_status(force=True)
         elif page == "cpa":
             if reload_config or not self.cpa_loaded_once:
                 self.load_cpa_config_controls()
@@ -1944,9 +2354,12 @@ class UConsoleHelperWindow(Gtk.Window):
             self.set_tab("mapper")
             return True
         if ctrl and key == "8":
-            self.set_tab("cpa")
+            self.set_tab("codex")
             return True
         if ctrl and key == "9":
+            self.set_tab("cpa")
+            return True
+        if ctrl and key == "0":
             self.set_tab("asr")
             return True
         if alt and key in {"Left", "Right"}:
@@ -1954,6 +2367,22 @@ class UConsoleHelperWindow(Gtk.Window):
             return True
         if is_text_input_focus(self):
             return False
+        if self.stack.get_visible_child_name() == "codex":
+            if key_lower == "a":
+                self.codex_ack_primary_notification()
+                return True
+            if key_lower == "c":
+                self.codex_continue_primary_notification()
+                return True
+            if key_lower == "s":
+                self.toggle_codex_settings()
+                return True
+            if key_lower == "v":
+                self.run_context_action()
+                return True
+            if key_lower == "r":
+                self.refresh_codex_status(force=True)
+                return True
         if key_lower == "h":
             self.set_tab("dashboard")
             return True
@@ -1972,6 +2401,9 @@ class UConsoleHelperWindow(Gtk.Window):
         if key_lower == "m":
             self.set_tab("mapper")
             return True
+        if key_lower == "x":
+            self.set_tab("codex")
+            return True
         if key_lower == "p":
             self.set_tab("cpa")
             return True
@@ -1984,7 +2416,7 @@ class UConsoleHelperWindow(Gtk.Window):
         if key_lower == "s" and self.stack.get_visible_child_name() == "lan":
             self.run_context_action()
             return True
-        if key_lower == "v" and self.stack.get_visible_child_name() in {"power", "mapper", "cpa", "asr"}:
+        if key_lower == "v" and self.stack.get_visible_child_name() in {"power", "mapper", "codex", "cpa", "asr"}:
             self.run_context_action()
             return True
         if key_lower == "e" and self.stack.get_visible_child_name() == "tailscale":
@@ -2001,7 +2433,7 @@ class UConsoleHelperWindow(Gtk.Window):
         return False
 
     def switch_tab(self, direction: int) -> None:
-        pages = ["dashboard", "lan", "tailscale", "power", "mcu", "utils", "mapper", "cpa", "asr"]
+        pages = ["dashboard", "lan", "tailscale", "power", "mcu", "utils", "mapper", "codex", "cpa", "asr"]
         current = self.stack.get_visible_child_name()
         try:
             index = pages.index(current)
@@ -2041,7 +2473,8 @@ class UConsoleHelperWindow(Gtk.Window):
 
     def current_dhcp_form_values(self) -> dict[str, str]:
         values = {key: entry.get_text().strip() for key, entry in self.entries.items()}
-        values["lease_time"] = self.lease_time_combo.get_active_text() or DEFAULTS["lease_time"]
+        values["lease_time"] = self.dhcp_defaults.get("lease_time", DEFAULTS["lease_time"])
+        values["gateway"] = ""
         for key in ("pool_start", "pool_end"):
             values[key] = self.pool_address_text_or_default(key)
         return values
@@ -2051,7 +2484,6 @@ class UConsoleHelperWindow(Gtk.Window):
             if key in {"pool_start", "pool_end", "lease_time"}:
                 continue
             entry.set_text(values.get(key, DEFAULTS[key]))
-        set_combo_text(self.lease_time_combo, values.get("lease_time", DEFAULTS["lease_time"]))
         self.update_pool_address_controls(values)
 
     def update_pool_address_controls(self, values: dict[str, str] | None = None) -> None:
@@ -2532,14 +2964,39 @@ class UConsoleHelperWindow(Gtk.Window):
         config = helper_service_config()
         self.mcu_led_config_updating = True
         for key, switch in self.mcu_led_controls.items():
-            switch.set_active(config.get(key, "1").lower() in {"1", "yes", "true", "on", "enabled"})
+            default = "0" if key in {"MCU_LED_CODEX_ENABLED", "MCU_LED_BRIGHTNESS_AUTO"} else "1"
+            switch.set_active(config.get(key, default).lower() in {"1", "yes", "true", "on", "enabled"})
+        try:
+            brightness_percent = int(config.get("MCU_LED_BRIGHTNESS_PERCENT", "30"))
+        except ValueError:
+            brightness_percent = 30
+        self.mcu_led_brightness_spin.set_value(max(0, min(100, brightness_percent)))
+        self.mcu_led_save_button.set_sensitive(False)
         self.mcu_led_config_updating = False
 
-    def on_mcu_led_config_changed(self, _switch: Gtk.Switch, _pspec: object) -> None:
+    def on_mcu_led_config_changed(self, *_args: object) -> None:
         if self.mcu_led_config_updating:
             return
+        self.mcu_led_save_button.set_sensitive(True)
+        self.mcu_action_label.set_text("LED behavior has unsaved changes.")
+
+    def save_mcu_led_config(self) -> None:
         if self.save_power_policy():
-            self.mcu_action_label.set_text("LED behavior updated.")
+            self.mcu_led_save_button.set_sensitive(False)
+            auto_switch = self.mcu_led_controls.get("MCU_LED_BRIGHTNESS_AUTO")
+            brightness_auto = auto_switch is not None and auto_switch.get_active()
+            brightness_percent = int(self.mcu_led_brightness_spin.get_value())
+            try:
+                if brightness_auto:
+                    send_xiao_command(f"led brightness {brightness_percent}")
+                    send_xiao_command("led brightness auto on")
+                else:
+                    send_xiao_command("led brightness auto off")
+                    send_xiao_command(f"led brightness {brightness_percent}")
+            except OSError as exc:
+                self.mcu_action_label.set_text(f"LED behavior saved. MCU not updated now: {exc}")
+                return
+            self.mcu_action_label.set_text("LED behavior saved and applied.")
 
     def hide_inline_panel_after_timeout(self) -> bool:
         self.hide_inline_panel()
@@ -2907,6 +3364,339 @@ class UConsoleHelperWindow(Gtk.Window):
         self.cpa_balance_store.set_value(tree_iter, 0, not enabled)
         self.cpa_status_label.set_text("Unsaved CPA changes.")
 
+    def load_codex_servers(self) -> None:
+        self.codex_server_store.clear()
+        for server in codex_configured_servers():
+            self.codex_server_store.append(
+                [
+                    str(server.get("id") or ""),
+                    str(server.get("name") or ""),
+                    str(server.get("base_url") or ""),
+                    str(server.get("built_in") or ""),
+                ]
+            )
+        if len(self.codex_server_store) == 0:
+            self.codex_server_store.append(["", "Local", "http://127.0.0.1:8787", ""])
+        self.codex_status_label.set_text("")
+        self.render_codex_page()
+
+    def save_codex_servers(self) -> bool:
+        servers: list[dict[str, str]] = []
+        for row in self.codex_server_store:
+            if str(row[3] or "") == "local":
+                continue
+            name = str(row[1] or "").strip()
+            base_url = str(row[2] or "").strip().rstrip("/")
+            if not base_url:
+                continue
+            if not codex_valid_base_url(base_url):
+                self.show_error("Codex config error", f"Invalid server URL: {base_url}")
+                return False
+            servers.append({"id": str(row[0] or "").strip(), "name": name, "base_url": base_url})
+        try:
+            codex_save_servers(servers)
+        except Exception as exc:
+            self.show_error("Save Codex failed", str(exc))
+            return False
+        self.codex_status_label.set_text("Codex server settings saved.")
+        self.refresh_codex_status(force=True)
+        return True
+
+    def add_codex_server(self) -> None:
+        self.codex_server_store.append([codex_server_id(""), "codex", "", ""])
+        self.codex_status_label.set_text("Unsaved Codex server settings.")
+        self.render_codex_page()
+
+    def on_codex_server_entry_changed(self, server_id: str, original_base_url: str, field: str, value: str) -> None:
+        for row in self.codex_server_store:
+            if str(row[0] or "") == server_id or str(row[2] or "") == original_base_url:
+                if field == "name":
+                    row[1] = value.strip()
+                elif field == "base_url":
+                    row[2] = value.strip().rstrip("/")
+                break
+        self.codex_status_label.set_text("Unsaved Codex server settings.")
+
+    def delete_codex_server(self, server_id: str, base_url: str) -> None:
+        tree_iter = self.codex_server_store.get_iter_first()
+        while tree_iter is not None:
+            if str(self.codex_server_store.get_value(tree_iter, 0) or "") == server_id or str(self.codex_server_store.get_value(tree_iter, 2) or "") == base_url:
+                self.codex_server_store.remove(tree_iter)
+                break
+            tree_iter = self.codex_server_store.iter_next(tree_iter)
+        self.codex_status_label.set_text("Unsaved Codex server settings.")
+        self.render_codex_page()
+
+    def refresh_codex_status(self, *, force: bool = False) -> None:
+        if self.codex_refresh_running:
+            return
+        if not force and self.codex_loaded_once:
+            return
+        self.codex_refresh_running = True
+        self.codex_status_label.set_text("Refreshing Codex...")
+        self.codex_session_store.clear()
+        self.codex_notification_store.clear()
+        self.update_header()
+        servers = [
+            {"id": str(row[0] or ""), "name": str(row[1] or ""), "base_url": str(row[2] or "")}
+            for row in self.codex_server_store
+            if str(row[2] or "").strip()
+        ]
+        thread = threading.Thread(target=self._codex_refresh_worker, args=(servers,), daemon=True)
+        thread.start()
+
+    def _codex_refresh_worker(self, servers: list[dict[str, str]]) -> None:
+        try:
+            data = codex_status_data(servers)
+        except Exception as exc:
+            GLib.idle_add(self.finish_codex_refresh_error, str(exc))
+            return
+        GLib.idle_add(self.finish_codex_refresh, data)
+
+    def finish_codex_refresh_error(self, error: str) -> bool:
+        self.codex_refresh_running = False
+        self.codex_loaded_once = True
+        self.codex_status_label.set_text(f"Codex refresh failed: {compact_error(error)}")
+        self.codex_summary_label.set_text("Codex unavailable")
+        self.codex_last_data = {"summary": "Codex unavailable", "sessions": [], "notifications": [], "overall_state": "offline"}
+        self.render_codex_page()
+        self.update_header()
+        return False
+
+    def finish_codex_refresh(self, data: dict[str, object]) -> bool:
+        self.codex_refresh_running = False
+        self.codex_loaded_once = True
+        self.codex_session_store.clear()
+        self.codex_notification_store.clear()
+        notifications = data.get("notifications", [])
+        if isinstance(notifications, list):
+            for notification in notifications:
+                if isinstance(notification, dict):
+                    self.append_codex_notification_row(notification)
+        if len(self.codex_notification_store) == 0:
+            self.codex_notification_store.append(["", "-", "-", "No notifications", "-", "-", "", False, ""])
+        sessions = data.get("sessions", [])
+        if isinstance(sessions, list):
+            for session in sessions:
+                if isinstance(session, dict):
+                    self.append_codex_session_row(session)
+        if len(self.codex_session_store) == 0:
+            self.codex_session_store.append(["-", "-", "idle", "No sessions", "-", "-", "", "", False, False, ""])
+        self.codex_summary_label.set_text(str(data.get("summary", "-")))
+        self.codex_status_label.set_text(f"Updated {time.strftime('%H:%M:%S')}")
+        self.codex_last_data = data
+        self.render_codex_page()
+        self.update_header()
+        return False
+
+    def codex_run_session_action(self, session: dict[str, object], action: str) -> None:
+        if action == "close":
+            self.dismiss_codex_session_card(session)
+            return
+        server_url = str(session.get("server_url") or "")
+        session_id = str(session.get("session_id") or "")
+        if not server_url or not session_id:
+            self.show_error("Codex action", "Selected session is missing server or session id.")
+            return
+        token = ""
+        if action == "continue":
+            action_data = session.get("continue_action")
+            if isinstance(action_data, dict):
+                token = str(action_data.get("action_token") or "")
+        self.codex_status_label.set_text("Sending continue...")
+        payload = {"server_url": server_url, "session_id": session_id, "action_token": token}
+        thread = threading.Thread(target=self._codex_session_action_worker, args=(payload, action), daemon=True)
+        thread.start()
+
+    def dismiss_codex_session_card(self, session: dict[str, object]) -> None:
+        key = codex_session_key(session)
+        if not key:
+            self.codex_status_label.set_text("Codex card close failed: missing session id.")
+            return
+        self.codex_dismissed_sessions[key] = codex_session_dismiss_fingerprint(session)
+        codex_save_dismissed_sessions(self.codex_dismissed_sessions)
+        self.codex_status_label.set_text("Codex card closed.")
+        self.render_codex_page()
+
+    def primary_codex_notification(self) -> dict[str, object] | None:
+        notifications = self.codex_last_data.get("notifications", [])
+        if not isinstance(notifications, list):
+            return None
+        for item in notifications:
+            if isinstance(item, dict):
+                return item
+        return None
+
+    def codex_ack_primary_notification(self) -> None:
+        notification = self.primary_codex_notification()
+        if notification is None:
+            self.codex_status_label.set_text("No notification to acknowledge.")
+            return
+        self.codex_run_notification_action(notification, "ack")
+
+    def codex_continue_primary_notification(self) -> None:
+        notification = self.primary_codex_notification()
+        if notification is None:
+            self.codex_status_label.set_text("No notification to continue.")
+            return
+        actions = notification.get("actions")
+        if not (isinstance(actions, list) and "continue" in [str(item) for item in actions]):
+            self.codex_status_label.set_text("Primary notification has no continue action.")
+            return
+        self.codex_run_notification_action(notification, "continue")
+
+    def codex_run_notification_action(self, notification: dict[str, object], action: str) -> None:
+        server_url = str(notification.get("server_url") or "")
+        notification_id = str(notification.get("id") or "")
+        if not server_url or not notification_id:
+            self.show_error("Codex action", "Selected notification is missing server or notification id.")
+            return
+        payload = {
+            "server_url": server_url,
+            "notification_id": notification_id,
+            "action_token": str(notification.get("action_token") or ""),
+        }
+        self.codex_status_label.set_text("Acknowledging notification..." if action == "ack" else "Sending continue...")
+        thread = threading.Thread(target=self._codex_notification_action_worker, args=(payload, action), daemon=True)
+        thread.start()
+
+    def append_codex_session_row(self, session: dict[str, object]) -> bool:
+        server = str(session.get("server_name") or "-")
+        server_url = str(session.get("server_url") or "")
+        session_id = str(session.get("session_id") or "")
+        state = str(session.get("state") or "-")
+        title = str(session.get("display_title") or session.get("short_session_id") or session_id or "-")
+        summary = str(session.get("open_summary") or session.get("summary") or "-")
+        updated = codex_updated_label(session.get("updated_at"))
+        can_continue = bool(session.get("can_continue"))
+        can_close = bool(session.get("can_close"))
+        token = ""
+        action = session.get("continue_action")
+        if isinstance(action, dict):
+            token = str(action.get("action_token") or "")
+        self.codex_session_store.append(
+            [server, session_id, state, title, summary, updated, server_url, token, can_continue, can_close, ""]
+        )
+        return False
+
+    def append_codex_notification_row(self, notification: dict[str, object]) -> bool:
+        notification_id = str(notification.get("id") or "")
+        server = str(notification.get("server_name") or "-")
+        kind = str(notification.get("kind") or "-")
+        title = str(notification.get("title") or notification.get("session_id") or "-")
+        summary = str(notification.get("summary") or "-")
+        updated = codex_updated_label(notification.get("updated_at"))
+        server_url = str(notification.get("server_url") or "")
+        actions = notification.get("actions")
+        can_continue = isinstance(actions, list) and "continue" in [str(item) for item in actions]
+        token = str(notification.get("action_token") or "")
+        self.codex_notification_store.append(
+            [notification_id, server, kind, title, summary, updated, server_url, can_continue, token]
+        )
+        return False
+
+    def selected_codex_notification(self) -> dict[str, object] | None:
+        if self.codex_notification_tree is None:
+            return None
+        selection = self.codex_notification_tree.get_selection()
+        model, tree_iter = selection.get_selected()
+        if tree_iter is None or model is None:
+            return None
+        return {
+            "notification_id": str(model.get_value(tree_iter, 0) or ""),
+            "server": str(model.get_value(tree_iter, 1) or ""),
+            "server_url": str(model.get_value(tree_iter, 6) or ""),
+            "can_continue": bool(model.get_value(tree_iter, 7)),
+            "action_token": str(model.get_value(tree_iter, 8) or ""),
+        }
+
+    def selected_codex_session(self) -> dict[str, object] | None:
+        if self.codex_session_tree is None:
+            return None
+        selection = self.codex_session_tree.get_selection()
+        model, tree_iter = selection.get_selected()
+        if tree_iter is None or model is None:
+            return None
+        return {
+            "server": str(model.get_value(tree_iter, 0) or ""),
+            "session_id": str(model.get_value(tree_iter, 1) or ""),
+            "state": str(model.get_value(tree_iter, 2) or ""),
+            "server_url": str(model.get_value(tree_iter, 6) or ""),
+            "action_token": str(model.get_value(tree_iter, 7) or ""),
+            "can_continue": bool(model.get_value(tree_iter, 8)),
+            "can_close": bool(model.get_value(tree_iter, 9)),
+        }
+
+    def codex_continue_selected_session(self) -> None:
+        session = self.selected_codex_session()
+        if not session or not session["session_id"] or not session["server_url"]:
+            self.show_error("Codex continue", "Select a Codex session first.")
+            return
+        if not session["can_continue"]:
+            self.show_error("Codex continue", "Selected session does not expose continue.")
+            return
+        self.codex_status_label.set_text("Sending continue...")
+        thread = threading.Thread(target=self._codex_session_action_worker, args=(session, "continue"), daemon=True)
+        thread.start()
+
+    def codex_ack_selected_notification(self) -> None:
+        notification = self.selected_codex_notification()
+        if not notification or not notification["notification_id"] or not notification["server_url"]:
+            self.show_error("Codex ack", "Select a Codex notification first.")
+            return
+        self.codex_status_label.set_text("Acknowledging notification...")
+        thread = threading.Thread(target=self._codex_notification_action_worker, args=(notification, "ack"), daemon=True)
+        thread.start()
+
+    def codex_continue_selected_notification(self) -> None:
+        notification = self.selected_codex_notification()
+        if not notification or not notification["notification_id"] or not notification["server_url"]:
+            self.show_error("Codex continue", "Select a Codex notification first.")
+            return
+        if not notification["can_continue"]:
+            self.show_error("Codex continue", "Selected notification does not expose continue.")
+            return
+        self.codex_status_label.set_text("Sending continue...")
+        thread = threading.Thread(target=self._codex_notification_action_worker, args=(notification, "continue"), daemon=True)
+        thread.start()
+
+    def codex_close_selected_session(self) -> None:
+        session = self.selected_codex_session()
+        if not session or not session["session_id"] or not session["server_url"]:
+            self.show_error("Codex close", "Select a Codex session first.")
+            return
+        self.dismiss_codex_session_card(session)
+
+    def _codex_session_action_worker(self, session: dict[str, object], action: str) -> None:
+        try:
+            codex_session_action(str(session["server_url"]), str(session["session_id"]), action, str(session.get("action_token") or ""))
+        except Exception as exc:
+            GLib.idle_add(self.finish_codex_action_error, str(exc))
+            return
+        GLib.idle_add(self.finish_codex_action_success, action)
+
+    def _codex_notification_action_worker(self, notification: dict[str, object], action: str) -> None:
+        try:
+            codex_notification_action(
+                str(notification["server_url"]),
+                str(notification["notification_id"]),
+                action,
+                str(notification.get("action_token") or ""),
+            )
+        except Exception as exc:
+            GLib.idle_add(self.finish_codex_action_error, str(exc))
+            return
+        GLib.idle_add(self.finish_codex_action_success, action)
+
+    def finish_codex_action_error(self, error: str) -> bool:
+        self.codex_status_label.set_text(f"Codex action failed: {compact_error(error)}")
+        return False
+
+    def finish_codex_action_success(self, action: str) -> bool:
+        self.codex_status_label.set_text(f"Codex {action} sent.")
+        self.refresh_codex_status(force=True)
+        return False
+
     def load_asr_config_controls(self) -> None:
         values = env_config(MAPPER_ASR_CONFIG, default_asr_config())
         for key, widget in self.asr_controls.items():
@@ -3161,8 +3951,14 @@ class UConsoleHelperWindow(Gtk.Window):
         for key, switch in led_controls.items():
             values[key] = "1" if switch.get_active() else "0"
         values.setdefault("MCU_LED_BATTERY_ENABLED", config.get("MCU_LED_BATTERY_ENABLED", "1"))
-        values.setdefault("MCU_LED_LXTERMINAL_BELL_ENABLED", config.get("MCU_LED_LXTERMINAL_BELL_ENABLED", "1"))
         values.setdefault("MCU_LED_NIGHT_MODE_ENABLED", config.get("MCU_LED_NIGHT_MODE_ENABLED", "1"))
+        values.setdefault("MCU_LED_CODEX_ENABLED", config.get("MCU_LED_CODEX_ENABLED", "0"))
+        values.setdefault("MCU_LED_BRIGHTNESS_AUTO", config.get("MCU_LED_BRIGHTNESS_AUTO", "0"))
+        brightness_spin = getattr(self, "mcu_led_brightness_spin", None)
+        if brightness_spin is not None:
+            values["MCU_LED_BRIGHTNESS_PERCENT"] = str(int(brightness_spin.get_value()))
+        else:
+            values.setdefault("MCU_LED_BRIGHTNESS_PERCENT", config.get("MCU_LED_BRIGHTNESS_PERCENT", "30"))
         return values
 
     def run_systemctl(self, args: list[str], title: str) -> subprocess.CompletedProcess[str]:
@@ -3453,6 +4249,207 @@ def card_box() -> Gtk.Box:
     box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
     box.get_style_context().add_class("card")
     return box
+
+
+def clear_box(box: Gtk.Box) -> None:
+    for child in list(box.get_children()):
+        box.remove(child)
+
+
+def replace_style_classes(widget: Gtk.Widget, classes: set[str], active: str) -> None:
+    context = widget.get_style_context()
+    for item in classes:
+        context.remove_class(item)
+    if active:
+        context.add_class(active)
+
+
+def codex_chip(label: str, style_class: str) -> Gtk.Label:
+    chip = Gtk.Label(label=label)
+    chip.set_xalign(0.5)
+    chip.get_style_context().add_class("codex-chip")
+    chip.get_style_context().add_class(style_class)
+    return chip
+
+
+def codex_action_button(label: str, style_class: str) -> Gtk.Button:
+    button = Gtk.Button(label=label)
+    button.set_relief(Gtk.ReliefStyle.NONE)
+    button.get_style_context().add_class("codex-chip")
+    button.get_style_context().add_class("codex-chip-button")
+    button.get_style_context().add_class(style_class)
+    return button
+
+
+def codex_markdown_widget(markdown_text: str) -> Gtk.Box:
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+    box.set_hexpand(True)
+    box.get_style_context().add_class("codex-markdown")
+    in_code = False
+    code_lines: list[str] = []
+
+    def flush_code() -> None:
+        nonlocal code_lines
+        if not code_lines:
+            return
+        code = Gtk.Label(label="\n".join(code_lines), xalign=0)
+        code.set_selectable(True)
+        code.set_line_wrap(False)
+        code.get_style_context().add_class("codex-markdown-code")
+        box.pack_start(code, False, False, 0)
+        code_lines = []
+
+    lines = markdown_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    index = 0
+    while index < len(lines):
+        raw_line = lines[index]
+        line = raw_line.rstrip()
+        if line.strip().startswith("```"):
+            if in_code:
+                flush_code()
+                in_code = False
+            else:
+                in_code = True
+                code_lines = []
+            index += 1
+            continue
+        if in_code:
+            code_lines.append(raw_line)
+            index += 1
+            continue
+        if not line.strip():
+            index += 1
+            continue
+        if codex_markdown_table_starts(lines, index):
+            table_lines = [lines[index], lines[index + 1]]
+            index += 2
+            while index < len(lines) and codex_markdown_table_row(lines[index]):
+                table_lines.append(lines[index])
+                index += 1
+            box.pack_start(codex_markdown_table_widget(table_lines), False, False, 0)
+            continue
+
+        css_class = "codex-markdown"
+        text = line.strip()
+        if text.startswith("#"):
+            text = text.lstrip("#").strip()
+            css_class = "codex-markdown-heading"
+        elif text.startswith(">"):
+            text = text.lstrip(">").strip()
+            css_class = "codex-markdown-quote"
+        elif re.match(r"^[-*+]\s+", text):
+            text = "• " + re.sub(r"^[-*+]\s+", "", text)
+        elif re.match(r"^\d+[.)]\s+", text):
+            text = re.sub(r"^(\d+)[.)]\s+", r"\1. ", text)
+
+        label = Gtk.Label(xalign=0)
+        label.set_line_wrap(True)
+        label.set_selectable(True)
+        label.set_markup(codex_markdown_inline_markup(text))
+        label.get_style_context().add_class(css_class)
+        box.pack_start(label, False, False, 0)
+        index += 1
+
+    flush_code()
+    return box
+
+
+def codex_markdown_inline_markup(text: str) -> str:
+    placeholders: list[str] = []
+
+    def stash(value: str) -> str:
+        placeholders.append(value)
+        return f"\u0000{len(placeholders) - 1}\u0000"
+
+    escaped = escape(text)
+    escaped = re.sub(r"`([^`]+)`", lambda match: stash(f'<span font_family="monospace" foreground="#61d6d6"><b>{match.group(1)}</b></span>'), escaped)
+    escaped = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", escaped)
+    escaped = re.sub(r"__([^_]+)__", r"<b>\1</b>", escaped)
+    escaped = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<i>\1</i>", escaped)
+    escaped = re.sub(r"(?<!_)_([^_]+)_(?!_)", r"<i>\1</i>", escaped)
+    escaped = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<span foreground="#61d6d6" underline="single">\1</span>', escaped)
+    for index, value in enumerate(placeholders):
+        escaped = escaped.replace(f"\u0000{index}\u0000", value)
+    return escaped
+
+
+def codex_markdown_table_row(line: str) -> bool:
+    text = line.strip()
+    return text.startswith("|") and text.endswith("|") and text.count("|") >= 2
+
+
+def codex_markdown_table_separator(line: str) -> bool:
+    if not codex_markdown_table_row(line):
+        return False
+    cells = codex_markdown_table_cells(line)
+    if not cells:
+        return False
+    return all(re.fullmatch(r":?-{3,}:?", cell.strip()) for cell in cells)
+
+
+def codex_markdown_table_starts(lines: list[str], index: int) -> bool:
+    return (
+        index + 1 < len(lines)
+        and codex_markdown_table_row(lines[index])
+        and codex_markdown_table_separator(lines[index + 1])
+    )
+
+
+def codex_markdown_table_cells(line: str) -> list[str]:
+    text = line.strip()
+    if text.startswith("|"):
+        text = text[1:]
+    if text.endswith("|"):
+        text = text[:-1]
+    cells: list[str] = []
+    current: list[str] = []
+    escaped_pipe = False
+    for char in text:
+        if char == "|" and not escaped_pipe:
+            cells.append("".join(current).strip().replace("\\|", "|"))
+            current = []
+            continue
+        current.append(char)
+        escaped_pipe = char == "\\" and not escaped_pipe
+        if char != "\\":
+            escaped_pipe = False
+    cells.append("".join(current).strip().replace("\\|", "|"))
+    return cells
+
+
+def codex_markdown_table_widget(lines: list[str]) -> Gtk.Widget:
+    headers = codex_markdown_table_cells(lines[0])
+    rows = [codex_markdown_table_cells(line) for line in lines[2:]]
+    column_count = max([len(headers), *(len(row) for row in rows)] or [0])
+    grid = Gtk.Grid(column_spacing=14, row_spacing=6)
+    grid.set_hexpand(True)
+    grid.get_style_context().add_class("codex-markdown")
+    for column, text in enumerate(headers):
+        label = codex_markdown_table_label(text, "codex-markdown-table-header")
+        grid.attach(label, column, 0, 1, 1)
+    for row_index, row in enumerate(rows, start=1):
+        for column in range(column_count):
+            text = row[column] if column < len(row) else ""
+            label = codex_markdown_table_label(text, "codex-markdown-table-cell")
+            grid.attach(label, column, row_index, 1, 1)
+    scroll = Gtk.ScrolledWindow()
+    scroll.set_hexpand(True)
+    scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
+    if hasattr(scroll, "set_propagate_natural_height"):
+        scroll.set_propagate_natural_height(True)
+    scroll.add(grid)
+    return scroll
+
+
+def codex_markdown_table_label(text: str, css_class: str) -> Gtk.Label:
+    label = Gtk.Label(xalign=0, yalign=0)
+    label.set_line_wrap(False)
+    label.set_ellipsize(Pango.EllipsizeMode.NONE)
+    label.set_min_width_chars(min(max(len(text), 8), 32))
+    label.set_selectable(True)
+    label.set_markup(codex_markdown_inline_markup(text))
+    label.get_style_context().add_class(css_class)
+    return label
 
 
 def dashboard_card(title: str) -> Gtk.Box:
@@ -3934,8 +4931,12 @@ def power_policy_config_text(values: dict[str, str]) -> str:
             "",
             "### MCU LED behavior --- [1|0]",
             f"MCU_LED_BATTERY_ENABLED={values['MCU_LED_BATTERY_ENABLED']}",
-            f"MCU_LED_LXTERMINAL_BELL_ENABLED={values['MCU_LED_LXTERMINAL_BELL_ENABLED']}",
             f"MCU_LED_NIGHT_MODE_ENABLED={values['MCU_LED_NIGHT_MODE_ENABLED']}",
+            f"MCU_LED_CODEX_ENABLED={values['MCU_LED_CODEX_ENABLED']}",
+            f"MCU_LED_BRIGHTNESS_AUTO={values['MCU_LED_BRIGHTNESS_AUTO']}",
+            "",
+            "### MCU_LED_BRIGHTNESS_PERCENT --- [0~100]",
+            f"MCU_LED_BRIGHTNESS_PERCENT={values['MCU_LED_BRIGHTNESS_PERCENT']}",
             "",
         ]
     )
@@ -6066,8 +7067,10 @@ def helper_service_config() -> dict[str, str]:
         "POWERSAVER_CPU_POLICY_PATH": "/sys/devices/system/cpu/cpufreq/policy0",
         "POWERSAVER_POWER_SUPPLY_DIR": "/sys/class/power_supply",
         "MCU_LED_BATTERY_ENABLED": "1",
-        "MCU_LED_LXTERMINAL_BELL_ENABLED": "1",
         "MCU_LED_NIGHT_MODE_ENABLED": "1",
+        "MCU_LED_CODEX_ENABLED": "0",
+        "MCU_LED_BRIGHTNESS_AUTO": "0",
+        "MCU_LED_BRIGHTNESS_PERCENT": "30",
     }
     if not SERVICE_CONFIG.exists():
         return defaults
@@ -6866,6 +7869,596 @@ def http_json(url: str, headers: dict[str, str] | None = None, data: bytes | Non
     request = urllib.request.Request(url, data=data, headers=headers or {})
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8", errors="replace"))
+
+
+def codex_default_config() -> dict[str, object]:
+    return {
+        "listen": {"host": "127.0.0.1", "port": 8787},
+        "remote_servers": [],
+        "uconsole": {"server_url": "http://127.0.0.1:8787"},
+    }
+
+
+def codex_load_config() -> dict[str, object]:
+    if not CODEX_BUDDY_CONFIG.exists():
+        return codex_default_config()
+    try:
+        data = json.loads(CODEX_BUDDY_CONFIG.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return codex_default_config()
+    if not isinstance(data, dict):
+        return codex_default_config()
+    default = codex_default_config()
+    for key, value in default.items():
+        data.setdefault(key, value)
+    if not isinstance(data.get("uconsole"), dict):
+        data["uconsole"] = default["uconsole"]
+    if not isinstance(data.get("remote_servers"), list):
+        data["remote_servers"] = []
+    return data
+
+
+def codex_save_config(config: dict[str, object]) -> None:
+    CODEX_BUDDY_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    CODEX_BUDDY_CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def codex_valid_base_url(value: str) -> bool:
+    parsed = urllib.parse.urlparse(value.strip())
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def codex_normalized_server_name(name: str, base_url: str) -> str:
+    name = name.strip()
+    if name:
+        return name
+    parsed = urllib.parse.urlparse(base_url)
+    host = (parsed.hostname or "").lower()
+    if host in {"127.0.0.1", "localhost", "::1"}:
+        return "Local"
+    if host.startswith("dgx") or ".dgx" in host:
+        return "Dgx"
+    return parsed.netloc or base_url
+
+
+def codex_server_id(value: str) -> str:
+    value = value.strip()
+    return value if value else f"srv-{time.time_ns()}"
+
+
+def codex_configured_servers() -> list[dict[str, object]]:
+    config = codex_load_config()
+    servers: list[dict[str, object]] = []
+    seen: set[str] = set()
+    local_url = "http://127.0.0.1:8787"
+    servers.append({"id": "local", "name": "Local", "base_url": local_url, "built_in": "local"})
+    seen.add(local_url)
+    uconsole = config.get("uconsole")
+    if isinstance(uconsole, dict):
+        uconsole_url = str(uconsole.get("server_url") or "").strip().rstrip("/")
+        if uconsole_url and codex_valid_base_url(uconsole_url) and uconsole_url not in seen:
+            seen.add(uconsole_url)
+            servers.append(
+                {
+                    "id": codex_server_id("uconsole"),
+                    "name": codex_normalized_server_name(str(uconsole.get("server_name") or ""), uconsole_url),
+                    "base_url": uconsole_url,
+                }
+            )
+    for item in config.get("remote_servers", []):
+        if not isinstance(item, dict):
+            continue
+        base_url = str(item.get("base_url") or "").strip().rstrip("/")
+        if not base_url or not codex_valid_base_url(base_url) or base_url in seen:
+            continue
+        seen.add(base_url)
+        servers.append(
+            {
+                "id": codex_server_id(str(item.get("id") or "")),
+                "name": codex_normalized_server_name(str(item.get("name") or ""), base_url),
+                "base_url": base_url,
+            }
+        )
+    return servers
+
+
+def codex_save_servers(servers: list[dict[str, str]]) -> None:
+    config = codex_load_config()
+    normalized: list[dict[str, str]] = []
+    seen: set[str] = set()
+    primary_url = ""
+    for item in servers:
+        base_url = item.get("base_url", "").strip().rstrip("/")
+        if not base_url or not codex_valid_base_url(base_url) or base_url in seen:
+            continue
+        seen.add(base_url)
+        if not primary_url:
+            primary_url = base_url
+        normalized.append(
+            {
+                "id": codex_server_id(item.get("id", "")),
+                "name": codex_normalized_server_name(item.get("name", ""), base_url),
+                "base_url": base_url,
+            }
+        )
+    uconsole = config.get("uconsole")
+    if not isinstance(uconsole, dict):
+        uconsole = {}
+    if primary_url:
+        uconsole["server_url"] = primary_url
+        uconsole["server_name"] = normalized[0]["name"]
+    config["uconsole"] = uconsole
+    config["remote_servers"] = normalized[1:] if primary_url else []
+    codex_save_config(config)
+
+
+def codex_status_data(servers: list[dict[str, str]]) -> dict[str, object]:
+    if not servers:
+        servers = [{"id": "", "name": "Local", "base_url": "http://127.0.0.1:8787"}]
+    sessions: list[dict[str, object]] = []
+    notifications: list[dict[str, object]] = []
+    connected = 0
+    connected_servers: list[str] = []
+    errors: list[str] = []
+    for server in servers:
+        base_url = server.get("base_url", "").strip().rstrip("/")
+        server_id = str(server.get("id") or "")
+        name = codex_normalized_server_name(server.get("name", ""), base_url)
+        try:
+            data = http_json(f"{base_url}/v1/status", headers={"Accept": "application/json"}, timeout=4)
+        except Exception as exc:
+            errors.append(f"{name}: {compact_error(str(exc))}")
+            continue
+        if not isinstance(data, dict):
+            errors.append(f"{name}: invalid response")
+            continue
+        connected += 1
+        connected_servers.extend([server_id, base_url])
+        server["server_time"] = str(data.get("server_time") or "")
+        overall_state = str(data.get("overall_state") or "")
+        if overall_state:
+            server["overall_state"] = overall_state
+        raw_sessions = data.get("sessions", [])
+        server_session_states: dict[str, str] = {}
+        if isinstance(raw_sessions, list):
+            for session in raw_sessions:
+                if isinstance(session, dict):
+                    row = dict(session)
+                    row["server_id"] = server_id
+                    row["server_name"] = name
+                    row["server_url"] = base_url
+                    session_id = str(row.get("session_id") or "")
+                    if session_id:
+                        server_session_states[session_id] = str(row.get("state") or "").lower()
+                    sessions.append(row)
+        try:
+            notification_data = http_json(f"{base_url}/v1/notifications", headers={"Accept": "application/json"}, timeout=4)
+        except Exception as exc:
+            errors.append(f"{name} notifications: {compact_error(str(exc))}")
+            continue
+        if isinstance(notification_data, dict):
+            raw_notifications = notification_data.get("notifications", [])
+            if isinstance(raw_notifications, list):
+                for notification in raw_notifications:
+                    if isinstance(notification, dict):
+                        notification_session_id = str(notification.get("session_id") or "")
+                        if server_session_states.get(notification_session_id) in {"idle", "ready"}:
+                            continue
+                        row = dict(notification)
+                        row["server_id"] = server_id
+                        row["server_name"] = name
+                        row["server_url"] = base_url
+                        notifications.append(row)
+    sessions.sort(key=lambda item: (codex_state_rank(str(item.get("state") or "")), str(item.get("updated_at") or "")), reverse=True)
+    notifications.sort(
+        key=lambda item: (
+            codex_notification_rank(str(item.get("state") or ""), str(item.get("kind") or "")),
+            str(item.get("updated_at") or ""),
+        ),
+        reverse=True,
+    )
+    if connected:
+        summary = f"{connected}/{len(servers)} servers connected, {len(notifications)} notifications, {len(sessions)} sessions"
+    else:
+        summary = f"No servers connected ({'; '.join(errors)})" if errors else "No servers configured"
+    return {
+        "summary": summary,
+        "notifications": notifications,
+        "sessions": sessions,
+        "errors": errors,
+        "servers": servers,
+        "connected_servers": connected_servers,
+        "overall_state": codex_overall_state(sessions, notifications),
+    }
+
+
+def codex_state_rank(state: str) -> int:
+    return {"error": 50, "blocked": 50, "open": 40, "attention": 40, "running_bash": 30, "running": 25, "run": 25, "idle": 10}.get(state.lower(), 0)
+
+
+def codex_overall_state(sessions: list[dict[str, object]], notifications: list[dict[str, object]]) -> str:
+    if any(str(item.get("kind") or "").lower() == "error" and str(item.get("state") or "").lower() == "pending" for item in notifications):
+        return "error"
+    state = "offline"
+    for session in sessions:
+        candidate = str(session.get("state") or "").lower()
+        if candidate in {"idle", "ready"}:
+            if state == "offline":
+                state = "idle"
+            continue
+        if candidate in {"error", "blocked"}:
+            return "error"
+        if candidate in {"running_bash"}:
+            state = "running_bash"
+        elif candidate in {"run", "running"} and state not in {"running_bash"}:
+            state = "running"
+        elif (candidate in {"open", "attention"} or bool(session.get("needs_open"))) and state not in {"running", "running_bash"}:
+            state = "open"
+    return state
+
+
+def codex_status_line_state(state: str, detail: str = "") -> str:
+    state = state.lower()
+    detail = detail.lower()
+    if state in {"idle", "ready"}:
+        return "Ready"
+    if state == "running_bash" or "bash" in detail:
+        return "Working"
+    if state in {"run", "running"}:
+        return "Thinking"
+    if state in {"error", "blocked"}:
+        return "Error"
+    if state in {"open", "attention"}:
+        return "Ready"
+    return "Offline"
+
+
+def codex_badge_style(signal_state: str) -> tuple[str, str]:
+    return {
+        "goal": ("GOAL", "codex-goal"),
+        "approval": ("APPROVAL", "codex-approval"),
+        "attention": ("OPEN", "codex-ready"),
+        "working": ("RUNNING", "codex-working"),
+    }.get(signal_state, ("READY", "codex-offline"))
+
+
+def codex_session_badge_text(session: dict[str, object]) -> str:
+    if bool(session.get("_codex_dismissed_attention")):
+        return "Closed"
+    state = str(session.get("state") or "").lower()
+    detail = str(session.get("state_detail") or "")
+    status = codex_status_line_state(state, detail)
+    if state in {"open", "attention"} or bool(session.get("needs_open")):
+        if bool(session.get("needs_approval")) or str(session.get("open_reason") or "").lower() == "approval":
+            return "Approval"
+        return "OPEN"
+    return status if status != "Offline" else "Offline"
+
+
+def codex_state_chip_class(state: str, detail: str) -> str:
+    status = codex_status_line_state(state, detail)
+    state_value = state.lower()
+    detail_value = detail.lower()
+    if state_value in {"open", "attention"}:
+        if "approval" in detail_value or "permission" in detail_value:
+            return "codex-chip-approval"
+        return "codex-chip-open"
+    return {
+        "Ready": "codex-chip-ready",
+        "Thinking": "codex-chip-thinking",
+        "Working": "codex-chip-working",
+        "Error": "codex-chip-error",
+    }.get(status, "codex-chip-offline")
+
+
+def codex_server_chip_class(server_id: str, base_url: str, connected_servers: set[str] | None = None) -> str:
+    server_id = server_id.strip()
+    base_url = base_url.strip().rstrip("/")
+    if connected_servers is not None and server_id != "local" and server_id not in connected_servers and base_url not in connected_servers:
+        return "codex-chip-offline"
+    if server_id == "local" or codex_is_loopback_url(base_url):
+        return "codex-chip-local"
+    return codex_source_chip_class(server_id or base_url)
+
+
+def codex_is_loopback_url(value: str) -> bool:
+    host = (urllib.parse.urlparse(value).hostname or "").lower()
+    return host in {"127.0.0.1", "localhost", "::1"}
+
+
+def codex_source_chip_class(value: str) -> str:
+    palette = ["codex-chip-source-a", "codex-chip-source-b", "codex-chip-source-c", "codex-chip-source-d"]
+    return palette[sum(value.encode("utf-8")) % len(palette)] if value else "codex-chip-source-a"
+
+
+def codex_session_signal_state(session: dict[str, object]) -> str:
+    if bool(session.get("_codex_dismissed_attention")):
+        return "off"
+    state = str(session.get("state") or "").lower()
+    detail = str(session.get("state_detail") or "").lower()
+    reason = str(session.get("open_reason") or "").lower()
+    goal_state = str(session.get("goal_state") or "").lower()
+    if goal_state in {"achieved", "complete", "completed", "done", "success", "succeeded"}:
+        return "goal"
+    if bool(session.get("needs_approval")) or reason == "approval":
+        return "approval"
+    if "permissionrequest" in detail or "permission request" in detail:
+        return "approval"
+    if codex_needs_attention(session) and state not in {"run", "running", "running_bash"}:
+        return "attention"
+    if state in {"run", "running", "running_bash"}:
+        return "working"
+    return "off"
+
+
+def codex_attention_session_sort_key(session: dict[str, object]) -> tuple[int, str]:
+    priority = {"approval": 20, "attention": 10}
+    return (priority.get(codex_session_signal_state(session), 0), str(session.get("updated_at") or ""))
+
+
+def codex_session_list_sort_key(session: dict[str, object]) -> tuple[int, str]:
+    priority = {"working": 30, "goal": 20, "off": 10, "attention": 5, "approval": 5}
+    return (priority.get(codex_session_signal_state(session), 0), str(session.get("updated_at") or ""))
+
+
+def codex_aggregate_signal_state(sessions: list[dict[str, object]]) -> str:
+    state = "off"
+    for session in sessions:
+        state = codex_stronger_signal_state(state, codex_session_signal_state(session))
+    return state
+
+
+def codex_stronger_signal_state(current: str, candidate: str) -> str:
+    priority = {"off": 0, "working": 10, "attention": 20, "approval": 30, "goal": 40}
+    return candidate if priority.get(candidate, 0) > priority.get(current, 0) else current
+
+
+def codex_signal_dot_class(state: str) -> str:
+    return {
+        "goal": "codex-signal-goal",
+        "approval": "codex-signal-approval",
+        "attention": "codex-signal-attention",
+        "working": "codex-signal-working",
+        "off": "codex-signal-off",
+        "closed": "codex-signal-off",
+        "close": "codex-signal-off",
+    }.get(state, "codex-signal-off")
+
+
+def codex_signal_chip_class(state: str) -> str:
+    return {
+        "goal": "codex-chip-goal",
+        "approval": "codex-chip-approval",
+        "attention": "codex-chip-attention",
+        "working": "codex-chip-working",
+    }.get(state, "codex-chip-offline")
+
+
+def codex_session_key(session: dict[str, object]) -> str:
+    server_url = str(session.get("server_url") or "").strip().rstrip("/")
+    session_id = str(session.get("session_id") or "").strip()
+    if not session_id:
+        return ""
+    return f"{server_url}|{session_id}"
+
+
+def codex_load_dismissed_sessions(path: Path = CODEX_DISMISSED_SESSIONS) -> dict[str, object]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    result: dict[str, object] = {}
+    for key, value in data.items():
+        if isinstance(value, dict):
+            result[str(key)] = value
+            continue
+        try:
+            result[str(key)] = {"dismissed_at": float(value)}
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def codex_save_dismissed_sessions(items: dict[str, object], path: Path = CODEX_DISMISSED_SESSIONS) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(items, sort_keys=True), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def codex_prune_dismissed_sessions(items: dict[str, object], sessions: list[dict[str, object]]) -> dict[str, object]:
+    sessions_by_key = {codex_session_key(session): session for session in sessions if codex_session_key(session)}
+    pruned: dict[str, object] = {}
+    for key, value in items.items():
+        session = sessions_by_key.get(key)
+        if session is None or not codex_needs_attention(session):
+            continue
+        if codex_session_dismissed_matches(session, value):
+            pruned[key] = value
+    if len(pruned) != len(items):
+        codex_save_dismissed_sessions(pruned)
+    return pruned
+
+
+def codex_session_dismissed(session: dict[str, object], dismissed: dict[str, object]) -> bool:
+    key = codex_session_key(session)
+    return bool(key and key in dismissed and codex_session_dismissed_matches(session, dismissed[key]))
+
+
+def codex_session_dismiss_fingerprint(session: dict[str, object]) -> dict[str, object]:
+    return {
+        "dismissed_at": time.time(),
+        "state": str(session.get("state") or ""),
+        "state_detail": str(session.get("state_detail") or ""),
+        "updated_at": str(session.get("updated_at") or ""),
+        "open_reason": str(session.get("open_reason") or ""),
+        "needs_approval": bool(session.get("needs_approval")),
+        "needs_open": bool(session.get("needs_open")),
+    }
+
+
+def codex_session_dismissed_matches(session: dict[str, object], dismissed_value: object) -> bool:
+    if not isinstance(dismissed_value, dict):
+        return True
+    if "state" not in dismissed_value and "updated_at" not in dismissed_value:
+        return True
+    return all(
+        dismissed_value.get(key) == codex_session_dismiss_fingerprint(session).get(key)
+        for key in ("state", "state_detail", "updated_at", "open_reason", "needs_approval", "needs_open")
+    )
+
+
+def codex_is_open_session(session: dict[str, object]) -> bool:
+    return codex_needs_attention(session)
+
+
+def codex_needs_attention(session: dict[str, object]) -> bool:
+    state = str(session.get("state") or "").lower()
+    if state in {"idle", "ready", "run", "running", "running_bash"}:
+        return False
+    return bool(session.get("needs_approval")) or bool(session.get("needs_open")) or bool(str(session.get("open_reason") or "").strip())
+
+
+def codex_session_title(session: dict[str, object]) -> str:
+    return str(session.get("display_title") or session.get("short_session_id") or session.get("session_id") or "unknown")
+
+
+def codex_session_title_markup(session: dict[str, object]) -> str:
+    title = escape(codex_session_title(session))
+    session_id = str(session.get("short_session_id") or session.get("session_id") or "").strip()
+    if not session_id:
+        return title
+    return f'{title} <span foreground="#9aa0a6" weight="normal">{escape(session_id)}</span>'
+
+
+def codex_session_summary(session: dict[str, object], fallback: str = "") -> str:
+    return str(
+        session.get("open_summary_markdown")
+        or session.get("open_summary")
+        or session.get("summary_markdown")
+        or session.get("summary")
+        or session.get("compact_open_summary")
+        or session.get("compact_summary")
+        or fallback
+        or ""
+    )
+
+
+def codex_session_fallback_summary(session: dict[str, object], open_style: bool) -> str:
+    if open_style:
+        return "Waiting for approval"
+    state = str(session.get("state") or "").lower()
+    detail = str(session.get("state_detail") or "").lower()
+    if state == "running_bash" or detail == "running_bash":
+        return "Working"
+    if state in {"run", "running"}:
+        return "Thinking"
+    return ""
+
+
+def codex_open_session_action_hint(session: dict[str, object]) -> str:
+    available: list[str] = []
+    if bool(session.get("can_continue")):
+        available.append("Continue")
+    if bool(session.get("can_close")):
+        available.append("Close")
+    if str(session.get("tmux_pane") or "").strip():
+        available.append("Jump")
+    if not available:
+        return "No open-session actions are available"
+    return "Hold " + "  |  ".join(available)
+
+
+def codex_settings_summary(servers: list[dict[str, object]]) -> str:
+    return f"Local runtime is always available. {len(servers)} remote server{plural_suffix(len(servers))} configured."
+
+
+def codex_relative_time(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "-"
+    try:
+        parsed = datetime_from_iso(text)
+    except ValueError:
+        return codex_updated_label(text)
+    delta = max(0, int(time.time() - parsed))
+    if delta < 60:
+        return "just now"
+    if delta < 3600:
+        return f"{delta // 60}m ago"
+    if delta < 86400:
+        return f"{delta // 3600}h ago"
+    return time.strftime("%m-%d %H:%M", time.localtime(parsed))
+
+
+def datetime_from_iso(value: str) -> float:
+    from datetime import datetime
+
+    normalized = value.strip().replace("Z", "+00:00")
+    if "." in normalized:
+        head, tail = normalized.split(".", 1)
+        zone = ""
+        for marker in ("+", "-"):
+            if marker in tail:
+                fraction, zone = tail.split(marker, 1)
+                zone = marker + zone
+                break
+        else:
+            fraction = tail
+        normalized = head + "." + fraction[:6] + zone
+    return datetime.fromisoformat(normalized).timestamp()
+
+
+def plural_suffix(count: int) -> str:
+    return "" if count == 1 else "s"
+
+
+def codex_notification_rank(state: str, kind: str) -> int:
+    score = 0
+    if state.lower() == "pending":
+        score += 100
+    if kind.lower() == "error":
+        score += 10
+    return score
+
+
+def codex_updated_label(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "-"
+    return text.replace("T", " ").replace("Z", "")[:19]
+
+
+def codex_session_action(base_url: str, session_id: str, action: str, action_token: str = "") -> None:
+    if action not in {"continue", "close"}:
+        raise ValueError("unsupported Codex action")
+    payload = json.dumps({"action_token": action_token}).encode("utf-8") if action_token else b"{}"
+    http_json(
+        f"{base_url.rstrip('/')}/v1/sessions/{urllib.parse.quote(session_id)}/{action}",
+        headers={"Content-Type": "application/json"},
+        data=payload,
+        timeout=12,
+    )
+
+
+def codex_notification_action(base_url: str, notification_id: str, action: str, action_token: str = "") -> None:
+    if action == "ack":
+        payload: bytes | None = b"{}"
+        url = f"{base_url.rstrip('/')}/v1/notifications/{urllib.parse.quote(notification_id)}/ack"
+    elif action == "continue":
+        payload = json.dumps({"action": "continue", "action_token": action_token}).encode("utf-8")
+        url = f"{base_url.rstrip('/')}/v1/notifications/{urllib.parse.quote(notification_id)}/action"
+    else:
+        raise ValueError("unsupported Codex notification action")
+    http_json(
+        url,
+        headers={"Content-Type": "application/json"},
+        data=payload,
+        timeout=12,
+    )
 
 
 def cpa_set_auth_file_enabled(base_url: str, management_key: str, name: str, enabled: bool) -> None:
