@@ -39,6 +39,7 @@ AUTO_PICKUP_WAKE_ENABLED = False
 AUTO_BRIGHTNESS_MANUAL_GRACE_SECONDS = 45.0
 AUTO_BRIGHTNESS_APPLY_EVENTS = {"brightness_changed", "light_changed", "screen_on_ack"}
 LED_POWER_POLL_SECONDS = 30
+LED_BEHAVIOR_REFRESH_SECONDS = 60
 TMUX_NOTIFY_POLL_SECONDS = 5
 CODEX_LED_POLL_SECONDS = 5
 CODEX_LED_REQUEST_TIMEOUT_SECONDS = 2
@@ -66,6 +67,7 @@ class McuSerialReader:
         self.led_night_mode_enabled: bool | None = None
         self.led_brightness_percent: int | None = None
         self.led_brightness_auto: bool | None = None
+        self.led_behavior_sent_at = 0.0
         self.codex_led_state: str | None = None
         self.codex_led_sent_at = 0.0
         self.pending_commands: list[str] = []
@@ -79,6 +81,9 @@ class McuSerialReader:
         self.fd = None
         self.path = None
         self.buffer = ""
+        self.reset_device_state()
+
+    def reset_device_state(self) -> None:
         self.lock_timeout_seconds = None
         self.stand_mode = None
         self.led_power_state = None
@@ -88,6 +93,7 @@ class McuSerialReader:
         self.led_night_mode_enabled = None
         self.led_brightness_percent = None
         self.led_brightness_auto = None
+        self.led_behavior_sent_at = 0.0
         self.codex_led_state = None
         self.codex_led_sent_at = 0.0
 
@@ -111,6 +117,8 @@ class McuSerialReader:
             return sample
         sample = read_mcu_sample_from_fd(self.fd, self)
         if sample is not None:
+            if sample.get("event") == "ready":
+                self.reset_device_state()
             self.last_sample_at = time.time()
             return sample
         sample = read_shared_mcu_sample(self)
@@ -166,24 +174,26 @@ class McuSerialReader:
 
     def configure_led_behavior(self, battery_enabled: bool, night_mode_enabled: bool, brightness_percent: int, brightness_auto: bool) -> None:
         brightness_percent = max(0, min(100, brightness_percent))
-        if self.led_brightness_auto is not brightness_auto:
+        now = time.time()
+        refresh = now - self.led_behavior_sent_at >= LED_BEHAVIOR_REFRESH_SECONDS
+        if refresh or self.led_brightness_percent != brightness_percent:
+            command = "led brightness base" if brightness_auto else "led brightness"
+            self.write_command(f"{command} {brightness_percent}")
+            self.led_brightness_percent = brightness_percent
+        if refresh or self.led_brightness_auto is not brightness_auto:
             self.write_command("led brightness auto on" if brightness_auto else "led brightness auto off")
             self.led_brightness_auto = brightness_auto
-        if self.led_brightness_percent != brightness_percent:
-            self.write_command(f"led brightness {brightness_percent}")
-            self.led_brightness_percent = brightness_percent
-            if brightness_auto:
-                self.write_command("led brightness auto on")
-        if self.led_battery_enabled is not battery_enabled:
+        if refresh or self.led_battery_enabled is not battery_enabled:
             self.write_command("led battery on" if battery_enabled else "led battery off")
             self.led_battery_enabled = battery_enabled
         if self.led_notify_enabled is not False:
             self.write_command("led notify off")
             self.write_command("notify clear")
             self.led_notify_enabled = False
-        if self.led_night_mode_enabled is not night_mode_enabled:
+        if refresh or self.led_night_mode_enabled is not night_mode_enabled:
             self.write_command("led night on" if night_mode_enabled else "led night off")
             self.led_night_mode_enabled = night_mode_enabled
+        self.led_behavior_sent_at = now
 
     def configure_codex_led(self, state: str) -> None:
         if state not in {"off", "goal", "approval", "attention", "working"}:
@@ -671,6 +681,8 @@ def codex_session_led_state(session: dict[str, object]) -> str:
         return "approval"
     if "permissionrequest" in detail or "permission request" in detail:
         return "approval"
+    if reason == "followup" and bool(session.get("needs_open")) and not bool(session.get("needs_approval")):
+        return "attention"
     if state not in {"idle", "ready", "run", "running", "running_bash"} and (
         bool(session.get("needs_open")) or bool(str(session.get("open_reason") or "").strip())
     ):
@@ -688,16 +700,53 @@ def codex_session_key(session: dict[str, object]) -> str:
     return f"{server_url}|{session_id}"
 
 
-def codex_load_dismissed_sessions(path: Path = CODEX_DISMISSED_SESSIONS) -> set[str]:
+def codex_load_dismissed_sessions(path: Path = CODEX_DISMISSED_SESSIONS) -> dict[str, object]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return set()
+        return {}
     if isinstance(data, dict):
-        return {str(key) for key in data}
+        result: dict[str, object] = {}
+        for key, value in data.items():
+            if isinstance(value, dict):
+                result[str(key)] = value
+                continue
+            try:
+                result[str(key)] = {"dismissed_at": float(value)}
+            except (TypeError, ValueError):
+                continue
+        return result
     if isinstance(data, list):
-        return {str(item) for item in data}
-    return set()
+        return {str(item): {} for item in data}
+    return {}
+
+
+def codex_session_dismiss_fingerprint(session: dict[str, object]) -> dict[str, object]:
+    return {
+        "state": str(session.get("state") or ""),
+        "state_detail": str(session.get("state_detail") or ""),
+        "updated_at": str(session.get("updated_at") or ""),
+        "open_reason": str(session.get("open_reason") or ""),
+        "needs_approval": bool(session.get("needs_approval")),
+        "needs_open": bool(session.get("needs_open")),
+    }
+
+
+def codex_session_dismissed_matches(session: dict[str, object], dismissed_value: object) -> bool:
+    if not isinstance(dismissed_value, dict):
+        return True
+    if "state" not in dismissed_value and "updated_at" not in dismissed_value:
+        return True
+    current = codex_session_dismiss_fingerprint(session)
+    return all(
+        dismissed_value.get(key) == current.get(key)
+        for key in ("state", "state_detail", "updated_at", "open_reason", "needs_approval", "needs_open")
+    )
+
+
+def codex_session_dismissed(session: dict[str, object], dismissed: dict[str, object]) -> bool:
+    key = codex_session_key(session)
+    return bool(key and key in dismissed and codex_session_dismissed_matches(session, dismissed[key]))
 
 
 def stronger_codex_state(current: str, candidate: str) -> str:
@@ -727,7 +776,7 @@ def aggregate_codex_led_state(values: dict[str, str]) -> str:
                 if isinstance(session, dict):
                     if "server_url" not in session:
                         session = {**session, "server_url": url.rstrip("/")}
-                    if codex_session_key(session) in dismissed_sessions:
+                    if codex_session_dismissed(session, dismissed_sessions):
                         continue
                     aggregate = stronger_codex_state(aggregate, codex_session_led_state(session))
         else:

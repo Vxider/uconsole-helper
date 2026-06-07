@@ -1064,7 +1064,7 @@ class UConsoleHelperWindow(Gtk.Window):
             ("MCU_LED_BATTERY_ENABLED", "Battery", "Show low battery warning only. This has the highest LED priority."),
             ("MCU_LED_NIGHT_MODE_ENABLED", "Night Mode", "Turn off LED indicators when ambient light is below 1 lux."),
             ("MCU_LED_CODEX_ENABLED", "Codex Indicator", "Show aggregated codex-buddy status with vibecoding signal-light colors."),
-            ("MCU_LED_BRIGHTNESS_AUTO", "Auto Brightness", "Adjust LED brightness from ambient light between 5% and 50%."),
+            ("MCU_LED_BRIGHTNESS_AUTO", "Auto Brightness", "Adjust LED brightness from ambient light between 2% and 40%."),
             ("MCU_LED_BRIGHTNESS_PERCENT", "Brightness", "WS2812 brightness percentage."),
         ]
         for index, (key, title, tooltip) in enumerate(led_rows):
@@ -2282,9 +2282,9 @@ class UConsoleHelperWindow(Gtk.Window):
         elif page == "codex":
             if reload_config or not self.codex_loaded_once:
                 self.load_codex_servers()
-            if reload_config:
+            if reload_config or not self.codex_loaded_once:
                 self.refresh_codex_status(force=True)
-            elif not self.codex_loaded_once:
+            else:
                 self.refresh_codex_status(force=True)
         elif page == "cpa":
             if reload_config or not self.cpa_loaded_once:
@@ -2370,9 +2370,6 @@ class UConsoleHelperWindow(Gtk.Window):
         if self.stack.get_visible_child_name() == "codex":
             if key_lower == "a":
                 self.codex_ack_primary_notification()
-                return True
-            if key_lower == "c":
-                self.codex_continue_primary_notification()
                 return True
             if key_lower == "s":
                 self.toggle_codex_settings()
@@ -8127,10 +8124,10 @@ def codex_session_badge_text(session: dict[str, object]) -> str:
         return "Closed"
     state = str(session.get("state") or "").lower()
     detail = str(session.get("state_detail") or "")
+    if codex_session_signal_state(session) == "approval":
+        return "Approval"
     status = codex_status_line_state(state, detail)
     if state in {"open", "attention"} or bool(session.get("needs_open")):
-        if bool(session.get("needs_approval")) or str(session.get("open_reason") or "").lower() == "approval":
-            return "Approval"
         return "OPEN"
     return status if status != "Offline" else "Offline"
 
@@ -8184,6 +8181,8 @@ def codex_session_signal_state(session: dict[str, object]) -> str:
         return "approval"
     if "permissionrequest" in detail or "permission request" in detail:
         return "approval"
+    if reason == "followup" and bool(session.get("needs_open")) and not bool(session.get("needs_approval")):
+        return "attention"
     if codex_needs_attention(session) and state not in {"run", "running", "running_bash"}:
         return "attention"
     if state in {"run", "running", "running_bash"}:

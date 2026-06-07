@@ -68,8 +68,8 @@ static const uint8_t VEML7700_REG_ALS_CONF = 0x00;
 static const uint8_t VEML7700_REG_ALS_DATA = 0x04;
 static const uint16_t VEML7700_ALS_CONF = 0x0000;  // gain x1, 100 ms integration, ALS on.
 static const uint8_t DEFAULT_WS2812_BRIGHTNESS_PERCENT = 30;
-static const uint8_t AUTO_WS2812_BRIGHTNESS_MIN_PERCENT = 5;
-static const uint8_t AUTO_WS2812_BRIGHTNESS_MAX_PERCENT = 50;
+static const uint8_t AUTO_WS2812_BRIGHTNESS_MIN_PERCENT = 2;
+static const uint8_t AUTO_WS2812_BRIGHTNESS_MAX_PERCENT = 40;
 static const float VEML7700_LUX_PER_COUNT = 0.0576f;
 static const uint32_t LIGHT_SAMPLE_INTERVAL_MS = 1000;
 static const float LIGHT_SMOOTH_ALPHA = 0.18f;
@@ -198,19 +198,19 @@ static uint8_t led_brightness_percent_from_lux(float lux) {
     return AUTO_WS2812_BRIGHTNESS_MIN_PERCENT;
   }
   if (lux < 5.0f) {
-    return 8;
+    return 5;
   }
   if (lux < 20.0f) {
-    return 14;
+    return 10;
   }
   if (lux < 80.0f) {
-    return 22;
+    return 16;
   }
   if (lux < 200.0f) {
-    return 32;
+    return 25;
   }
   if (lux < 500.0f) {
-    return 42;
+    return 33;
   }
   return AUTO_WS2812_BRIGHTNESS_MAX_PERCENT;
 }
@@ -981,6 +981,10 @@ static void handle_command(const Sample &sample) {
     last_led_color = UINT32_MAX;
     update_status_pixel();
     print_status("led_brightness_auto_off", sample);
+  } else if (command.startsWith("led brightness base ")) {
+    const int percent = command.substring(20).toInt();
+    ws2812_brightness_percent = constrain(percent, 0, 100);
+    print_status("led_brightness_base_ack", sample);
   } else if (command.startsWith("led brightness ")) {
     const int percent = command.substring(15).toInt();
     ws2812_brightness_percent = constrain(percent, 0, 100);
@@ -1014,7 +1018,7 @@ static void handle_command(const Sample &sample) {
     update_mic_power(millis());
     print_status("mic_assist_off", sample);
   } else if (command == "help") {
-    Serial.println("{\"commands\":[\"status\",\"sample\",\"calibrate pose\",\"screen on\",\"screen off\",\"lock timeout <seconds>\",\"stand mode on\",\"stand mode off\",\"power ac\",\"power battery\",\"battery <percent> <charging|discharging|full>\",\"led battery on\",\"led battery off\",\"led notify on\",\"led notify off\",\"led night on\",\"led night off\",\"led brightness <0-100>\",\"led brightness auto on\",\"led brightness auto off\",\"led codex <off|goal|approval|attention|working>\",\"notify tmux\",\"notify clear\",\"mic assist on\",\"mic assist off\",\"stream on\",\"stream off\",\"help\"]}");
+    Serial.println("{\"commands\":[\"status\",\"sample\",\"calibrate pose\",\"screen on\",\"screen off\",\"lock timeout <seconds>\",\"stand mode on\",\"stand mode off\",\"power ac\",\"power battery\",\"battery <percent> <charging|discharging|full>\",\"led battery on\",\"led battery off\",\"led notify on\",\"led notify off\",\"led night on\",\"led night off\",\"led brightness <0-100>\",\"led brightness base <0-100>\",\"led brightness auto on\",\"led brightness auto off\",\"led codex <off|goal|approval|attention|working>\",\"notify tmux\",\"notify clear\",\"mic assist on\",\"mic assist off\",\"stream on\",\"stream off\",\"help\"]}");
   }
 }
 
