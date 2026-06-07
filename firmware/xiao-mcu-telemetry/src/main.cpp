@@ -25,7 +25,7 @@ static const uint32_t LIGHT_REPORT_BOOT_GRACE_MS = 5000;
 static const uint32_t VEML7700_STARTUP_MS = 120;
 static const uint32_t BRIGHTNESS_REPORT_MIN_INTERVAL_MS = 2500;
 static const uint32_t BRIGHTNESS_CHANGE_STABLE_MS = 2500;
-static const uint32_t LIGHT_PEAK_STABLE_MS = 2500;
+static const uint32_t LIGHT_OUTLIER_STABLE_MS = 2500;
 static const uint32_t ORIENTATION_STABLE_MS = 700;
 static const uint32_t PICKUP_REST_MIN_MS = 900;
 static const uint32_t PICKUP_SEQUENCE_WINDOW_MS = 1600;
@@ -41,7 +41,6 @@ static const uint32_t LED_TMUX_NOTIFY_MS = 600000;
 static const uint32_t LED_TMUX_DOUBLE_FLASH_PERIOD_MS = 3000;
 static const uint32_t LED_CODEX_FLASH_PERIOD_MS = 1400;
 static const uint32_t LED_CODEX_FLASH_ON_MS = 820;
-static const uint32_t LED_LIGHT_SENSOR_GUARD_MS = 2200;
 static const uint32_t LED_AUTO_BRIGHTNESS_STEP_MS = 1000;
 static const uint8_t LED_AUTO_BRIGHTEN_STEP_PERCENT = 2;
 static const uint8_t LED_AUTO_DARKEN_STEP_PERCENT = 8;
@@ -69,7 +68,8 @@ static const uint8_t VEML7700_REG_ALS_CONF = 0x00;
 static const uint8_t VEML7700_REG_ALS_DATA = 0x04;
 static const uint16_t VEML7700_ALS_CONF = 0x0000;  // gain x1, 100 ms integration, ALS on.
 static const uint8_t DEFAULT_WS2812_BRIGHTNESS_PERCENT = 30;
-static const uint8_t AUTO_WS2812_BRIGHTNESS_MAX_PERCENT = 70;
+static const uint8_t AUTO_WS2812_BRIGHTNESS_MIN_PERCENT = 5;
+static const uint8_t AUTO_WS2812_BRIGHTNESS_MAX_PERCENT = 50;
 static const float VEML7700_LUX_PER_COUNT = 0.0576f;
 static const uint32_t LIGHT_SAMPLE_INTERVAL_MS = 1000;
 static const float LIGHT_SMOOTH_ALPHA = 0.18f;
@@ -78,7 +78,7 @@ static const float LIGHT_REPORT_SMALL_DELTA_LUX = 6.0f;
 static const float LIGHT_REPORT_LARGE_RATIO = 0.45f;
 static const float LIGHT_PEAK_RATIO = 1.20f;
 static const float LIGHT_SPIKE_RATIO = 3.5f;
-static const uint8_t LIGHT_ZERO_REINIT_SAMPLES = 3;
+static const uint8_t LIGHT_ZERO_REINIT_SAMPLES = 8;
 static const uint8_t LIGHT_ZERO_STABLE_SAMPLES = 3;
 static const char *POSE_CALIBRATION_FILE = "/uconsole_pose.txt";
 
@@ -123,7 +123,6 @@ static String battery_status = "unknown";
 static String codex_led_state = "off";
 static uint32_t tmux_notify_until = 0;
 static uint32_t last_led_color = 0;
-static uint32_t led_visible_until = 0;
 static uint32_t last_led_brightness_step_ms = 0;
 
 static String stable_orientation = "unknown";
@@ -146,7 +145,6 @@ static uint32_t mic_assist_until = 0;
 static uint16_t light_raw = 0;
 static float light_lux = 0.0f;
 static float smoothed_light_lux = 0.0f;
-static float led_ambient_lux = 0.0f;
 static float last_reported_light_lux = -1.0f;
 static float light_report_candidate_lux = 0.0f;
 static float light_spike_candidate_lux = 0.0f;
@@ -157,7 +155,6 @@ static int last_reported_screen_brightness = 0;
 static int brightness_candidate = 0;
 static bool light_sample_valid = false;
 static bool have_smoothed_light = false;
-static bool have_led_ambient_lux = false;
 static bool storage_ready = false;
 
 struct Sample {
@@ -180,9 +177,6 @@ static uint32_t pixel_color(uint8_t red, uint8_t green, uint8_t blue) {
 }
 
 static void set_status_pixel(uint32_t color) {
-  if (color != 0) {
-    led_visible_until = millis() + LED_LIGHT_SENSOR_GUARD_MS;
-  }
   if (color == last_led_color) {
     return;
   }
@@ -201,7 +195,7 @@ static uint32_t scaled_color(uint8_t red, uint8_t green, uint8_t blue, uint8_t b
 
 static uint8_t led_brightness_percent_from_lux(float lux) {
   if (lux < 1.0f) {
-    return 4;
+    return AUTO_WS2812_BRIGHTNESS_MIN_PERCENT;
   }
   if (lux < 5.0f) {
     return 8;
@@ -210,13 +204,13 @@ static uint8_t led_brightness_percent_from_lux(float lux) {
     return 14;
   }
   if (lux < 80.0f) {
-    return 24;
+    return 22;
   }
   if (lux < 200.0f) {
-    return 38;
+    return 32;
   }
   if (lux < 500.0f) {
-    return 55;
+    return 42;
   }
   return AUTO_WS2812_BRIGHTNESS_MAX_PERCENT;
 }
@@ -225,8 +219,11 @@ static uint8_t effective_led_brightness_percent() {
   if (!ws2812_auto_brightness_enabled || !light_ready || !light_sample_valid || !have_smoothed_light) {
     return ws2812_brightness_percent;
   }
-  const float lux = have_led_ambient_lux ? led_ambient_lux : smoothed_light_lux;
-  return min(led_brightness_percent_from_lux(lux), AUTO_WS2812_BRIGHTNESS_MAX_PERCENT);
+  const float lux = smoothed_light_lux;
+  return constrain(
+      led_brightness_percent_from_lux(lux),
+      AUTO_WS2812_BRIGHTNESS_MIN_PERCENT,
+      AUTO_WS2812_BRIGHTNESS_MAX_PERCENT);
 }
 
 static void update_led_brightness_percent() {
@@ -463,8 +460,16 @@ static bool init_light_sensor() {
   return true;
 }
 
+static bool light_sampling_blocked_by_led() {
+  return last_led_color != 0;
+}
+
 static void update_light_sensor(bool force) {
   const uint32_t now = millis();
+  if (light_sampling_blocked_by_led()) {
+    light_sample_valid = have_smoothed_light;
+    return;
+  }
   if (!force && now - last_light_sample_ms < LIGHT_SAMPLE_INTERVAL_MS) {
     return;
   }
@@ -514,7 +519,7 @@ static void update_light_sensor(bool force) {
         light_spike_candidate_lux = light_lux;
         light_spike_candidate_since = now;
       }
-      if (now - light_spike_candidate_since < LIGHT_PEAK_STABLE_MS) {
+      if (now - light_spike_candidate_since < LIGHT_OUTLIER_STABLE_MS) {
         light_sample_valid = true;
         update_brightness_targets();
         return;
@@ -526,13 +531,6 @@ static void update_light_sensor(bool force) {
     smoothed_light_lux += alpha * (light_lux - smoothed_light_lux);
   }
   light_sample_valid = true;
-  if (!have_led_ambient_lux) {
-    led_ambient_lux = smoothed_light_lux;
-    have_led_ambient_lux = true;
-  } else if (now > led_visible_until || smoothed_light_lux < led_ambient_lux) {
-    const float alpha = smoothed_light_lux < led_ambient_lux ? LIGHT_DARKEN_SMOOTH_ALPHA : LIGHT_SMOOTH_ALPHA;
-    led_ambient_lux += alpha * (smoothed_light_lux - led_ambient_lux);
-  }
   update_brightness_targets();
 }
 
@@ -1034,7 +1032,6 @@ void setup() {
   Serial.begin(115200);
   status_pixel.begin();
   status_pixel.setBrightness(255);
-  set_status_pixel(pixel_color(0, 0, 16));
 
   // Do not block on Serial. The GUI may open the port after boot.
   delay(300);
@@ -1044,6 +1041,7 @@ void setup() {
   imu_ready = (imu.begin() == 0);
   light_ready = init_light_sensor();
   update_light_sensor(true);
+  set_status_pixel(pixel_color(0, 0, 16));
   PDM.onReceive(on_pdm_data);
   PDM.setGain(30);
   if (!imu_ready) {

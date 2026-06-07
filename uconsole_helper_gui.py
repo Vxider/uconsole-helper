@@ -1064,7 +1064,7 @@ class UConsoleHelperWindow(Gtk.Window):
             ("MCU_LED_BATTERY_ENABLED", "Battery", "Show low battery warning only. This has the highest LED priority."),
             ("MCU_LED_NIGHT_MODE_ENABLED", "Night Mode", "Turn off LED indicators when ambient light is below 1 lux."),
             ("MCU_LED_CODEX_ENABLED", "Codex Indicator", "Show aggregated codex-buddy status with vibecoding signal-light colors."),
-            ("MCU_LED_BRIGHTNESS_AUTO", "Auto Brightness", "Adjust LED brightness from ambient light. Maximum is 70%."),
+            ("MCU_LED_BRIGHTNESS_AUTO", "Auto Brightness", "Adjust LED brightness from ambient light between 5% and 50%."),
             ("MCU_LED_BRIGHTNESS_PERCENT", "Brightness", "WS2812 brightness percentage."),
         ]
         for index, (key, title, tooltip) in enumerate(led_rows):
