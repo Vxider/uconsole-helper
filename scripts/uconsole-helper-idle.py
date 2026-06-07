@@ -19,7 +19,7 @@ from pathlib import Path
 
 
 CONFIG_FILE = Path(os.environ.get("UCONSOLE_HELPER_CONFIG", "/etc/uconsole-helper/uconsole-helper.conf"))
-CODEX_BUDDY_CONFIG = Path.home() / ".config/codex-buddy/config.json"
+CODEX_HELPER_CONFIG = Path.home() / ".config/uconsole-helper/codex-servers.json"
 CODEX_DISMISSED_SESSIONS = Path.home() / ".cache/uconsole-helper/codex-dismissed-sessions.json"
 POWER_SUPPLY_DIR = Path("/sys/class/power_supply")
 DISPLAY_CONTROL = "/usr/local/bin/uconsole-helper-mapper-display-control"
@@ -625,7 +625,9 @@ def codex_server_urls(values: dict[str, str]) -> list[str]:
     return [item.strip().rstrip("/") for item in raw.replace("\n", ",").replace(" ", ",").split(",") if item.strip()]
 
 
-def codex_server_urls_from_config(path: Path = CODEX_BUDDY_CONFIG) -> list[str]:
+def codex_server_urls_from_config(path: Path | None = None) -> list[str]:
+    if path is None:
+        path = CODEX_HELPER_CONFIG
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -767,7 +769,7 @@ def aggregate_codex_led_state(values: dict[str, str]) -> str:
         try:
             status = load_codex_status(url)
         except (OSError, TimeoutError, ValueError, json.JSONDecodeError, urllib.error.URLError) as exc:
-            print(f"warning: codex-buddy status failed for {url}: {exc}", flush=True)
+            print(f"warning: codex status failed for {url}: {exc}", flush=True)
             continue
         connected = True
         sessions = status.get("sessions")

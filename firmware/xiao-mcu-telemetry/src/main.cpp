@@ -25,7 +25,7 @@ static const uint32_t LIGHT_REPORT_BOOT_GRACE_MS = 5000;
 static const uint32_t VEML7700_STARTUP_MS = 120;
 static const uint32_t BRIGHTNESS_REPORT_MIN_INTERVAL_MS = 2500;
 static const uint32_t BRIGHTNESS_CHANGE_STABLE_MS = 2500;
-static const uint32_t LIGHT_OUTLIER_STABLE_MS = 2500;
+static const uint32_t LIGHT_OUTLIER_STABLE_MS = 800;
 static const uint32_t ORIENTATION_STABLE_MS = 700;
 static const uint32_t PICKUP_REST_MIN_MS = 900;
 static const uint32_t PICKUP_SEQUENCE_WINDOW_MS = 1600;
@@ -68,7 +68,7 @@ static const uint8_t VEML7700_REG_ALS_CONF = 0x00;
 static const uint8_t VEML7700_REG_ALS_DATA = 0x04;
 static const uint16_t VEML7700_ALS_CONF = 0x0000;  // gain x1, 100 ms integration, ALS on.
 static const uint8_t DEFAULT_WS2812_BRIGHTNESS_PERCENT = 30;
-static const uint8_t AUTO_WS2812_BRIGHTNESS_MIN_PERCENT = 2;
+static const uint8_t AUTO_WS2812_BRIGHTNESS_MIN_PERCENT = 1;
 static const uint8_t AUTO_WS2812_BRIGHTNESS_MAX_PERCENT = 40;
 static const float VEML7700_LUX_PER_COUNT = 0.0576f;
 static const uint32_t LIGHT_SAMPLE_INTERVAL_MS = 1000;
@@ -305,7 +305,7 @@ static void update_status_pixel() {
     return;
   }
 
-  if (led_night_mode_enabled && light_ready && light_lux < 1.0f) {
+  if (led_night_mode_enabled && light_ready && light_lux <= 0.1f) {
     set_status_pixel(0);
   } else if (codex_led_state != "off") {
     set_status_pixel(codex_led_color(now));
@@ -514,7 +514,7 @@ static void update_light_sensor(bool force) {
     have_smoothed_light = true;
   } else {
     const float spike_ratio = relative_delta(light_lux, smoothed_light_lux);
-    if (spike_ratio >= LIGHT_SPIKE_RATIO) {
+    if (light_lux > smoothed_light_lux && spike_ratio >= LIGHT_SPIKE_RATIO) {
       if (fabsf(light_lux - light_spike_candidate_lux) > max(6.0f, smoothed_light_lux * 0.25f)) {
         light_spike_candidate_lux = light_lux;
         light_spike_candidate_since = now;
@@ -524,6 +524,11 @@ static void update_light_sensor(bool force) {
         update_brightness_targets();
         return;
       }
+      smoothed_light_lux = light_lux;
+      light_spike_candidate_since = 0;
+      light_sample_valid = true;
+      update_brightness_targets();
+      return;
     } else {
       light_spike_candidate_since = 0;
     }
@@ -565,7 +570,7 @@ static void update_brightness_targets() {
   if (current_screen_brightness <= 0) {
     current_screen_brightness = target;
   } else if (target > current_screen_brightness) {
-    current_screen_brightness++;
+    current_screen_brightness = target;
   } else if (target < current_screen_brightness) {
     current_screen_brightness = target;
   }
@@ -1080,6 +1085,7 @@ void loop() {
   Sample sample = read_sample();
   update_mic_power(now);
   update_mic_state();
+  update_status_pixel();
   update_light_sensor(false);
   handle_command(sample);
   maybe_report_brightness_change(sample, now);

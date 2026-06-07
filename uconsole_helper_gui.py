@@ -54,7 +54,7 @@ MAPPER_ASR_CONFIG = Path.home() / ".config/uconsole-helper-mapper/voice.env"
 MAPPER_GLOSSARY_FILE = Path.home() / ".config/uconsole-helper-mapper/voice-glossary.txt"
 CPA_GUI_CONFIG = Path.home() / ".config/uconsole-helper/cpa.env"
 CPA_STATUS_CACHE = Path.home() / ".cache/uconsole-helper/cpa-status.json"
-CODEX_BUDDY_CONFIG = Path.home() / ".config/codex-buddy/config.json"
+CODEX_HELPER_CONFIG = Path.home() / ".config/uconsole-helper/codex-servers.json"
 CODEX_DISMISSED_SESSIONS = Path.home() / ".cache/uconsole-helper/codex-dismissed-sessions.json"
 MCU_SHARED_SAMPLE_FILE = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "uconsole-helper-mcu-latest.json"
 BATTERY_CALIBRATE_PATH = Path("/sys/class/power_supply/axp20x-battery/calibrate")
@@ -443,11 +443,13 @@ class UConsoleHelperWindow(Gtk.Window):
         self.codex_open_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         self.codex_session_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         self.codex_last_data: dict[str, object] = {}
+        self.codex_relative_time_labels: list[tuple[Gtk.Label, object]] = []
         self.codex_summary_label = Gtk.Label(label="-", xalign=0)
         self.codex_summary_label.get_style_context().add_class("muted")
         self.codex_status_label = Gtk.Label(label="", xalign=0)
         self.codex_status_label.get_style_context().add_class("muted")
         self.codex_refresh_running = False
+        self.codex_last_refresh_at = 0.0
         self.codex_loaded_once = False
         self.asr_controls: dict[str, Gtk.Widget] = {}
         self.asr_status_label = Gtk.Label(label="", xalign=0)
@@ -488,6 +490,7 @@ class UConsoleHelperWindow(Gtk.Window):
         self.refresh_mapper_status()
         self.load_cpa_config_controls()
         self.load_asr_config_controls()
+        GLib.timeout_add_seconds(1, self.refresh_codex_relative_times)
         GLib.timeout_add_seconds(5, self.auto_refresh_visible_status)
         self.mcu_monitor_thread = threading.Thread(target=self._mcu_monitor_worker, daemon=True)
         self.mcu_monitor_thread.start()
@@ -1062,9 +1065,9 @@ class UConsoleHelperWindow(Gtk.Window):
         led_card.pack_start(led_grid, False, False, 0)
         led_rows = [
             ("MCU_LED_BATTERY_ENABLED", "Battery", "Show low battery warning only. This has the highest LED priority."),
-            ("MCU_LED_NIGHT_MODE_ENABLED", "Night Mode", "Turn off LED indicators when ambient light is below 1 lux."),
-            ("MCU_LED_CODEX_ENABLED", "Codex Indicator", "Show aggregated codex-buddy status with vibecoding signal-light colors."),
-            ("MCU_LED_BRIGHTNESS_AUTO", "Auto Brightness", "Adjust LED brightness from ambient light between 2% and 40%."),
+            ("MCU_LED_NIGHT_MODE_ENABLED", "Night Mode", "Turn off LED indicators when ambient light is at or below 0.1 lux."),
+            ("MCU_LED_CODEX_ENABLED", "Codex Indicator", "Show aggregated Codex status with signal colors: green=goal complete, red=approval needed, yellow=follow-up/open needed, blue=working."),
+            ("MCU_LED_BRIGHTNESS_AUTO", "Auto Brightness", "Adjust LED brightness from ambient light between 1% and 40%."),
             ("MCU_LED_BRIGHTNESS_PERCENT", "Brightness", "WS2812 brightness percentage."),
         ]
         for index, (key, title, tooltip) in enumerate(led_rows):
@@ -1401,6 +1404,7 @@ class UConsoleHelperWindow(Gtk.Window):
 
     def render_codex_page(self) -> None:
         data = self.codex_last_data
+        self.codex_relative_time_labels = []
         sessions = [item for item in data.get("sessions", []) if isinstance(item, dict)]
         self.codex_dismissed_sessions = codex_prune_dismissed_sessions(self.codex_dismissed_sessions, sessions)
         notifications = [item for item in data.get("notifications", []) if isinstance(item, dict)]
@@ -1485,6 +1489,7 @@ class UConsoleHelperWindow(Gtk.Window):
         row.pack_start(header, False, False, 0)
         updated = Gtk.Label(label=f"Updated {codex_relative_time(server.get('server_time'))}", xalign=0)
         updated.get_style_context().add_class("muted")
+        self.codex_relative_time_labels.append((updated, server.get("server_time")))
         row.pack_start(updated, False, False, 0)
         editor = Gtk.Grid(column_spacing=8, row_spacing=6)
         name_entry = Gtk.Entry()
@@ -1566,6 +1571,7 @@ class UConsoleHelperWindow(Gtk.Window):
             row.pack_start(codex_markdown_widget(summary_text), False, False, 0)
         meta = Gtk.Label(label=f"Updated {codex_relative_time(session.get('updated_at'))}", xalign=0)
         meta.get_style_context().add_class("muted")
+        self.codex_relative_time_labels.append((meta, session.get("updated_at")))
         row.pack_start(meta, False, False, 0)
         return row
 
@@ -2282,6 +2288,8 @@ class UConsoleHelperWindow(Gtk.Window):
         elif page == "codex":
             if reload_config or not self.codex_loaded_once:
                 self.load_codex_servers()
+            elif self.codex_last_refresh_at > 0:
+                self.codex_status_label.set_text(f"Updated {codex_relative_timestamp(self.codex_last_refresh_at)}")
             if reload_config or not self.codex_loaded_once:
                 self.refresh_codex_status(force=True)
             else:
@@ -2757,6 +2765,20 @@ class UConsoleHelperWindow(Gtk.Window):
         if self.stack.get_visible_child_name() == "cpa":
             return True
         self.refresh_page(self.stack.get_visible_child_name())
+        return True
+
+    def refresh_codex_relative_times(self) -> bool:
+        if not self.should_refresh_ui() or self.stack.get_visible_child_name() != "codex":
+            return True
+        if self.codex_last_refresh_at > 0:
+            self.codex_status_label.set_text(f"Updated {codex_relative_timestamp(self.codex_last_refresh_at)}")
+        live_labels: list[tuple[Gtk.Label, object]] = []
+        for label, value in self.codex_relative_time_labels:
+            if label.get_parent() is None:
+                continue
+            label.set_text(f"Updated {codex_relative_time(value)}")
+            live_labels.append((label, value))
+        self.codex_relative_time_labels = live_labels
         return True
 
     def on_visible_page_changed(self, *_args: object) -> None:
@@ -3480,7 +3502,8 @@ class UConsoleHelperWindow(Gtk.Window):
         if len(self.codex_session_store) == 0:
             self.codex_session_store.append(["-", "-", "idle", "No sessions", "-", "-", "", "", False, False, ""])
         self.codex_summary_label.set_text(str(data.get("summary", "-")))
-        self.codex_status_label.set_text(f"Updated {time.strftime('%H:%M:%S')}")
+        self.codex_last_refresh_at = time.time()
+        self.codex_status_label.set_text(f"Updated {codex_relative_timestamp(self.codex_last_refresh_at)}")
         self.codex_last_data = data
         self.render_codex_page()
         self.update_header()
@@ -7877,10 +7900,10 @@ def codex_default_config() -> dict[str, object]:
 
 
 def codex_load_config() -> dict[str, object]:
-    if not CODEX_BUDDY_CONFIG.exists():
+    if not CODEX_HELPER_CONFIG.exists():
         return codex_default_config()
     try:
-        data = json.loads(CODEX_BUDDY_CONFIG.read_text(encoding="utf-8"))
+        data = json.loads(CODEX_HELPER_CONFIG.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return codex_default_config()
     if not isinstance(data, dict):
@@ -7896,8 +7919,8 @@ def codex_load_config() -> dict[str, object]:
 
 
 def codex_save_config(config: dict[str, object]) -> None:
-    CODEX_BUDDY_CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    CODEX_BUDDY_CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    CODEX_HELPER_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    CODEX_HELPER_CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def codex_valid_base_url(value: str) -> bool:
@@ -7913,8 +7936,6 @@ def codex_normalized_server_name(name: str, base_url: str) -> str:
     host = (parsed.hostname or "").lower()
     if host in {"127.0.0.1", "localhost", "::1"}:
         return "Local"
-    if host.startswith("dgx") or ".dgx" in host:
-        return "Dgx"
     return parsed.netloc or base_url
 
 
@@ -8385,12 +8406,29 @@ def codex_relative_time(value: object) -> str:
         return codex_updated_label(text)
     delta = max(0, int(time.time() - parsed))
     if delta < 60:
-        return "just now"
+        return f"{delta}s ago"
     if delta < 3600:
-        return f"{delta // 60}m ago"
+        minutes = delta // 60
+        seconds = delta % 60
+        return f"{minutes}m {seconds}s ago"
     if delta < 86400:
         return f"{delta // 3600}h ago"
     return time.strftime("%m-%d %H:%M", time.localtime(parsed))
+
+
+def codex_relative_timestamp(timestamp: float) -> str:
+    if timestamp <= 0:
+        return "-"
+    delta = max(0, int(time.time() - timestamp))
+    if delta < 60:
+        return f"{delta}s ago"
+    if delta < 3600:
+        minutes = delta // 60
+        seconds = delta % 60
+        return f"{minutes}m {seconds}s ago"
+    if delta < 86400:
+        return f"{delta // 3600}h ago"
+    return time.strftime("%m-%d %H:%M", time.localtime(timestamp))
 
 
 def datetime_from_iso(value: str) -> float:
