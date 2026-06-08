@@ -35,6 +35,7 @@ DISPLAY_STATUS_ACTIVE_POLL_SECONDS = 10
 DISPLAY_STATUS_OFF_POLL_SECONDS = 2
 AUTO_MCU_STALE_SECONDS = 20
 MCU_SERIAL_REOPEN_SECONDS = 75
+MCU_SAMPLE_REQUEST_SECONDS = 1.0
 AUTO_PICKUP_WAKE_ENABLED = False
 AUTO_BRIGHTNESS_MANUAL_GRACE_SECONDS = 45.0
 AUTO_BRIGHTNESS_APPLY_EVENTS = {"brightness_changed", "light_changed", "screen_on_ack"}
@@ -70,6 +71,7 @@ class McuSerialReader:
         self.led_behavior_sent_at = 0.0
         self.codex_led_state: str | None = None
         self.codex_led_sent_at = 0.0
+        self.last_sample_request_at = 0.0
         self.pending_commands: list[str] = []
 
     def close(self) -> None:
@@ -115,6 +117,10 @@ class McuSerialReader:
             if sample is not None:
                 self.last_sample_at = time.time()
             return sample
+        now = time.time()
+        if now - self.last_sample_request_at >= MCU_SAMPLE_REQUEST_SECONDS:
+            self.write_command("sample")
+            self.last_sample_request_at = now
         sample = read_mcu_sample_from_fd(self.fd, self)
         if sample is not None:
             if sample.get("event") == "ready":
@@ -1105,22 +1111,24 @@ def maybe_apply_auto_brightness(
     force_apply = now <= state.force_apply_until
     actual_display_off = read_display_off_sysfs()
     display_is_off_now = display_off_now or actual_display_off is True
+    suggested, keyboard_level = brightness_targets_from_sample(sample)
+    if suggested is None:
+        return
+    actual_backlight = read_display_brightness()
+    current_backlight = actual_backlight if actual_backlight is not None else state.current_backlight
     screen_on_keyboard_restore = not display_is_off_now and state.current_keyboard_level == 0
+    brightness_changed = not display_is_off_now and suggested != current_backlight
     should_apply = (
         force_apply
         or event in AUTO_BRIGHTNESS_APPLY_EVENTS
         or state.current_backlight is None
         or screen_on_keyboard_restore
+        or brightness_changed
     )
     if not should_apply:
         return
-    suggested, keyboard_level = brightness_targets_from_sample(sample)
-    if suggested is None:
-        return
     if keyboard_level is None:
         keyboard_level = keyboard_backlight_level(suggested)
-    actual_backlight = read_display_brightness()
-    current_backlight = actual_backlight if actual_backlight is not None else state.current_backlight
     if (
         actual_backlight is not None
         and state.current_backlight is not None

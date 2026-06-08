@@ -1419,19 +1419,19 @@ class UConsoleHelperWindow(Gtk.Window):
             ]
         connected_servers = set(data.get("connected_servers", [])) if isinstance(data.get("connected_servers"), list) else set()
         open_sessions = []
-        dismissed_attention_sessions = []
+        dismissed_sessions = []
         other_sessions = []
         for session in sessions:
+            if codex_session_dismissed(session, self.codex_dismissed_sessions):
+                muted_session = dict(session)
+                muted_session["_codex_dismissed_attention"] = True
+                dismissed_sessions.append(muted_session)
+                continue
             if codex_needs_attention(session):
-                if codex_session_dismissed(session, self.codex_dismissed_sessions):
-                    muted_session = dict(session)
-                    muted_session["_codex_dismissed_attention"] = True
-                    dismissed_attention_sessions.append(muted_session)
-                else:
-                    open_sessions.append(session)
+                open_sessions.append(session)
             else:
                 other_sessions.append(session)
-        display_sessions = open_sessions + dismissed_attention_sessions + other_sessions
+        display_sessions = open_sessions + dismissed_sessions + other_sessions
         signal_state = codex_aggregate_signal_state(display_sessions)
         badge_text, badge_class = codex_badge_style(signal_state)
         replace_style_classes(self.codex_badge_label, {"codex-goal", "codex-approval", "codex-ready", "codex-working", "codex-offline"}, badge_class)
@@ -1440,7 +1440,7 @@ class UConsoleHelperWindow(Gtk.Window):
         self.render_codex_server_strip(servers, connected_servers)
         self.render_codex_settings([server for server in servers if str(server.get("built_in") or "") != "local"], connected_servers, data)
         open_sessions.sort(key=codex_attention_session_sort_key, reverse=True)
-        other_sessions = dismissed_attention_sessions + other_sessions
+        other_sessions = dismissed_sessions + other_sessions
         other_sessions.sort(key=codex_session_list_sort_key, reverse=True)
         self.render_codex_open_sessions(open_sessions)
         self.render_codex_sessions(other_sessions, bool(open_sessions))
@@ -1562,6 +1562,7 @@ class UConsoleHelperWindow(Gtk.Window):
                 button = codex_action_button("Continue", "codex-chip-working")
                 button.connect("clicked", lambda _button, item=dict(session): self.codex_run_session_action(item, "continue"))
                 header.pack_start(button, False, False, 0)
+        if codex_session_key(session) and not bool(session.get("_codex_dismissed_attention")):
             button = codex_action_button("Close", "codex-chip-offline")
             button.connect("clicked", lambda _button, item=dict(session): self.dismiss_codex_session_card(item))
             header.pack_start(button, False, False, 0)
@@ -8145,7 +8146,10 @@ def codex_session_badge_text(session: dict[str, object]) -> str:
         return "Closed"
     state = str(session.get("state") or "").lower()
     detail = str(session.get("state_detail") or "")
-    if codex_session_signal_state(session) == "approval":
+    signal_state = codex_session_signal_state(session)
+    if signal_state == "goal":
+        return "Goal Achieved"
+    if signal_state == "approval":
         return "Approval"
     status = codex_status_line_state(state, detail)
     if state in {"open", "attention"} or bool(session.get("needs_open")):
@@ -8294,7 +8298,7 @@ def codex_prune_dismissed_sessions(items: dict[str, object], sessions: list[dict
     pruned: dict[str, object] = {}
     for key, value in items.items():
         session = sessions_by_key.get(key)
-        if session is None or not codex_needs_attention(session):
+        if session is None or codex_session_signal_state(session) == "off":
             continue
         if codex_session_dismissed_matches(session, value):
             pruned[key] = value

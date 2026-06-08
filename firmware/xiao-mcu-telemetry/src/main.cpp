@@ -22,7 +22,7 @@ static const uint32_t LIGHT_REPORT_FAST_INTERVAL_MS = 1000;
 static const uint32_t LIGHT_REPORT_SLOW_INTERVAL_MS = 30000;
 static const uint32_t LIGHT_REPORT_STABLE_MS = 800;
 static const uint32_t LIGHT_REPORT_BOOT_GRACE_MS = 5000;
-static const uint32_t VEML7700_STARTUP_MS = 120;
+static const uint32_t VEML7700_STARTUP_MS = 450;
 static const uint32_t BRIGHTNESS_REPORT_MIN_INTERVAL_MS = 2500;
 static const uint32_t BRIGHTNESS_CHANGE_STABLE_MS = 2500;
 static const uint32_t LIGHT_OUTLIER_STABLE_MS = 800;
@@ -66,11 +66,11 @@ static const int MIC_PEAK_THRESHOLD = 900;
 static const uint8_t VEML7700_ADDR = 0x10;
 static const uint8_t VEML7700_REG_ALS_CONF = 0x00;
 static const uint8_t VEML7700_REG_ALS_DATA = 0x04;
-static const uint16_t VEML7700_ALS_CONF = 0x0000;  // gain x1, 100 ms integration, ALS on.
+static const uint16_t VEML7700_ALS_CONF = 0x0880;  // gain x2, 400 ms integration, ALS on.
 static const uint8_t DEFAULT_WS2812_BRIGHTNESS_PERCENT = 30;
 static const uint8_t AUTO_WS2812_BRIGHTNESS_MIN_PERCENT = 1;
 static const uint8_t AUTO_WS2812_BRIGHTNESS_MAX_PERCENT = 40;
-static const float VEML7700_LUX_PER_COUNT = 0.0576f;
+static const float VEML7700_LUX_PER_COUNT = 0.0072f;
 static const uint32_t LIGHT_SAMPLE_INTERVAL_MS = 1000;
 static const float LIGHT_SMOOTH_ALPHA = 0.18f;
 static const float LIGHT_DARKEN_SMOOTH_ALPHA = 0.65f;
@@ -143,6 +143,7 @@ static int last_mic_peak = 0;
 static uint32_t last_mic_peak_ms = 0;
 static uint32_t mic_assist_until = 0;
 static uint16_t light_raw = 0;
+static uint16_t light_conf_raw = 0;
 static float light_lux = 0.0f;
 static float smoothed_light_lux = 0.0f;
 static float last_reported_light_lux = -1.0f;
@@ -456,6 +457,10 @@ static bool init_light_sensor() {
     light_sample_valid = false;
     return false;
   }
+  uint16_t conf = 0;
+  if (veml7700_read16(VEML7700_REG_ALS_CONF, conf)) {
+    light_conf_raw = conf;
+  }
   light_zero_sample_count = 0;
   return true;
 }
@@ -545,14 +550,14 @@ static float relative_delta(float a, float b) {
 }
 
 static int classify_screen_brightness(float lux) {
-  if (lux < 2.0f) return 1;
-  if (lux < 5.0f) return 2;
-  if (lux < 9.0f) return 3;
-  if (lux < 30.0f) return 4;
-  if (lux < 120.0f) return 5;
-  if (lux < 220.0f) return 6;
-  if (lux < 420.0f) return 7;
-  if (lux < 900.0f) return 8;
+  if (lux < 0.12f) return 1;
+  if (lux < 0.25f) return 2;
+  if (lux < 0.40f) return 3;
+  if (lux < 0.70f) return 4;
+  if (lux < 1.20f) return 5;
+  if (lux < 2.00f) return 6;
+  if (lux < 4.00f) return 7;
+  if (lux < 8.00f) return 8;
   return 9;
 }
 
@@ -854,6 +859,8 @@ static void print_status(const char *event_name, const Sample &sample) {
   Serial.print(light_sample_valid ? "true" : "false");
   Serial.print(",\"raw\":");
   Serial.print(light_raw);
+  Serial.print(",\"conf\":");
+  Serial.print(light_conf_raw);
   Serial.print(",\"lux\":");
   Serial.print(light_lux, 2);
   Serial.print(",\"smoothed_lux\":");
