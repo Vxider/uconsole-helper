@@ -550,14 +550,14 @@ static float relative_delta(float a, float b) {
 }
 
 static int classify_screen_brightness(float lux) {
-  if (lux < 0.12f) return 1;
-  if (lux < 0.25f) return 2;
-  if (lux < 0.40f) return 3;
-  if (lux < 0.70f) return 4;
-  if (lux < 1.20f) return 5;
-  if (lux < 2.00f) return 6;
-  if (lux < 4.00f) return 7;
-  if (lux < 8.00f) return 8;
+  if (lux < 2.0f) return 1;
+  if (lux < 5.0f) return 2;
+  if (lux < 9.0f) return 3;
+  if (lux < 30.0f) return 4;
+  if (lux < 120.0f) return 5;
+  if (lux < 220.0f) return 6;
+  if (lux < 420.0f) return 7;
+  if (lux < 900.0f) return 8;
   return 9;
 }
 
