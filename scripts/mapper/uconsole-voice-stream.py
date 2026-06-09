@@ -921,6 +921,20 @@ class SegmentingTranscriptionSession:
         )
         return self.final_text
 
+    def accept_streaming_text_as_final(self, raw_text: str, *, reason: str) -> str:
+        text = normalize_text(raw_text)
+        if not text or is_placeholder_text(text):
+            return ""
+        self.final_text = text
+        self.raw_text = text
+        self.corrected_text = ""
+        self.last_request_id = self.request_id
+        append_log(
+            f"streaming final text accepted without finalize requestId={self.request_id} "
+            f"reason={reason} chars={len(text)}"
+        )
+        return self.final_text
+
     def transcribe_segment(self, pcm: bytes, *, final_segment: bool = False) -> str:
         if len(pcm) < int(self.sample_rate * self.channels * 2 * 0.25):
             return ""
@@ -1111,9 +1125,12 @@ class SegmentingTranscriptionSession:
                 except Exception as exc:
                     fallback_reason = "client_error" if should_fallback_to_audio_after_finalize_error(exc) else "request_error"
                     append_log(
-                        f"streaming final text failed; falling back to recorded audio "
+                        f"streaming final text failed; accepting streaming text "
                         f"requestId={self.request_id} chars={len(preferred_text)} "
                         f"reason={fallback_reason} error={type(exc).__name__}: {exc}"
+                    )
+                    finalized_from_stream = bool(
+                        self.accept_streaming_text_as_final(preferred_text, reason=f"finalize_{fallback_reason}")
                     )
             if not finalized_from_stream and recording:
                 self.transcribe_segment(bytes(recording), final_segment=True)
