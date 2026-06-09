@@ -71,6 +71,7 @@ XIAO_USB_VENDOR = "2886"
 XIAO_USB_PRODUCT_IDS = {"0065", "8044", "8065"}
 XIAO_BOOTLOADER_PRODUCT_IDS = {"0065"}
 XIAO_BOOTLOADER_HINTS = ("uf2", "bootloader", "mass storage")
+UTILS_RESET_U_USB_TARGET = "1-1.4"
 XIAO_SERIAL_BAUD = 115200
 XIAO_STILL_G_FORCE = 0.08
 XIAO_PICKUP_G_FORCE = 0.12
@@ -463,10 +464,12 @@ class UConsoleHelperWindow(Gtk.Window):
         self.utils_battery_label = Gtk.Label(label="-", xalign=0)
         self.utils_calibrate_button = Gtk.Button(label="Battery Calibrate")
         self.utils_calibrate_button.connect("clicked", lambda _button: self.calibrate_battery())
-        self.utils_reset_xiao_usb_button = Gtk.Button(label="Reset USB2.0 HUB")
-        self.utils_reset_xiao_usb_button.connect("clicked", lambda _button: self.reset_xiao_usb_hub())
+        self.utils_reset_selected_usb_button = Gtk.Button(label="Reset Selected Hub")
+        self.utils_reset_selected_usb_button.connect("clicked", lambda _button: self.reset_selected_usb_hub())
         self.utils_usb_reset_running = False
-        self.utils_usb_store = Gtk.ListStore(str, str, str, str, str)
+        self.utils_selected_usb_hub: str | None = None
+        self.utils_usb_store = Gtk.TreeStore(str, str, str, str, str, bool)
+        self.utils_usb_tree_column: Gtk.TreeViewColumn | None = None
         self.utils_status_label = Gtk.Label(label="", xalign=0)
         self.utils_status_label.get_style_context().add_class("muted")
         self.inline_panel_box: Gtk.Box | None = None
@@ -971,25 +974,29 @@ class UConsoleHelperWindow(Gtk.Window):
         usb_row.set_margin_top(8)
         usb_card.pack_start(usb_row, False, False, 0)
 
-        usb_hint = Gtk.Label(label="Reset USB2.0 HUB when USB devices have descriptor errors.", xalign=0)
+        usb_hint = Gtk.Label(label="Select a USB hub from the tree, then reset that hub.", xalign=0)
         usb_hint.set_line_wrap(True)
         usb_hint.set_hexpand(True)
         usb_hint.get_style_context().add_class("muted")
         usb_row.pack_start(usb_hint, True, True, 0)
 
-        self.utils_reset_xiao_usb_button.set_tooltip_text("会短暂断开 USB2.0 HUB 下的设备；必要时会继续重置上一层 USB HUB。")
-        usb_row.pack_start(self.utils_reset_xiao_usb_button, False, False, 0)
+        self.utils_reset_selected_usb_button.set_tooltip_text("选择树里的 Hub 后重置该 USB 节点，会短暂断开其下设备。")
+        usb_row.pack_start(self.utils_reset_selected_usb_button, False, False, 0)
 
         usb_tree = Gtk.TreeView(model=self.utils_usb_store)
         usb_tree.set_headers_visible(True)
-        for index, title in enumerate(("Hub", "Path", "Device", "ID", "Driver")):
+        usb_tree.get_selection().set_mode(Gtk.SelectionMode.SINGLE)
+        usb_tree.get_selection().connect("changed", self.on_utils_usb_selection_changed)
+        for index, title in enumerate(("USB Tree", "Path", "Device", "ID", "Driver")):
             renderer = Gtk.CellRendererText()
             if index in {0, 2, 4}:
                 renderer.set_property("ellipsize", Pango.EllipsizeMode.END)
             column = Gtk.TreeViewColumn(title, renderer, text=index)
             column.set_resizable(True)
             if index == 0:
-                column.set_min_width(110)
+                column.set_min_width(174)
+                column.set_sizing(Gtk.TreeViewColumnSizing.FIXED)
+                self.utils_usb_tree_column = column
             elif index == 1:
                 column.set_min_width(80)
             elif index == 2:
@@ -1000,6 +1007,8 @@ class UConsoleHelperWindow(Gtk.Window):
         usb_scrolled.set_min_content_height(118)
         usb_scrolled.add(usb_tree)
         usb_card.pack_start(usb_scrolled, False, False, 10)
+        self.utils_usb_tree = usb_tree
+        usb_tree.connect("size-allocate", self.on_utils_usb_tree_size_allocate)
 
         page.pack_start(self.utils_status_label, False, False, 0)
         self.refresh_utils_status()
@@ -3077,7 +3086,7 @@ class UConsoleHelperWindow(Gtk.Window):
         else:
             self.utils_battery_label.set_text("Unknown")
         self.utils_calibrate_button.set_sensitive(capacity == 100)
-        self.utils_reset_xiao_usb_button.set_sensitive(not self.utils_usb_reset_running)
+        self.sync_utils_usb_reset_button()
         if capacity == 100:
             self.utils_calibrate_button.set_tooltip_text("电量为 100%，可以执行电量校准。")
         else:
@@ -3085,13 +3094,44 @@ class UConsoleHelperWindow(Gtk.Window):
         self.refresh_utils_usb_devices()
 
     def refresh_utils_usb_devices(self) -> None:
+        selected_hub = self.utils_selected_usb_hub
         self.utils_usb_store.clear()
-        rows = usb_hub_device_rows(("1-1.4", "1-1.4.2"))
-        if not rows:
-            self.utils_usb_store.append(["-", "-", "No USB devices", "-", "-"])
+        appended = append_usb_device_tree(self.utils_usb_store, UTILS_RESET_U_USB_TARGET)
+        if not appended:
+            self.utils_usb_store.append(None, ["-", "-", "No USB devices", "-", "-", False])
+        self.utils_usb_tree.expand_all()
+        self.restore_utils_usb_selection(selected_hub)
+        self.sync_utils_usb_reset_button()
+
+    def restore_utils_usb_selection(self, selected_hub: str | None) -> None:
+        if not selected_hub:
             return
-        for row in rows:
-            self.utils_usb_store.append(list(row))
+        tree_iter = find_tree_iter_by_value(self.utils_usb_store, 1, selected_hub)
+        if tree_iter is None:
+            return
+        self.utils_usb_tree.get_selection().select_iter(tree_iter)
+
+    def on_utils_usb_selection_changed(self, selection: Gtk.TreeSelection) -> None:
+        model, tree_iter = selection.get_selected()
+        self.utils_selected_usb_hub = None
+        if tree_iter is not None and bool(model[tree_iter][5]):
+            self.utils_selected_usb_hub = str(model[tree_iter][1])
+        self.sync_utils_usb_reset_button()
+
+    def sync_utils_usb_reset_button(self) -> None:
+        selected = self.utils_selected_usb_hub or ""
+        self.utils_reset_selected_usb_button.set_sensitive(bool(selected) and not self.utils_usb_reset_running)
+        if selected:
+            self.utils_reset_selected_usb_button.set_tooltip_text(f"重置 /sys/bus/usb/devices/{selected}")
+        else:
+            self.utils_reset_selected_usb_button.set_tooltip_text("选择树里的 Hub 后重置该 USB 节点。")
+
+    def on_utils_usb_tree_size_allocate(self, _tree: Gtk.TreeView, allocation: Gdk.Rectangle) -> None:
+        if self.utils_usb_tree_column is None:
+            return
+        target_width = max(174, int(allocation.width * 2 / 3))
+        if self.utils_usb_tree_column.get_fixed_width() != target_width:
+            self.utils_usb_tree_column.set_fixed_width(target_width)
 
     def calibrate_battery(self) -> None:
         capacity = battery_capacity_percent()
@@ -3108,53 +3148,38 @@ class UConsoleHelperWindow(Gtk.Window):
         self.utils_status_label.set_text("Battery calibration command executed.")
         self.refresh_utils_status()
 
-    def reset_xiao_usb_hub(self) -> None:
+    def reset_selected_usb_hub(self) -> None:
         if self.utils_usb_reset_running:
             return
+        target = self.utils_selected_usb_hub
+        if not target:
+            self.show_error("USB hub reset blocked", "请先在 USB 树里选择一个 Hub。")
+            return
         self.utils_usb_reset_running = True
-        self.utils_reset_xiao_usb_button.set_sensitive(False)
-        self.utils_status_label.set_text("Resetting USB2.0 HUB...")
-        thread = threading.Thread(target=self._reset_xiao_usb_hub_worker, daemon=True)
+        self.sync_utils_usb_reset_button()
+        self.utils_status_label.set_text(f"Resetting USB hub {target}...")
+        thread = threading.Thread(target=self._reset_selected_usb_hub_worker, args=(target,), daemon=True)
         thread.start()
 
-    def _reset_xiao_usb_hub_worker(self) -> None:
-        messages: list[str] = []
+    def _reset_selected_usb_hub_worker(self, target: str) -> None:
+        message = ""
         error = ""
         try:
-            for index, target in enumerate(xiao_usb_reset_targets()):
-                reset_usb_device(target, settle_seconds=2.0 if index == 0 else 3.0)
-                messages.append(f"reset {usb_device_product(target)}")
-                time.sleep(1.0)
-                device = find_xiao_device()
-                if device.present and device.tty:
-                    GLib.idle_add(
-                        self.finish_xiao_usb_hub_reset,
-                        f"USB2.0 HUB reset done: /dev/{device.tty} ({', '.join(messages)})",
-                        None,
-                    )
-                    return
+            reset_usb_device(target, settle_seconds=3.0)
+            message = f"USB hub {target} reset done: {usb_device_product(target)}"
         except Exception as exc:
+            message = f"USB hub {target} reset failed."
             error = str(exc)
-        device = find_xiao_device()
-        if device.present:
-            if device.tty:
-                message = f"USB2.0 HUB reset done: /dev/{device.tty}"
-            else:
-                message = "USB2.0 HUB reset done, but ttyACM is not ready."
-        else:
-            message = "XIAO still not detected after USB hub reset."
-        if messages:
-            message = f"{message} ({', '.join(messages)})"
-        GLib.idle_add(self.finish_xiao_usb_hub_reset, message, error or None)
+        GLib.idle_add(self.finish_selected_usb_hub_reset, message, error or None)
 
-    def finish_xiao_usb_hub_reset(self, message: str, error: str | None) -> bool:
+    def finish_selected_usb_hub_reset(self, message: str, error: str | None) -> bool:
         self.utils_usb_reset_running = False
         self.refresh_utils_status()
         self.utils_status_label.set_text(message)
         if error:
-            self.show_error("USB2.0 HUB reset failed", error)
+            self.show_error("USB hub reset failed", error)
         else:
-            self.show_success_banner("USB2.0 HUB reset", message, timeout_ms=3000)
+            self.show_success_banner("USB hub reset", message, timeout_ms=3000)
         return False
 
     def refresh_mapper_status(self) -> None:
@@ -10126,26 +10151,64 @@ def find_xiao_usb_root() -> Path | None:
     return None
 
 
-def xiao_usb_reset_targets() -> tuple[str, ...]:
-    device = find_xiao_usb_root()
-    if device is not None:
-        direct_parent = usb_reset_parent_name(device.name)
-        upper_parent = usb_reset_parent_name(direct_parent)
-        targets = [target for target in (direct_parent, upper_parent) if target]
-        if targets:
-            return tuple(dict.fromkeys(targets))
-    return ("1-1.4.2", "1-1.4")
-
-
-def usb_reset_parent_name(device_name: str) -> str:
-    if "." not in device_name:
-        return ""
-    return device_name.rsplit(".", 1)[0]
-
-
 def usb_device_product(device_name: str) -> str:
     product = read_text(Path("/sys/bus/usb/devices") / device_name / "product")
     return product or device_name
+
+
+def append_usb_device_tree(
+    store: Gtk.TreeStore,
+    device_name: str,
+    parent_iter: Gtk.TreeIter | None = None,
+    visited: set[str] | None = None,
+) -> bool:
+    usb_root = Path("/sys/bus/usb/devices")
+    device_path = usb_root / device_name
+    if not device_path.exists():
+        store.append(parent_iter, [device_name, device_name, "Not present", "-", "-", False])
+        return True
+    if visited is None:
+        visited = set()
+    if device_name in visited:
+        return False
+    visited.add(device_name)
+
+    children = direct_usb_children(device_name)
+    is_hub = usb_device_is_hub(device_path, children)
+    manufacturer = read_text(device_path / "manufacturer")
+    product = read_text(device_path / "product")
+    label = " ".join(part for part in (manufacturer, product) if part) or device_name
+    vendor = read_text(device_path / "idVendor")
+    product_id = read_text(device_path / "idProduct")
+    usb_id = f"{vendor}:{product_id}" if vendor and product_id else "-"
+    driver = usb_device_driver(device_path)
+    device_label = "Hub" if is_hub else label
+    tree_iter = store.append(parent_iter, [label, device_name, device_label, usb_id, driver or "-", is_hub])
+
+    for child in children:
+        append_usb_device_tree(store, child, tree_iter, visited)
+    return True
+
+
+def usb_device_is_hub(device_path: Path, children: list[str]) -> bool:
+    if children:
+        return True
+    return read_text(device_path / "bDeviceClass") == "09"
+
+
+def find_tree_iter_by_value(store: Gtk.TreeStore, column: int, value: str) -> Gtk.TreeIter | None:
+    def walk(tree_iter: Gtk.TreeIter | None) -> Gtk.TreeIter | None:
+        while tree_iter is not None:
+            if str(store[tree_iter][column]) == value:
+                return tree_iter
+            child_iter = store.iter_children(tree_iter)
+            found = walk(child_iter)
+            if found is not None:
+                return found
+            tree_iter = store.iter_next(tree_iter)
+        return None
+
+    return walk(store.get_iter_first())
 
 
 def usb_hub_device_rows(hub_names: tuple[str, ...]) -> list[tuple[str, str, str, str, str]]:
