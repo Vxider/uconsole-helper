@@ -63,6 +63,7 @@ DISPLAY_BACKLIGHT_MAX_PATH = Path("/sys/class/backlight/backlight@0/max_brightne
 SCREEN_TIMEOUT_OPTIONS = ("Default", "30s", "1min", "2min", "5min", "10min", "15min")
 AUTO_SCREEN_TIMEOUT_OPTIONS = ("5s", "10s", "15s", "30s", "1min", "2min", "5min", "10min", "15min", "30min", "Never")
 IDLE_SHUTDOWN_TIMEOUT_OPTIONS = ("Never", "15min", "30min", "1h", "2h", "4h", "8h")
+CODEX_GOAL_STALE_SECONDS = 300
 APP_POWER_MIN_CPU_PERCENT = 1.0
 APP_POWER_MIN_IO_BYTES_PER_SEC = 256 * 1024
 APP_POWER_MIN_SCORE = 10.0
@@ -324,7 +325,7 @@ class UConsoleHelperWindow(Gtk.Window):
     def __init__(self) -> None:
         super().__init__(title="uConsole Helper")
         self.set_default_size(920, 640)
-        self.connect("destroy", Gtk.main_quit)
+        self.connect("destroy", self.on_destroy)
         self.connect("key-press-event", self.on_key_press)
         self.scan_running = False
         self.scan_cancel = threading.Event()
@@ -451,6 +452,11 @@ class UConsoleHelperWindow(Gtk.Window):
         self.codex_refresh_running = False
         self.codex_last_refresh_at = 0.0
         self.codex_loaded_once = False
+        self.codex_stream_stop = threading.Event()
+        self.codex_stream_lock = threading.Lock()
+        self.codex_stream_results: dict[str, dict[str, object]] = {}
+        self.codex_stream_signature = ""
+        self.codex_last_poll_fallback_at = 0.0
         self.asr_controls: dict[str, Gtk.Widget] = {}
         self.asr_status_label = Gtk.Label(label="", xalign=0)
         self.asr_status_label.get_style_context().add_class("muted")
@@ -2291,10 +2297,11 @@ class UConsoleHelperWindow(Gtk.Window):
                 self.load_codex_servers()
             elif self.codex_last_refresh_at > 0:
                 self.codex_status_label.set_text(f"Updated {codex_relative_timestamp(self.codex_last_refresh_at)}")
+            self.ensure_codex_streams()
             if reload_config or not self.codex_loaded_once:
                 self.refresh_codex_status(force=True)
             else:
-                self.refresh_codex_status(force=True)
+                self.refresh_codex_status(force=False)
         elif page == "cpa":
             if reload_config or not self.cpa_loaded_once:
                 self.load_cpa_config_controls()
@@ -2767,6 +2774,11 @@ class UConsoleHelperWindow(Gtk.Window):
             return True
         self.refresh_page(self.stack.get_visible_child_name())
         return True
+
+    def on_destroy(self, *_args: object) -> None:
+        self.codex_stream_stop.set()
+        self.mcu_monitor_stop.set()
+        Gtk.main_quit()
 
     def refresh_codex_relative_times(self) -> bool:
         if not self.should_refresh_ui() or self.stack.get_visible_child_name() != "codex":
@@ -3398,6 +3410,7 @@ class UConsoleHelperWindow(Gtk.Window):
         if len(self.codex_server_store) == 0:
             self.codex_server_store.append(["", "Local", "http://127.0.0.1:8787", ""])
         self.codex_status_label.set_text("")
+        self.ensure_codex_streams()
         self.render_codex_page()
 
     def save_codex_servers(self) -> bool:
@@ -3419,6 +3432,7 @@ class UConsoleHelperWindow(Gtk.Window):
             self.show_error("Save Codex failed", str(exc))
             return False
         self.codex_status_label.set_text("Codex server settings saved.")
+        self.ensure_codex_streams(restart=True)
         self.refresh_codex_status(force=True)
         return True
 
@@ -3445,13 +3459,16 @@ class UConsoleHelperWindow(Gtk.Window):
                 break
             tree_iter = self.codex_server_store.iter_next(tree_iter)
         self.codex_status_label.set_text("Unsaved Codex server settings.")
+        self.ensure_codex_streams(restart=True)
         self.render_codex_page()
 
     def refresh_codex_status(self, *, force: bool = False) -> None:
         if self.codex_refresh_running:
             return
-        if not force and self.codex_loaded_once:
+        now = time.time()
+        if not force and self.codex_loaded_once and now - self.codex_last_poll_fallback_at < 60:
             return
+        self.codex_last_poll_fallback_at = now
         self.codex_refresh_running = True
         self.codex_status_label.set_text("Refreshing Codex...")
         self.codex_session_store.clear()
@@ -3464,6 +3481,64 @@ class UConsoleHelperWindow(Gtk.Window):
         ]
         thread = threading.Thread(target=self._codex_refresh_worker, args=(servers,), daemon=True)
         thread.start()
+
+    def current_codex_servers(self) -> list[dict[str, str]]:
+        return [
+            {"id": str(row[0] or ""), "name": str(row[1] or ""), "base_url": str(row[2] or "").strip().rstrip("/")}
+            for row in self.codex_server_store
+            if str(row[2] or "").strip()
+        ]
+
+    def ensure_codex_streams(self, *, restart: bool = False) -> None:
+        servers = self.current_codex_servers()
+        signature = codex_servers_signature(servers)
+        if not restart and signature == self.codex_stream_signature:
+            return
+        self.codex_stream_stop.set()
+        self.codex_stream_stop = threading.Event()
+        self.codex_stream_signature = signature
+        with self.codex_stream_lock:
+            self.codex_stream_results = {}
+        for server in servers:
+            thread = threading.Thread(target=self._codex_stream_worker, args=(dict(server), self.codex_stream_stop), daemon=True)
+            thread.start()
+
+    def _codex_stream_worker(self, server: dict[str, str], stop_event: threading.Event) -> None:
+        key = codex_server_key(server)
+        backoff = 1.0
+        while not stop_event.is_set():
+            try:
+                for status in codex_stream_status_events(str(server.get("base_url") or ""), stop_event):
+                    if stop_event.is_set():
+                        break
+                    notification_data = None
+                    try:
+                        notification_data = http_json(f"{str(server.get('base_url') or '').rstrip('/')}/v1/notifications", headers={"Accept": "application/json"}, timeout=4)
+                    except Exception:
+                        notification_data = None
+                    result = codex_server_result_from_status(server, status, notification_data)
+                    GLib.idle_add(self.finish_codex_stream_update, key, result)
+                    backoff = 1.0
+                if stop_event.is_set():
+                    break
+            except Exception as exc:
+                base_url = str(server.get("base_url") or "").strip().rstrip("/")
+                name = codex_normalized_server_name(str(server.get("name") or ""), base_url)
+                result = codex_disconnected_server_result(server, f"{name}: {compact_error(str(exc))}")
+                GLib.idle_add(self.finish_codex_stream_update, key, result)
+            stop_event.wait(backoff)
+            backoff = min(30.0, backoff * 2)
+
+    def finish_codex_stream_update(self, key: str, result: dict[str, object]) -> bool:
+        servers = self.current_codex_servers()
+        if key not in {codex_server_key(server) for server in servers}:
+            return False
+        with self.codex_stream_lock:
+            self.codex_stream_results[key] = result
+            results = list(self.codex_stream_results.values())
+        data = codex_status_data_from_results(servers, results)
+        self.apply_codex_data(data)
+        return False
 
     def _codex_refresh_worker(self, servers: list[dict[str, str]]) -> None:
         try:
@@ -3485,6 +3560,19 @@ class UConsoleHelperWindow(Gtk.Window):
 
     def finish_codex_refresh(self, data: dict[str, object]) -> bool:
         self.codex_refresh_running = False
+        self.codex_loaded_once = True
+        server_results = data.get("_server_results")
+        if isinstance(server_results, list):
+            with self.codex_stream_lock:
+                self.codex_stream_results = {
+                    codex_server_key(result.get("server", {})): result
+                    for result in server_results
+                    if isinstance(result, dict) and isinstance(result.get("server"), dict)
+                }
+        self.apply_codex_data(data)
+        return False
+
+    def apply_codex_data(self, data: dict[str, object]) -> None:
         self.codex_loaded_once = True
         self.codex_session_store.clear()
         self.codex_notification_store.clear()
@@ -3508,7 +3596,6 @@ class UConsoleHelperWindow(Gtk.Window):
         self.codex_last_data = data
         self.render_codex_page()
         self.update_header()
-        return False
 
     def codex_run_session_action(self, session: dict[str, object], action: str) -> None:
         if action == "close":
@@ -7892,6 +7979,30 @@ def http_json(url: str, headers: dict[str, str] | None = None, data: bytes | Non
         return json.loads(response.read().decode("utf-8", errors="replace"))
 
 
+def codex_stream_status_events(base_url: str, stop_event: threading.Event):
+    request = urllib.request.Request(f"{base_url.rstrip('/')}/v1/stream", headers={"Accept": "text/event-stream"})
+    with urllib.request.urlopen(request, timeout=45) as response:
+        event = ""
+        data_lines: list[str] = []
+        while not stop_event.is_set():
+            raw = response.readline()
+            if not raw:
+                return
+            line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+            if line == "":
+                if event == "status" and data_lines:
+                    yield json.loads("\n".join(data_lines))
+                event = ""
+                data_lines = []
+                continue
+            if line.startswith(":"):
+                continue
+            if line.startswith("event:"):
+                event = line[6:].strip()
+            elif line.startswith("data:"):
+                data_lines.append(line[5:].strip())
+
+
 def codex_default_config() -> dict[str, object]:
     return {
         "listen": {"host": "127.0.0.1", "port": 8787},
@@ -8014,60 +8125,127 @@ def codex_save_servers(servers: list[dict[str, str]]) -> None:
 def codex_status_data(servers: list[dict[str, str]]) -> dict[str, object]:
     if not servers:
         servers = [{"id": "", "name": "Local", "base_url": "http://127.0.0.1:8787"}]
+    results = [codex_fetch_server_result(server) for server in servers]
+    data = codex_status_data_from_results(servers, results)
+    data["_server_results"] = results
+    return data
+
+
+def codex_fetch_server_result(server: dict[str, str]) -> dict[str, object]:
+    base_url = server.get("base_url", "").strip().rstrip("/")
+    name = codex_normalized_server_name(server.get("name", ""), base_url)
+    try:
+        data = http_json(f"{base_url}/v1/status", headers={"Accept": "application/json"}, timeout=4)
+    except Exception as exc:
+        return codex_disconnected_server_result(server, f"{name}: {compact_error(str(exc))}")
+    try:
+        notification_data = http_json(f"{base_url}/v1/notifications", headers={"Accept": "application/json"}, timeout=4)
+    except Exception as exc:
+        return codex_server_result_from_status(server, data, None, notification_error=f"{name} notifications: {compact_error(str(exc))}")
+    return codex_server_result_from_status(server, data, notification_data)
+
+
+def codex_disconnected_server_result(server: dict[str, str], error: str) -> dict[str, object]:
+    return {
+        "server": dict(server),
+        "connected": False,
+        "connected_servers": [],
+        "sessions": [],
+        "notifications": [],
+        "errors": [error],
+    }
+
+
+def codex_server_result_from_status(
+    server: dict[str, str],
+    data: object,
+    notification_data: object | None,
+    notification_error: str = "",
+) -> dict[str, object]:
+    base_url = server.get("base_url", "").strip().rstrip("/")
+    server_id = str(server.get("id") or "")
+    name = codex_normalized_server_name(server.get("name", ""), base_url)
+    if not isinstance(data, dict):
+        return codex_disconnected_server_result(server, f"{name}: invalid response")
+    server_data = dict(server)
+    server_data["server_time"] = str(data.get("server_time") or "")
+    overall_state = str(data.get("overall_state") or "")
+    if overall_state:
+        server_data["overall_state"] = overall_state
+    sessions: list[dict[str, object]] = []
+    notifications: list[dict[str, object]] = []
+    errors: list[str] = []
+    raw_sessions = data.get("sessions", [])
+    server_session_states: dict[str, str] = {}
+    if isinstance(raw_sessions, list):
+        for session in raw_sessions:
+            if isinstance(session, dict):
+                row = dict(session)
+                row["server_id"] = server_id
+                row["server_name"] = name
+                row["server_url"] = base_url
+                session_id = str(row.get("session_id") or "")
+                if session_id:
+                    server_session_states[session_id] = str(row.get("state") or "").lower()
+                sessions.append(row)
+    if notification_error:
+        errors.append(notification_error)
+    if isinstance(notification_data, dict):
+        raw_notifications = notification_data.get("notifications", [])
+        if isinstance(raw_notifications, list):
+            for notification in raw_notifications:
+                if isinstance(notification, dict):
+                    notification_session_id = str(notification.get("session_id") or "")
+                    if server_session_states.get(notification_session_id) in {"idle", "ready"}:
+                        continue
+                    row = dict(notification)
+                    row["server_id"] = server_id
+                    row["server_name"] = name
+                    row["server_url"] = base_url
+                    notifications.append(row)
+    return {
+        "server": server_data,
+        "connected": True,
+        "connected_servers": [server_id, base_url],
+        "sessions": sessions,
+        "notifications": notifications,
+        "errors": errors,
+    }
+
+
+def codex_status_data_from_results(servers: list[dict[str, str]], results: list[dict[str, object]]) -> dict[str, object]:
     sessions: list[dict[str, object]] = []
     notifications: list[dict[str, object]] = []
     connected = 0
     connected_servers: list[str] = []
     errors: list[str] = []
+    result_by_key = {
+        codex_server_key(result.get("server", {})): result
+        for result in results
+        if isinstance(result, dict) and isinstance(result.get("server"), dict)
+    }
+    rendered_servers: list[dict[str, object]] = []
     for server in servers:
-        base_url = server.get("base_url", "").strip().rstrip("/")
-        server_id = str(server.get("id") or "")
-        name = codex_normalized_server_name(server.get("name", ""), base_url)
-        try:
-            data = http_json(f"{base_url}/v1/status", headers={"Accept": "application/json"}, timeout=4)
-        except Exception as exc:
-            errors.append(f"{name}: {compact_error(str(exc))}")
+        result = result_by_key.get(codex_server_key(server))
+        if result is None:
+            rendered_servers.append(dict(server))
             continue
-        if not isinstance(data, dict):
-            errors.append(f"{name}: invalid response")
-            continue
-        connected += 1
-        connected_servers.extend([server_id, base_url])
-        server["server_time"] = str(data.get("server_time") or "")
-        overall_state = str(data.get("overall_state") or "")
-        if overall_state:
-            server["overall_state"] = overall_state
-        raw_sessions = data.get("sessions", [])
-        server_session_states: dict[str, str] = {}
+        result_server = result.get("server")
+        rendered_servers.append(dict(result_server) if isinstance(result_server, dict) else dict(server))
+        if bool(result.get("connected")):
+            connected += 1
+        raw_connected_servers = result.get("connected_servers")
+        if isinstance(raw_connected_servers, list):
+            connected_servers.extend(str(item) for item in raw_connected_servers)
+        raw_errors = result.get("errors")
+        if isinstance(raw_errors, list):
+            errors.extend(str(item) for item in raw_errors if str(item))
+        raw_sessions = result.get("sessions")
         if isinstance(raw_sessions, list):
-            for session in raw_sessions:
-                if isinstance(session, dict):
-                    row = dict(session)
-                    row["server_id"] = server_id
-                    row["server_name"] = name
-                    row["server_url"] = base_url
-                    session_id = str(row.get("session_id") or "")
-                    if session_id:
-                        server_session_states[session_id] = str(row.get("state") or "").lower()
-                    sessions.append(row)
-        try:
-            notification_data = http_json(f"{base_url}/v1/notifications", headers={"Accept": "application/json"}, timeout=4)
-        except Exception as exc:
-            errors.append(f"{name} notifications: {compact_error(str(exc))}")
-            continue
-        if isinstance(notification_data, dict):
-            raw_notifications = notification_data.get("notifications", [])
-            if isinstance(raw_notifications, list):
-                for notification in raw_notifications:
-                    if isinstance(notification, dict):
-                        notification_session_id = str(notification.get("session_id") or "")
-                        if server_session_states.get(notification_session_id) in {"idle", "ready"}:
-                            continue
-                        row = dict(notification)
-                        row["server_id"] = server_id
-                        row["server_name"] = name
-                        row["server_url"] = base_url
-                        notifications.append(row)
+            sessions.extend(item for item in raw_sessions if isinstance(item, dict))
+        raw_notifications = result.get("notifications")
+        if isinstance(raw_notifications, list):
+            notifications.extend(item for item in raw_notifications if isinstance(item, dict))
     sessions.sort(key=lambda item: (codex_state_rank(str(item.get("state") or "")), str(item.get("updated_at") or "")), reverse=True)
     notifications.sort(
         key=lambda item: (
@@ -8085,10 +8263,21 @@ def codex_status_data(servers: list[dict[str, str]]) -> dict[str, object]:
         "notifications": notifications,
         "sessions": sessions,
         "errors": errors,
-        "servers": servers,
+        "servers": rendered_servers,
         "connected_servers": connected_servers,
         "overall_state": codex_overall_state(sessions, notifications),
     }
+
+
+def codex_server_key(server: object) -> str:
+    if not isinstance(server, dict):
+        return ""
+    base_url = str(server.get("base_url") or "").strip().rstrip("/")
+    return base_url or str(server.get("id") or "").strip()
+
+
+def codex_servers_signature(servers: list[dict[str, str]]) -> str:
+    return "\n".join(f"{server.get('id', '')}|{server.get('name', '')}|{server.get('base_url', '').strip().rstrip('/')}" for server in servers)
 
 
 def codex_state_rank(state: str) -> int:
@@ -8200,7 +8389,7 @@ def codex_session_signal_state(session: dict[str, object]) -> str:
     detail = str(session.get("state_detail") or "").lower()
     reason = str(session.get("open_reason") or "").lower()
     goal_state = str(session.get("goal_state") or "").lower()
-    if goal_state in {"achieved", "complete", "completed", "done", "success", "succeeded"}:
+    if codex_session_has_current_achieved_goal(session, goal_state):
         return "goal"
     if bool(session.get("needs_approval")) or reason == "approval":
         return "approval"
@@ -8213,6 +8402,22 @@ def codex_session_signal_state(session: dict[str, object]) -> str:
     if state in {"run", "running", "running_bash"}:
         return "working"
     return "off"
+
+
+def codex_session_has_current_achieved_goal(session: dict[str, object], goal_state: str | None = None) -> bool:
+    goal_state = (goal_state or str(session.get("goal_state") or "")).lower()
+    if goal_state not in {"achieved", "complete", "completed", "done", "success", "succeeded"}:
+        return False
+    goal_updated_at = str(session.get("goal_updated_at") or "").strip()
+    updated_at = str(session.get("updated_at") or "").strip()
+    if not goal_updated_at or not updated_at:
+        return bool(goal_updated_at)
+    try:
+        goal_time = datetime_from_iso(goal_updated_at)
+        session_time = datetime_from_iso(updated_at)
+    except ValueError:
+        return True
+    return session_time - goal_time <= CODEX_GOAL_STALE_SECONDS
 
 
 def codex_attention_session_sort_key(session: dict[str, object]) -> tuple[int, str]:

@@ -15,6 +15,7 @@ import time
 import termios
 import urllib.error
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 
@@ -43,6 +44,7 @@ LED_POWER_POLL_SECONDS = 30
 LED_BEHAVIOR_REFRESH_SECONDS = 60
 TMUX_NOTIFY_POLL_SECONDS = 5
 CODEX_LED_POLL_SECONDS = 5
+CODEX_GOAL_STALE_SECONDS = 300
 CODEX_LED_REQUEST_TIMEOUT_SECONDS = 2
 CODEX_LED_REFRESH_SECONDS = 300
 TMUX_NOTIFY_MARKER = Path(f"/run/user/{os.getuid()}/uconsole-helper-tmux-notify")
@@ -683,7 +685,7 @@ def codex_session_led_state(session: dict[str, object]) -> str:
     detail = str(session.get("state_detail") or "").lower()
     reason = str(session.get("open_reason") or "").lower()
     goal_state = str(session.get("goal_state") or "").lower()
-    if goal_state in {"achieved", "complete", "completed", "done", "success", "succeeded"}:
+    if codex_session_has_current_achieved_goal(session, goal_state):
         return "goal"
     if bool(session.get("needs_approval")) or reason == "approval":
         return "approval"
@@ -698,6 +700,38 @@ def codex_session_led_state(session: dict[str, object]) -> str:
     if state in {"run", "running", "running_bash"}:
         return "working"
     return "off"
+
+
+def codex_session_has_current_achieved_goal(session: dict[str, object], goal_state: str | None = None) -> bool:
+    goal_state = (goal_state or str(session.get("goal_state") or "")).lower()
+    if goal_state not in {"achieved", "complete", "completed", "done", "success", "succeeded"}:
+        return False
+    goal_updated_at = str(session.get("goal_updated_at") or "").strip()
+    updated_at = str(session.get("updated_at") or "").strip()
+    if not goal_updated_at or not updated_at:
+        return bool(goal_updated_at)
+    try:
+        goal_time = codex_datetime_from_iso(goal_updated_at)
+        session_time = codex_datetime_from_iso(updated_at)
+    except ValueError:
+        return True
+    return session_time - goal_time <= CODEX_GOAL_STALE_SECONDS
+
+
+def codex_datetime_from_iso(value: str) -> float:
+    normalized = value.strip().replace("Z", "+00:00")
+    if "." in normalized:
+        head, tail = normalized.split(".", 1)
+        zone = ""
+        for marker in ("+", "-"):
+            if marker in tail:
+                fraction, zone = tail.split(marker, 1)
+                zone = marker + zone
+                break
+        else:
+            fraction = tail
+        normalized = head + "." + fraction[:6] + zone
+    return datetime.fromisoformat(normalized).timestamp()
 
 
 def codex_session_key(session: dict[str, object]) -> str:
