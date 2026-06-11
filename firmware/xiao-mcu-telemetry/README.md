@@ -47,6 +47,7 @@ status
 sample
 ?
 calibrate pose
+calibrate light
 led brightness <0-100>
 led brightness base <0-100>
 led brightness auto on

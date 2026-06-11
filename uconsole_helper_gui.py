@@ -2000,9 +2000,23 @@ class UConsoleHelperWindow(Gtk.Window):
                 border-radius: 8px;
                 padding: 8px 10px;
             }
+            .inline-panel.inline-panel-success {
+                background: #142a20;
+                border-color: #2ba866;
+            }
+            .inline-panel.inline-panel-danger {
+                background: #2a1717;
+                border-color: #b84a4a;
+            }
             .inline-panel-title {
                 color: #ffd7d7;
                 font-weight: 700;
+            }
+            .inline-panel.inline-panel-success .inline-panel-title {
+                color: #baf7d5;
+            }
+            .inline-panel.inline-panel-danger .inline-panel-title {
+                color: #ffd7d7;
             }
             .inline-panel-close {
                 min-height: 28px;
@@ -4347,18 +4361,31 @@ class UConsoleHelperWindow(Gtk.Window):
         message_label = Gtk.Label(label=message, xalign=0)
         message_label.set_line_wrap(True)
         message_label.set_selectable(True)
-        self.show_inline_panel(title, [message_label], show_close=True)
+        self.show_inline_panel(title, [message_label], show_close=True, style="danger")
 
     def show_success_banner(self, title: str, message: str, timeout_ms: int = 3000) -> None:
         message_label = Gtk.Label(label=message, xalign=0)
         message_label.set_line_wrap(True)
-        self.show_inline_panel(title, [message_label], show_close=False)
+        self.show_inline_panel(title, [message_label], show_close=False, style="success")
         GLib.timeout_add(timeout_ms, self.hide_inline_panel_after_timeout)
 
-    def show_inline_panel(self, title: str, widgets: list[Gtk.Widget], show_close: bool = True) -> None:
+    def show_inline_panel(
+        self,
+        title: str,
+        widgets: list[Gtk.Widget],
+        show_close: bool = True,
+        style: str | None = None,
+    ) -> None:
         if self.inline_panel_box is None or self.inline_panel_title is None or self.inline_panel_body is None:
             print(title, file=sys.stderr)
             return
+        style_context = self.inline_panel_box.get_style_context()
+        style_context.remove_class("inline-panel-success")
+        style_context.remove_class("inline-panel-danger")
+        if style == "success":
+            style_context.add_class("inline-panel-success")
+        elif style == "danger":
+            style_context.add_class("inline-panel-danger")
         for child in list(self.inline_panel_body.get_children()):
             self.inline_panel_body.remove(child)
         self.inline_panel_title.set_text(title)

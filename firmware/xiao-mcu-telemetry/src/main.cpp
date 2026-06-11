@@ -70,6 +70,8 @@ static const uint16_t VEML7700_ALS_CONF = 0x0880;  // gain x2, 400 ms integratio
 static const uint8_t DEFAULT_WS2812_BRIGHTNESS_PERCENT = 30;
 static const uint8_t AUTO_WS2812_BRIGHTNESS_MIN_PERCENT = 1;
 static const uint8_t AUTO_WS2812_BRIGHTNESS_MAX_PERCENT = 40;
+static const uint16_t DEFAULT_LIGHT_DARK_RAW_OFFSET = 1400;
+static const uint16_t MAX_LIGHT_DARK_RAW_OFFSET = 5000;
 static const float VEML7700_LUX_PER_COUNT = 0.0072f;
 static const uint32_t LIGHT_SAMPLE_INTERVAL_MS = 1000;
 static const float LIGHT_SMOOTH_ALPHA = 0.18f;
@@ -81,6 +83,7 @@ static const float LIGHT_SPIKE_RATIO = 3.5f;
 static const uint8_t LIGHT_ZERO_REINIT_SAMPLES = 8;
 static const uint8_t LIGHT_ZERO_STABLE_SAMPLES = 3;
 static const char *POSE_CALIBRATION_FILE = "/uconsole_pose.txt";
+static const char *LIGHT_CALIBRATION_FILE = "/uconsole_light_offset.txt";
 
 static uint32_t last_sample_ms = 0;
 static uint32_t last_heartbeat_ms = 0;
@@ -144,6 +147,7 @@ static uint32_t last_mic_peak_ms = 0;
 static uint32_t mic_assist_until = 0;
 static uint16_t light_raw = 0;
 static uint16_t light_conf_raw = 0;
+static uint16_t light_dark_raw_offset = DEFAULT_LIGHT_DARK_RAW_OFFSET;
 static float light_lux = 0.0f;
 static float smoothed_light_lux = 0.0f;
 static float last_reported_light_lux = -1.0f;
@@ -172,6 +176,7 @@ struct Sample {
 static void print_status(const char *event_name, const Sample &sample);
 static float relative_delta(float a, float b);
 static void update_brightness_targets();
+static void reset_light_filter_from_current_raw();
 
 static uint32_t pixel_color(uint8_t red, uint8_t green, uint8_t blue) {
   return status_pixel.Color(red, green, blue);
@@ -364,6 +369,41 @@ static bool save_resting_orientation(const String &orientation) {
   return true;
 }
 
+static uint16_t read_saved_light_dark_raw_offset() {
+  if (!storage_ready) {
+    return DEFAULT_LIGHT_DARK_RAW_OFFSET;
+  }
+  File file(InternalFS);
+  if (!file.open(LIGHT_CALIBRATION_FILE, FILE_O_READ)) {
+    return DEFAULT_LIGHT_DARK_RAW_OFFSET;
+  }
+  char buffer[12] = {0};
+  int read_len = file.read(buffer, sizeof(buffer) - 1);
+  file.close();
+  if (read_len <= 0) {
+    return DEFAULT_LIGHT_DARK_RAW_OFFSET;
+  }
+  const long value = atol(buffer);
+  if (value < 0 || value > MAX_LIGHT_DARK_RAW_OFFSET) {
+    return DEFAULT_LIGHT_DARK_RAW_OFFSET;
+  }
+  return (uint16_t)value;
+}
+
+static bool save_light_dark_raw_offset(uint16_t offset) {
+  if (!storage_ready) {
+    return false;
+  }
+  File file(InternalFS);
+  if (!file.open(LIGHT_CALIBRATION_FILE, FILE_O_WRITE)) {
+    return false;
+  }
+  String value(offset);
+  file.write(value.c_str(), value.length());
+  file.close();
+  return true;
+}
+
 static void on_pdm_data() {
   int bytes_available = PDM.available();
   if (bytes_available <= 0) {
@@ -452,6 +492,13 @@ static bool veml7700_read16(uint8_t reg, uint16_t &value) {
   return true;
 }
 
+static uint16_t corrected_light_raw(uint16_t raw) {
+  if (raw <= light_dark_raw_offset) {
+    return 0;
+  }
+  return raw - light_dark_raw_offset;
+}
+
 static bool init_light_sensor() {
   if (!veml7700_write16(VEML7700_REG_ALS_CONF, VEML7700_ALS_CONF)) {
     light_sample_valid = false;
@@ -513,7 +560,7 @@ static void update_light_sensor(bool force) {
     light_zero_sample_count = 0;
   }
   light_raw = value;
-  light_lux = (float)value * VEML7700_LUX_PER_COUNT;
+  light_lux = (float)corrected_light_raw(value) * VEML7700_LUX_PER_COUNT;
   if (!have_smoothed_light) {
     smoothed_light_lux = light_lux;
     have_smoothed_light = true;
@@ -541,6 +588,21 @@ static void update_light_sensor(bool force) {
     smoothed_light_lux += alpha * (light_lux - smoothed_light_lux);
   }
   light_sample_valid = true;
+  update_brightness_targets();
+}
+
+static void reset_light_filter_from_current_raw() {
+  light_lux = (float)corrected_light_raw(light_raw) * VEML7700_LUX_PER_COUNT;
+  smoothed_light_lux = light_lux;
+  have_smoothed_light = true;
+  light_sample_valid = true;
+  light_spike_candidate_since = 0;
+  light_report_candidate_since = 0;
+  last_reported_light_lux = -1.0f;
+  current_screen_brightness = 0;
+  last_reported_screen_brightness = 0;
+  brightness_candidate = 0;
+  brightness_candidate_since = 0;
   update_brightness_targets();
 }
 
@@ -861,6 +923,8 @@ static void print_status(const char *event_name, const Sample &sample) {
   Serial.print(light_raw);
   Serial.print(",\"conf\":");
   Serial.print(light_conf_raw);
+  Serial.print(",\"offset\":");
+  Serial.print(light_dark_raw_offset);
   Serial.print(",\"lux\":");
   Serial.print(light_lux, 2);
   Serial.print(",\"smoothed_lux\":");
@@ -911,6 +975,25 @@ static void handle_command(const Sample &sample) {
     device_state = "held";
     save_resting_orientation(resting_orientation);
     print_status("pose_calibrated", sample);
+  } else if (command == "calibrate light" || command == "light calibrate") {
+    uint16_t value = 0;
+    if (light_ready || init_light_sensor()) {
+      delay(VEML7700_STARTUP_MS);
+      if (veml7700_read16(VEML7700_REG_ALS_DATA, value)) {
+        light_ready = true;
+        light_raw = value;
+        light_dark_raw_offset = min(value, MAX_LIGHT_DARK_RAW_OFFSET);
+        save_light_dark_raw_offset(light_dark_raw_offset);
+        reset_light_filter_from_current_raw();
+        print_status("light_calibrated", sample);
+      } else {
+        light_ready = false;
+        light_sample_valid = false;
+        print_error("light_calibration_failed");
+      }
+    } else {
+      print_error("light_calibration_failed");
+    }
   } else if (command == "stream on") {
     stream_samples = true;
     print_status("stream_on", sample);
@@ -1030,7 +1113,7 @@ static void handle_command(const Sample &sample) {
     update_mic_power(millis());
     print_status("mic_assist_off", sample);
   } else if (command == "help") {
-    Serial.println("{\"commands\":[\"status\",\"sample\",\"calibrate pose\",\"screen on\",\"screen off\",\"lock timeout <seconds>\",\"stand mode on\",\"stand mode off\",\"power ac\",\"power battery\",\"battery <percent> <charging|discharging|full>\",\"led battery on\",\"led battery off\",\"led notify on\",\"led notify off\",\"led night on\",\"led night off\",\"led brightness <0-100>\",\"led brightness base <0-100>\",\"led brightness auto on\",\"led brightness auto off\",\"led codex <off|goal|approval|attention|working>\",\"notify tmux\",\"notify clear\",\"mic assist on\",\"mic assist off\",\"stream on\",\"stream off\",\"help\"]}");
+    Serial.println("{\"commands\":[\"status\",\"sample\",\"calibrate pose\",\"calibrate light\",\"screen on\",\"screen off\",\"lock timeout <seconds>\",\"stand mode on\",\"stand mode off\",\"power ac\",\"power battery\",\"battery <percent> <charging|discharging|full>\",\"led battery on\",\"led battery off\",\"led notify on\",\"led notify off\",\"led night on\",\"led night off\",\"led brightness <0-100>\",\"led brightness base <0-100>\",\"led brightness auto on\",\"led brightness auto off\",\"led codex <off|goal|approval|attention|working>\",\"notify tmux\",\"notify clear\",\"mic assist on\",\"mic assist off\",\"stream on\",\"stream off\",\"help\"]}");
   }
 }
 
@@ -1053,6 +1136,7 @@ void setup() {
   delay(300);
 
   storage_ready = InternalFS.begin();
+  light_dark_raw_offset = read_saved_light_dark_raw_offset();
   Wire.begin();
   imu_ready = (imu.begin() == 0);
   light_ready = init_light_sensor();
