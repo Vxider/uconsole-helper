@@ -21,7 +21,7 @@ from pathlib import Path
 
 CONFIG_FILE = Path(os.environ.get("UCONSOLE_HELPER_CONFIG", "/etc/uconsole-helper/uconsole-helper.conf"))
 CODEX_HELPER_CONFIG = Path.home() / ".config/uconsole-helper/codex-servers.json"
-CODEX_DISMISSED_SESSIONS = Path.home() / ".cache/uconsole-helper/codex-dismissed-sessions.json"
+CODEX_LED_STATUS_FILE = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "uconsole-helper/codex-led.json"
 POWER_SUPPLY_DIR = Path("/sys/class/power_supply")
 DISPLAY_CONTROL = "/usr/local/bin/uconsole-helper-mapper-display-control"
 DISPLAY_BACKLIGHT_POWER = Path("/sys/class/backlight/backlight@0/bl_power")
@@ -47,6 +47,7 @@ CODEX_LED_POLL_SECONDS = 5
 CODEX_GOAL_STALE_SECONDS = 300
 CODEX_LED_REQUEST_TIMEOUT_SECONDS = 2
 CODEX_LED_REFRESH_SECONDS = 300
+CODEX_LED_STATUS_STALE_SECONDS = 60
 TMUX_NOTIFY_MARKER = Path(f"/run/user/{os.getuid()}/uconsole-helper-tmux-notify")
 TMUX_CLEAR_MARKER = Path(f"/run/user/{os.getuid()}/uconsole-helper-tmux-clear")
 INPUT_EVENT_FORMAT = "llHHI"
@@ -734,77 +735,41 @@ def codex_datetime_from_iso(value: str) -> float:
     return datetime.fromisoformat(normalized).timestamp()
 
 
-def codex_session_key(session: dict[str, object]) -> str:
-    server_url = str(session.get("server_url") or "").strip().rstrip("/")
-    session_id = str(session.get("session_id") or "").strip()
-    if not session_id:
-        return ""
-    return f"{server_url}|{session_id}"
-
-
-def codex_load_dismissed_sessions(path: Path = CODEX_DISMISSED_SESSIONS) -> dict[str, object]:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    if isinstance(data, dict):
-        result: dict[str, object] = {}
-        for key, value in data.items():
-            if isinstance(value, dict):
-                result[str(key)] = value
-                continue
-            try:
-                result[str(key)] = {"dismissed_at": float(value)}
-            except (TypeError, ValueError):
-                continue
-        return result
-    if isinstance(data, list):
-        return {str(item): {} for item in data}
-    return {}
-
-
-def codex_session_dismiss_fingerprint(session: dict[str, object]) -> dict[str, object]:
-    return {
-        "state": str(session.get("state") or ""),
-        "state_detail": str(session.get("state_detail") or ""),
-        "updated_at": str(session.get("updated_at") or ""),
-        "open_reason": str(session.get("open_reason") or ""),
-        "needs_approval": bool(session.get("needs_approval")),
-        "needs_open": bool(session.get("needs_open")),
-    }
-
-
-def codex_session_dismissed_matches(session: dict[str, object], dismissed_value: object) -> bool:
-    if not isinstance(dismissed_value, dict):
-        return True
-    if "state" not in dismissed_value and "updated_at" not in dismissed_value:
-        return True
-    current = codex_session_dismiss_fingerprint(session)
-    return all(
-        dismissed_value.get(key) == current.get(key)
-        for key in ("state", "state_detail", "updated_at", "open_reason", "needs_approval", "needs_open")
-    )
-
-
-def codex_session_dismissed(session: dict[str, object], dismissed: dict[str, object]) -> bool:
-    key = codex_session_key(session)
-    return bool(key and key in dismissed and codex_session_dismissed_matches(session, dismissed[key]))
-
-
 def stronger_codex_state(current: str, candidate: str) -> str:
     priority = {"off": 0, "working": 10, "attention": 20, "approval": 30, "goal": 40}
     return candidate if priority.get(candidate, 0) > priority.get(current, 0) else current
 
 
+def load_codex_led_status(path: Path = CODEX_LED_STATUS_FILE) -> str | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    state = str(payload.get("state") or "").strip().lower()
+    if state not in {"off", "goal", "approval", "attention", "working"}:
+        return None
+    try:
+        updated_at = float(payload.get("updated_at") or 0)
+    except (TypeError, ValueError):
+        return None
+    if updated_at <= 0 or time.time() - updated_at > CODEX_LED_STATUS_STALE_SECONDS:
+        return None
+    return state
+
+
 def aggregate_codex_led_state(values: dict[str, str]) -> str:
     if not config_enabled(values, "MCU_LED_CODEX_ENABLED", "0"):
         return "off"
+    runtime_state = load_codex_led_status()
+    if runtime_state is not None:
+        return runtime_state
     urls = codex_server_urls(values)
     if not urls:
         return "off"
     aggregate = "off"
     connected = False
-    dismissed_sessions = codex_load_dismissed_sessions()
     for url in urls:
         try:
             status = load_codex_status(url)
@@ -818,8 +783,6 @@ def aggregate_codex_led_state(values: dict[str, str]) -> str:
                 if isinstance(session, dict):
                     if "server_url" not in session:
                         session = {**session, "server_url": url.rstrip("/")}
-                    if codex_session_dismissed(session, dismissed_sessions):
-                        continue
                     aggregate = stronger_codex_state(aggregate, codex_session_led_state(session))
         else:
             state = str(status.get("overall_state") or "").lower()
