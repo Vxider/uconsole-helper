@@ -1188,7 +1188,10 @@ stop_recording() {
   fi
   stream_status=$(jq -r '.status // empty' "${STREAM_RESULT_FILE}")
   stream_error=$(jq -r '.error // empty' "${STREAM_RESULT_FILE}")
-  if [[ "${stream_status}" == "error" ]]; then
+  local text
+  text=$(jq -r '(.text // "") as $text | if ($text | length) > 0 then $text else (.streamText // "") end' "${STREAM_RESULT_FILE}" | normalize_transcript)
+
+  if [[ "${stream_status}" == "error" && -z "${text}" ]]; then
     if [[ "${suppress_asr_status}" != "1" ]]; then
       show_recording_popup_message_then_close "${stream_error:-语音识别失败}" 2
     else
@@ -1197,9 +1200,6 @@ stop_recording() {
     rm -f "${STREAM_RESULT_FILE:-}" "${STREAM_STOP_FILE:-}"
     exit 1
   fi
-
-  local text
-  text=$(jq -r '.text // empty' "${STREAM_RESULT_FILE}" | normalize_transcript)
 
   if [[ -z "${text}" ]]; then
     if [[ "${suppress_asr_status}" != "1" ]]; then

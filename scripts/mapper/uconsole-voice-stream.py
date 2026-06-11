@@ -772,11 +772,14 @@ class SegmentingTranscriptionSession:
         return commands[0]
 
     def write_result(self, *, status: str, error: str = "") -> None:
+        text = normalize_text(self.final_text)
+        if status == "error" and not text:
+            text = normalize_text(self.qwen_preview_text)
         payload = {
             "status": status,
             "requestId": self.last_request_id,
-            "text": normalize_text(self.final_text),
-            "rawText": normalize_text(self.raw_text or self.final_text),
+            "text": text,
+            "rawText": normalize_text(self.raw_text or self.final_text or text),
             "streamText": normalize_text(self.qwen_preview_text),
             "correctedText": normalize_text(self.corrected_text),
             "error": error,
