@@ -73,6 +73,8 @@ Supported variables:
                       endpoint for finalizing streaming text; derived from ASR_URL when empty
   ASR_PREVIEW_FINAL_WAIT_SECONDS
                       seconds to wait for Qwen streaming final after stop, default: 1.5
+  ASR_PREVIEW_WS_SEND_TIMEOUT
+                      max seconds a preview websocket audio send may block, default: 0.25
   VOICE_OUTPUT_MODE      type | type_enter | clipboard | paste | fcitx_commit, default: type
   VOICE_TMUX_OUTPUT_MODE output mode used when a tmux/terminal window is focused, default: type
   VOICE_WECHAT_OUTPUT_MODE
@@ -944,6 +946,7 @@ start_recording() {
     ASR_PREVIEW_FINAL_WAIT_SECONDS="${ASR_PREVIEW_FINAL_WAIT_SECONDS}" \
     ASR_PREVIEW_FINAL_STABLE_WAIT_SECONDS="${ASR_PREVIEW_FINAL_STABLE_WAIT_SECONDS}" \
     ASR_PREVIEW_WS_TIMEOUT="${ASR_PREVIEW_WS_TIMEOUT}" \
+    ASR_PREVIEW_WS_SEND_TIMEOUT="${ASR_PREVIEW_WS_SEND_TIMEOUT}" \
     ASR_PROMPT="${ASR_PROMPT}" \
     ASR_PROMPT_FIELD="${ASR_PROMPT_FIELD}" \
     ASR_PROMPT_GLOSSARY="${prompt_glossary_json}" \
@@ -1333,6 +1336,7 @@ ASR_FINALIZE_TEXT_URL=${ASR_FINALIZE_TEXT_URL:-}
 ASR_PREVIEW_FINAL_WAIT_SECONDS=${ASR_PREVIEW_FINAL_WAIT_SECONDS:-1.5}
 ASR_PREVIEW_FINAL_STABLE_WAIT_SECONDS=${ASR_PREVIEW_FINAL_STABLE_WAIT_SECONDS:-0.5}
 ASR_PREVIEW_WS_TIMEOUT=${ASR_PREVIEW_WS_TIMEOUT:-2}
+ASR_PREVIEW_WS_SEND_TIMEOUT=${ASR_PREVIEW_WS_SEND_TIMEOUT:-0.25}
 VOICE_STREAM_PREVIEW=${VOICE_STREAM_PREVIEW:-1}
 VOICE_QWEN_ASR_STREAMING=${VOICE_QWEN_ASR_STREAMING:-1}
 VOICE_NOTIFY_WHILE_PREVIEW=${VOICE_NOTIFY_WHILE_PREVIEW:-0}

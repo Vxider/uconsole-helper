@@ -186,7 +186,7 @@ def append_log(message: str) -> None:
         pass
 
 
-def write_popup_text(value: str, *, volume: float | None = None, animate: bool = False) -> bool:
+def write_popup_text(value: str, *, volume: float | None = None, animate: bool = False, pulse: bool = False) -> bool:
     text = normalize_text(value)
     if not text:
         return False
@@ -209,6 +209,8 @@ def write_popup_text(value: str, *, volume: float | None = None, animate: bool =
             handle.write(f"# {text}\n")
             if volume is not None:
                 handle.write(f"@volume={max(0.0, min(1.0, volume)):.3f}\n")
+            if pulse:
+                handle.write("@pulse=1\n")
             if animate:
                 handle.write("@animate=1\n")
             temp_name = handle.name
@@ -313,6 +315,7 @@ class QwenAsrStreamingPreview:
         self.sample_rate = sample_rate
         self.channels = channels
         self.timeout = max(0.2, env_float("ASR_PREVIEW_WS_TIMEOUT", 2.0))
+        self.send_timeout = max(0.05, env_float("ASR_PREVIEW_WS_SEND_TIMEOUT", min(0.25, self.timeout)))
         self.final_wait_seconds = max(0.1, env_float("ASR_PREVIEW_FINAL_WAIT_SECONDS", 1.5))
         self.final_stable_wait_seconds = max(0.1, env_float("ASR_PREVIEW_FINAL_STABLE_WAIT_SECONDS", 0.5))
         self.sock: socket.socket | ssl.SSLSocket | None = None
@@ -402,7 +405,15 @@ class QwenAsrStreamingPreview:
         with self.send_lock:
             if self.sock is None or not self.connected:
                 return
-            self.sock.sendall(header + mask + masked)
+            old_timeout = self.sock.gettimeout()
+            self.sock.settimeout(self.send_timeout)
+            try:
+                self.sock.sendall(header + mask + masked)
+            finally:
+                try:
+                    self.sock.settimeout(old_timeout)
+                except Exception:
+                    pass
 
     def recv_exact(self, size: int) -> bytes:
         if self.sock is None:
@@ -1031,6 +1042,7 @@ class SegmentingTranscriptionSession:
                 break
             recording.extend(data)
             drained += len(data)
+            self.update_recording_popup_volume(data)
             if self.qwen_preview is not None:
                 self.qwen_preview.accept_pcm(data)
         if drained:
@@ -1087,13 +1099,13 @@ class SegmentingTranscriptionSession:
                         )
                         break
                     recording.extend(data)
+                    self.update_recording_popup_volume(data)
                     qwen_preview_text = self.ensure_qwen_preview().accept_pcm(data)
                     if qwen_preview_text:
                         self.qwen_preview_text = qwen_preview_text
                         self.popup_text = qwen_preview_text
                         if not env_bool("VOICE_STREAM_NOTIFY_FROM_READER", True):
                             notify_text(qwen_preview_text, progress=35, notify_id=os.environ.get("VOICE_RECORDING_NOTIFY_ID", "991200"), animate=True)
-                    self.update_recording_popup_volume(data)
                 try:
                     if recorder.poll() is None:
                         self.drain_recorder_stdout(recorder, recording, frame_bytes)
@@ -1115,6 +1127,7 @@ class SegmentingTranscriptionSession:
                 write_popup_text(qwen_text)
             preferred_text = normalize_text(qwen_text)
             finalized_from_stream = False
+            write_popup_text("识别中", pulse=True)
             if preferred_text:
                 try:
                     finalized_text = self.finalize_streaming_text(preferred_text)
