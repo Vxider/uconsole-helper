@@ -154,7 +154,6 @@ install_service() {
     ensure_config_key "${config_file}" "POWERSAVER_PERFORMANCE_AUTO_BATTERY_PUTDOWN_TIMEOUT_SEC" "120"
     ensure_config_key "${config_file}" "POWERSAVER_PERFORMANCE_AUTO_AC_PUTDOWN_TIMEOUT_SEC" "300"
     ensure_config_key "${config_file}" "POWERSAVER_PERFORMANCE_BATTERY_IDLE_SHUTDOWN_TIMEOUT_SEC" "-1"
-    ensure_config_key "${config_file}" "POWERSAVER_SAVE_TMUX_ON_SHUTDOWN" "1"
     ensure_config_key "${config_file}" "MCU_LED_BATTERY_ENABLED" "1"
     remove_config_key "${config_file}" "MCU_LED_LXTERMINAL_BELL_ENABLED"
     ensure_config_key "${config_file}" "MCU_LED_NIGHT_MODE_ENABLED" "1"
@@ -333,7 +332,6 @@ install_mapper() {
   install -m 0755 "${APP_DIR}/scripts/mapper/uconsole-paste.sh" "${bin_dir}/uconsole-paste"
   install -m 0755 "${APP_DIR}/scripts/mapper/uconsole-voice-ptt.sh" "${bin_dir}/uconsole-voice-ptt"
   install -m 0755 "${APP_DIR}/scripts/mapper/uconsole-voice-stream.py" "${bin_dir}/uconsole-voice-stream"
-  install -m 0755 "${APP_DIR}/scripts/user/uconsole-save-tmux-layout" "${bin_dir}/uconsole-save-tmux-layout"
   if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists gtk+-3.0 gtk-layer-shell-0; then
     cc "${APP_DIR}/scripts/mapper/uconsole-asr-popup.c" -o "${bin_dir}/uconsole-asr-popup" $(pkg-config --cflags --libs gtk+-3.0 gtk-layer-shell-0)
     chmod 0755 "${bin_dir}/uconsole-asr-popup"

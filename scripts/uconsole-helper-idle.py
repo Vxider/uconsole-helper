@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import atexit
 import json
 import select
 import shlex
@@ -27,7 +28,6 @@ DISPLAY_CONTROL = "/usr/local/bin/uconsole-helper-mapper-display-control"
 DISPLAY_BACKLIGHT_POWER = Path("/sys/class/backlight/backlight@0/bl_power")
 DISPLAY_BACKLIGHT_BRIGHTNESS = Path("/sys/class/backlight/backlight@0/brightness")
 KEYBOARD_BACKLIGHT_SCRIPT = Path("~/WorkSpace/uconsole-keyboard/tools/keyboard_state.sh").expanduser()
-TMUX_SAVE_SCRIPT = Path("~/WorkSpace/uconsole-helper/scripts/user/uconsole-save-tmux-layout").expanduser()
 MCU_SHARED_SAMPLE_FILE = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "uconsole-helper-mcu-latest.json"
 POLL_SECONDS = 1
 CONFIG_POLL_SECONDS = 15
@@ -50,6 +50,7 @@ CODEX_LED_REFRESH_SECONDS = 300
 CODEX_LED_STATUS_STALE_SECONDS = 60
 TMUX_NOTIFY_MARKER = Path(f"/run/user/{os.getuid()}/uconsole-helper-tmux-notify")
 TMUX_CLEAR_MARKER = Path(f"/run/user/{os.getuid()}/uconsole-helper-tmux-clear")
+DEFAULT_BATTERY_LOCK_PAUSE_PROCESS_NAMES = "chromium,chromium-browser,chrome,google-chrome,firefox,brave-browser"
 INPUT_EVENT_FORMAT = "llHHI"
 INPUT_EVENT_SIZE = struct.calcsize(INPUT_EVENT_FORMAT)
 INPUT_ACTIVITY_TYPES = {1, 2}
@@ -626,6 +627,129 @@ def config_enabled(values: dict[str, str], key: str, default: str = "1") -> bool
     return value in {"1", "yes", "true", "on", "enabled"}
 
 
+def split_process_names(value: str) -> set[str]:
+    return {item.strip().lower() for item in value.replace("\n", ",").replace(";", ",").split(",") if item.strip()}
+
+
+class BatteryLockProcessPauser:
+    def __init__(self) -> None:
+        self.paused_pids: set[int] = set()
+        self.uid = os.getuid()
+
+    def close(self) -> None:
+        self.resume_all(reason="idle service stopping")
+
+    def tick(self, values: dict[str, str], state: str, display_off: bool) -> None:
+        profile = current_profile(values)
+        enabled = config_enabled(
+            values,
+            f"POWERSAVER_{profile}_BATTERY_LOCK_PAUSE_ENABLED",
+            values.get("POWERSAVER_BATTERY_LOCK_PAUSE_ENABLED", "0"),
+        )
+        if not enabled or state != "battery" or not display_off:
+            self.resume_all(reason="battery lock pause inactive")
+            return
+        names = split_process_names(
+            values.get(
+                f"POWERSAVER_{profile}_BATTERY_LOCK_PAUSE_PROCESSES",
+                values.get("POWERSAVER_BATTERY_LOCK_PAUSE_PROCESSES", DEFAULT_BATTERY_LOCK_PAUSE_PROCESS_NAMES),
+            )
+        )
+        if not names:
+            self.resume_all(reason="no battery lock pause targets")
+            return
+        matched = self.matching_pids(names)
+        for pid in sorted(matched - self.paused_pids):
+            self.pause_pid(pid)
+        for pid in sorted(self.paused_pids - matched):
+            if Path(f"/proc/{pid}").exists():
+                self.resume_pid(pid, reason="battery lock pause target changed")
+            else:
+                self.paused_pids.discard(pid)
+
+    def matching_pids(self, names: set[str]) -> set[int]:
+        current_pid = os.getpid()
+        matched: set[int] = set()
+        for proc in Path("/proc").iterdir():
+            if not proc.name.isdigit():
+                continue
+            pid = int(proc.name)
+            if pid == current_pid:
+                continue
+            try:
+                stat = proc.stat()
+            except OSError:
+                continue
+            if stat.st_uid != self.uid:
+                continue
+            if self.proc_matches(proc, names):
+                matched.add(pid)
+        return matched
+
+    def proc_matches(self, proc: Path, names: set[str]) -> bool:
+        candidates = [
+            read_text(proc / "comm"),
+        ]
+        try:
+            candidates.append(Path(os.readlink(proc / "exe")).name)
+        except OSError:
+            pass
+        try:
+            raw_cmdline = (proc / "cmdline").read_bytes().decode("utf-8", errors="ignore")
+        except OSError:
+            raw_cmdline = ""
+        cmdline = [part for part in raw_cmdline.split("\0") if part]
+        if cmdline:
+            candidates.append(Path(cmdline[0]).name)
+            candidates.extend(cmdline)
+        lowered = [candidate.lower() for candidate in candidates if candidate]
+        return any(name in lowered or any(name in candidate for candidate in lowered) for name in names)
+
+    def pause_pid(self, pid: int) -> None:
+        if process_state(pid) in {"T", "t"}:
+            return
+        try:
+            os.kill(pid, signal.SIGSTOP)
+        except ProcessLookupError:
+            return
+        except PermissionError as exc:
+            print(f"warning: failed to pause pid={pid}: {exc}", flush=True)
+            return
+        self.paused_pids.add(pid)
+        print(f"battery lock pause: stopped pid={pid} {process_label(pid)}", flush=True)
+
+    def resume_all(self, reason: str) -> None:
+        for pid in sorted(self.paused_pids):
+            self.resume_pid(pid, reason=reason)
+        self.paused_pids.clear()
+
+    def resume_pid(self, pid: int, reason: str) -> None:
+        try:
+            os.kill(pid, signal.SIGCONT)
+        except ProcessLookupError:
+            self.paused_pids.discard(pid)
+        except PermissionError as exc:
+            print(f"warning: failed to resume pid={pid}: {exc}", flush=True)
+        else:
+            print(f"battery lock pause: resumed pid={pid} reason={reason}", flush=True)
+            self.paused_pids.discard(pid)
+
+
+def process_label(pid: int) -> str:
+    name = read_text(Path(f"/proc/{pid}/comm"))
+    if name:
+        return name
+    return "-"
+
+
+def process_state(pid: int) -> str:
+    text = read_text(Path(f"/proc/{pid}/stat"))
+    try:
+        return text.rsplit(") ", 1)[1].split(" ", 1)[0]
+    except IndexError:
+        return ""
+
+
 def codex_server_urls(values: dict[str, str]) -> list[str]:
     urls = codex_server_urls_from_config()
     if urls:
@@ -825,24 +949,6 @@ def battery_idle_shutdown_timeout(values: dict[str, str], state: str) -> int:
     if state != "battery":
         return -1
     return int_config(values, f"POWERSAVER_{current_profile(values)}_BATTERY_IDLE_SHUTDOWN_TIMEOUT_SEC", -1)
-
-
-def save_tmux_on_shutdown_enabled(values: dict[str, str]) -> bool:
-    return config_enabled(values, "POWERSAVER_SAVE_TMUX_ON_SHUTDOWN", "1")
-
-
-def save_tmux_layout(values: dict[str, str]) -> None:
-    if not save_tmux_on_shutdown_enabled(values):
-        return
-    script = Path(values.get("POWERSAVER_SAVE_TMUX_SCRIPT", str(TMUX_SAVE_SCRIPT))).expanduser()
-    if not script.exists():
-        script = Path.home() / ".local/bin/uconsole-save-tmux-layout"
-    if not script.exists():
-        return
-    try:
-        subprocess.run([str(script)], text=True, capture_output=True, timeout=12, check=False)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        print(f"warning: tmux layout save failed before shutdown: {exc}", flush=True)
 
 
 def request_poweroff(reason: str) -> None:
@@ -1178,6 +1284,8 @@ def main() -> int:
     auto_brightness_state = AutoBrightnessState()
     mcu_reader = McuSerialReader()
     host_input = HostInputMonitor()
+    process_pauser = BatteryLockProcessPauser()
+    atexit.register(process_pauser.close)
     display_cache = DisplayStateCache()
     reported_display_off: bool | None = None
     last_led_power_update = 0.0
@@ -1209,7 +1317,6 @@ def main() -> int:
         if idle_shutdown_timeout > 0 and idle_seconds >= idle_shutdown_timeout:
             if not idle_shutdown_requested:
                 idle_shutdown_requested = True
-                save_tmux_layout(values)
                 request_poweroff(
                     f"battery idle for {idle_seconds:.0f}s >= {idle_shutdown_timeout}s "
                     f"profile={current_profile(values).lower()}"
@@ -1302,6 +1409,7 @@ def main() -> int:
             display_cache.mark_on()
             auto_brightness_state.request_screen_on_apply()
             was_display_off = False
+        process_pauser.tick(values, state, was_display_off)
         active_power_state = state
         active_screen_mode = screen_mode
         last_display_off = was_display_off
@@ -1309,6 +1417,8 @@ def main() -> int:
 
     mcu_reader.close()
     host_input.close()
+    process_pauser.close()
+    atexit.unregister(process_pauser.close)
     stop_process(process)
     return 0
 

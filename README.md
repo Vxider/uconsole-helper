@@ -204,6 +204,12 @@ The controls edit the powersaver policy in `/etc/uconsole-helper/uconsole-helper
 - `{Mode} Unknown`: unknown-power action for that mode, one of `AC`, `Battery`,
   or `Keep`
 - `{Mode} WWAN`: WWAN policy for that mode, one of `ondemand`, `keep`, or `off`
+- `{Mode} Pause Apps`: when enabled for the active mode, the user idle service
+  sends `SIGSTOP` to listed current-user processes while on battery and the
+  screen is locked/off, then sends `SIGCONT` when the screen wakes or power is
+  no longer battery.
+- `{Mode} Pause List`: comma-separated process names or command fragments for
+  that mode, defaulting to common browser process names.
 
 `Save Policy` writes the config through `pkexec` or `sudo` and restarts
 `uconsole-helper.service`. The user idle service watches the same config and
