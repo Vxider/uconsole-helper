@@ -669,6 +669,36 @@ class SegmentingTranscriptionSession:
         signal.signal(signal.SIGTERM, self._signal_stop)
         signal.signal(signal.SIGINT, self._signal_stop)
 
+    def popup_preview_text(self) -> str:
+        popup_text_file = os.environ.get("VOICE_RECORDING_POPUP_TEXT_FILE", "").strip()
+        if not popup_text_file:
+            return ""
+        try:
+            for line in Path(popup_text_file).read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line.startswith("#"):
+                    text = normalize_text(line[1:])
+                    if text and text not in {"录音中", "识别中", "未识别到文本", "语音识别失败"}:
+                        return text
+                    return ""
+        except Exception:
+            return ""
+        return ""
+
+    def sync_qwen_preview_text(self) -> str:
+        candidates: list[str] = []
+        if self.qwen_preview is not None:
+            candidates.append(self.qwen_preview.current_text())
+        candidates.append(self.qwen_preview_text)
+        candidates.append(self.popup_preview_text())
+        for candidate in candidates:
+            text = normalize_text(candidate)
+            if text:
+                self.qwen_preview_text = text
+                self.popup_text = text
+                return text
+        return ""
+
     def ensure_qwen_preview(self) -> QwenAsrStreamingPreview:
         if self.qwen_preview is None:
             self.qwen_preview = QwenAsrStreamingPreview(sample_rate=self.sample_rate, channels=self.channels)
@@ -783,15 +813,16 @@ class SegmentingTranscriptionSession:
         return commands[0]
 
     def write_result(self, *, status: str, error: str = "") -> None:
+        stream_text = self.sync_qwen_preview_text()
         text = normalize_text(self.final_text)
         if status == "error" and not text:
-            text = normalize_text(self.qwen_preview_text)
+            text = stream_text
         payload = {
             "status": status,
             "requestId": self.last_request_id,
             "text": text,
             "rawText": normalize_text(self.raw_text or self.final_text or text),
-            "streamText": normalize_text(self.qwen_preview_text),
+            "streamText": stream_text,
             "correctedText": normalize_text(self.corrected_text),
             "error": error,
         }
@@ -1125,7 +1156,7 @@ class SegmentingTranscriptionSession:
                 self.qwen_preview_text = qwen_text
                 self.popup_text = qwen_text
                 write_popup_text(qwen_text)
-            preferred_text = normalize_text(qwen_text)
+            preferred_text = normalize_text(qwen_text or self.sync_qwen_preview_text())
             finalized_from_stream = False
             write_popup_text("识别中", pulse=True)
             if preferred_text:
