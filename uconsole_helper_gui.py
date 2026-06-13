@@ -55,7 +55,6 @@ MAPPER_GLOSSARY_FILE = Path.home() / ".config/uconsole-helper-mapper/voice-gloss
 CPA_GUI_CONFIG = Path.home() / ".config/uconsole-helper/cpa.env"
 CPA_STATUS_CACHE = Path.home() / ".cache/uconsole-helper/cpa-status.json"
 CODEX_HELPER_CONFIG = Path.home() / ".config/uconsole-helper/codex-servers.json"
-CODEX_DISMISSED_SESSIONS = Path.home() / ".cache/uconsole-helper/codex-dismissed-sessions.json"
 MCU_SHARED_SAMPLE_FILE = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "uconsole-helper-mcu-latest.json"
 BATTERY_CALIBRATE_PATH = Path("/sys/class/power_supply/axp20x-battery/calibrate")
 DISPLAY_BACKLIGHT_BRIGHTNESS_PATH = Path("/sys/class/backlight/backlight@0/brightness")
@@ -431,7 +430,7 @@ class UConsoleHelperWindow(Gtk.Window):
         self.cpa_last_refresh_at = 0.0
         self.cpa_loaded_once = False
         self.codex_server_store = Gtk.ListStore(str, str, str, str)
-        self.codex_session_store = Gtk.ListStore(str, str, str, str, str, str, str, str, bool, bool, str)
+        self.codex_session_store = Gtk.ListStore(str, str, str, str, str, str, str, str, bool, str)
         self.codex_notification_store = Gtk.ListStore(str, str, str, str, str, str, str, bool, str)
         self.codex_server_tree: Gtk.TreeView | None = None
         self.codex_session_tree: Gtk.TreeView | None = None
@@ -440,7 +439,6 @@ class UConsoleHelperWindow(Gtk.Window):
         self.codex_server_strip = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.codex_settings_card: Gtk.Widget | None = None
         self.codex_settings_visible = False
-        self.codex_dismissed_sessions = codex_load_dismissed_sessions()
         self.codex_settings_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         self.codex_open_section: Gtk.Widget | None = None
         self.codex_open_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -1432,7 +1430,6 @@ class UConsoleHelperWindow(Gtk.Window):
         data = self.codex_last_data
         self.codex_relative_time_labels = []
         sessions = [item for item in data.get("sessions", []) if isinstance(item, dict)]
-        self.codex_dismissed_sessions = codex_prune_dismissed_sessions(self.codex_dismissed_sessions, sessions)
         notifications = [item for item in data.get("notifications", []) if isinstance(item, dict)]
         data_servers = data.get("servers", [])
         if isinstance(data_servers, list) and data_servers:
@@ -1445,19 +1442,13 @@ class UConsoleHelperWindow(Gtk.Window):
             ]
         connected_servers = set(data.get("connected_servers", [])) if isinstance(data.get("connected_servers"), list) else set()
         open_sessions = []
-        dismissed_sessions = []
         other_sessions = []
         for session in sessions:
-            if codex_session_dismissed(session, self.codex_dismissed_sessions):
-                muted_session = dict(session)
-                muted_session["_codex_dismissed_attention"] = True
-                dismissed_sessions.append(muted_session)
-                continue
             if codex_needs_attention(session):
                 open_sessions.append(session)
             else:
                 other_sessions.append(session)
-        display_sessions = open_sessions + dismissed_sessions + other_sessions
+        display_sessions = open_sessions + other_sessions
         signal_state = codex_aggregate_signal_state(display_sessions)
         badge_text, badge_class = codex_badge_style(signal_state)
         replace_style_classes(self.codex_badge_label, {"codex-goal", "codex-approval", "codex-ready", "codex-working", "codex-offline"}, badge_class)
@@ -1466,7 +1457,6 @@ class UConsoleHelperWindow(Gtk.Window):
         self.render_codex_server_strip(servers, connected_servers)
         self.render_codex_settings([server for server in servers if str(server.get("built_in") or "") != "local"], connected_servers, data)
         open_sessions.sort(key=codex_attention_session_sort_key, reverse=True)
-        other_sessions = dismissed_sessions + other_sessions
         other_sessions.sort(key=codex_session_list_sort_key, reverse=True)
         self.render_codex_open_sessions(open_sessions)
         self.render_codex_sessions(other_sessions, bool(open_sessions))
@@ -1588,10 +1578,6 @@ class UConsoleHelperWindow(Gtk.Window):
                 button = codex_action_button("Continue", "codex-chip-working")
                 button.connect("clicked", lambda _button, item=dict(session): self.codex_run_session_action(item, "continue"))
                 header.pack_start(button, False, False, 0)
-        if codex_session_key(session) and not bool(session.get("_codex_dismissed_attention")):
-            button = codex_action_button("Close", "codex-chip-offline")
-            button.connect("clicked", lambda _button, item=dict(session): self.dismiss_codex_session_card(item))
-            header.pack_start(button, False, False, 0)
         row.pack_start(header, False, False, 0)
         summary_text = codex_session_summary(session, codex_session_fallback_summary(session, open_style))
         if summary_text:
@@ -3639,7 +3625,7 @@ class UConsoleHelperWindow(Gtk.Window):
                 if isinstance(session, dict):
                     self.append_codex_session_row(session)
         if len(self.codex_session_store) == 0:
-            self.codex_session_store.append(["-", "-", "idle", "No sessions", "-", "-", "", "", False, False, ""])
+            self.codex_session_store.append(["-", "-", "idle", "No sessions", "-", "-", "", "", False, ""])
         self.codex_summary_label.set_text(str(data.get("summary", "-")))
         self.codex_last_refresh_at = time.time()
         self.codex_status_label.set_text(f"Updated {codex_relative_timestamp(self.codex_last_refresh_at)}")
@@ -3648,9 +3634,6 @@ class UConsoleHelperWindow(Gtk.Window):
         self.update_header()
 
     def codex_run_session_action(self, session: dict[str, object], action: str) -> None:
-        if action == "close":
-            self.dismiss_codex_session_card(session)
-            return
         server_url = str(session.get("server_url") or "")
         session_id = str(session.get("session_id") or "")
         if not server_url or not session_id:
@@ -3665,16 +3648,6 @@ class UConsoleHelperWindow(Gtk.Window):
         payload = {"server_url": server_url, "session_id": session_id, "action_token": token}
         thread = threading.Thread(target=self._codex_session_action_worker, args=(payload, action), daemon=True)
         thread.start()
-
-    def dismiss_codex_session_card(self, session: dict[str, object]) -> None:
-        key = codex_session_key(session)
-        if not key:
-            self.codex_status_label.set_text("Codex card close failed: missing session id.")
-            return
-        self.codex_dismissed_sessions[key] = codex_session_dismiss_fingerprint(session)
-        codex_save_dismissed_sessions(self.codex_dismissed_sessions)
-        self.codex_status_label.set_text("Codex card closed.")
-        self.render_codex_page()
 
     def primary_codex_notification(self) -> dict[str, object] | None:
         notifications = self.codex_last_data.get("notifications", [])
@@ -3727,13 +3700,12 @@ class UConsoleHelperWindow(Gtk.Window):
         summary = str(session.get("open_summary") or session.get("summary") or "-")
         updated = codex_updated_label(session.get("updated_at"))
         can_continue = bool(session.get("can_continue"))
-        can_close = bool(session.get("can_close"))
         token = ""
         action = session.get("continue_action")
         if isinstance(action, dict):
             token = str(action.get("action_token") or "")
         self.codex_session_store.append(
-            [server, session_id, state, title, summary, updated, server_url, token, can_continue, can_close, ""]
+            [server, session_id, state, title, summary, updated, server_url, token, can_continue, ""]
         )
         return False
 
@@ -3782,7 +3754,6 @@ class UConsoleHelperWindow(Gtk.Window):
             "server_url": str(model.get_value(tree_iter, 6) or ""),
             "action_token": str(model.get_value(tree_iter, 7) or ""),
             "can_continue": bool(model.get_value(tree_iter, 8)),
-            "can_close": bool(model.get_value(tree_iter, 9)),
         }
 
     def codex_continue_selected_session(self) -> None:
@@ -3817,13 +3788,6 @@ class UConsoleHelperWindow(Gtk.Window):
         self.codex_status_label.set_text("Sending continue...")
         thread = threading.Thread(target=self._codex_notification_action_worker, args=(notification, "continue"), daemon=True)
         thread.start()
-
-    def codex_close_selected_session(self) -> None:
-        session = self.selected_codex_session()
-        if not session or not session["session_id"] or not session["server_url"]:
-            self.show_error("Codex close", "Select a Codex session first.")
-            return
-        self.dismiss_codex_session_card(session)
 
     def _codex_session_action_worker(self, session: dict[str, object], action: str) -> None:
         try:
@@ -8411,8 +8375,6 @@ def codex_badge_style(signal_state: str) -> tuple[str, str]:
 
 
 def codex_session_badge_text(session: dict[str, object]) -> str:
-    if bool(session.get("_codex_dismissed_attention")):
-        return "Closed"
     state = str(session.get("state") or "").lower()
     detail = str(session.get("state_detail") or "")
     signal_state = codex_session_signal_state(session)
@@ -8463,8 +8425,6 @@ def codex_source_chip_class(value: str) -> str:
 
 
 def codex_session_signal_state(session: dict[str, object]) -> str:
-    if bool(session.get("_codex_dismissed_attention")):
-        return "off"
     state = str(session.get("state") or "").lower()
     detail = str(session.get("state_detail") or "").lower()
     reason = str(session.get("open_reason") or "").lower()
@@ -8529,8 +8489,6 @@ def codex_signal_dot_class(state: str) -> str:
         "attention": "codex-signal-attention",
         "working": "codex-signal-working",
         "off": "codex-signal-off",
-        "closed": "codex-signal-off",
-        "close": "codex-signal-off",
     }.get(state, "codex-signal-off")
 
 
@@ -8541,83 +8499,6 @@ def codex_signal_chip_class(state: str) -> str:
         "attention": "codex-chip-attention",
         "working": "codex-chip-working",
     }.get(state, "codex-chip-offline")
-
-
-def codex_session_key(session: dict[str, object]) -> str:
-    server_url = str(session.get("server_url") or "").strip().rstrip("/")
-    session_id = str(session.get("session_id") or "").strip()
-    if not session_id:
-        return ""
-    return f"{server_url}|{session_id}"
-
-
-def codex_load_dismissed_sessions(path: Path = CODEX_DISMISSED_SESSIONS) -> dict[str, object]:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    result: dict[str, object] = {}
-    for key, value in data.items():
-        if isinstance(value, dict):
-            result[str(key)] = value
-            continue
-        try:
-            result[str(key)] = {"dismissed_at": float(value)}
-        except (TypeError, ValueError):
-            continue
-    return result
-
-
-def codex_save_dismissed_sessions(items: dict[str, object], path: Path = CODEX_DISMISSED_SESSIONS) -> None:
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(items, sort_keys=True), encoding="utf-8")
-    except OSError:
-        pass
-
-
-def codex_prune_dismissed_sessions(items: dict[str, object], sessions: list[dict[str, object]]) -> dict[str, object]:
-    sessions_by_key = {codex_session_key(session): session for session in sessions if codex_session_key(session)}
-    pruned: dict[str, object] = {}
-    for key, value in items.items():
-        session = sessions_by_key.get(key)
-        if session is None or codex_session_signal_state(session) == "off":
-            continue
-        if codex_session_dismissed_matches(session, value):
-            pruned[key] = value
-    if len(pruned) != len(items):
-        codex_save_dismissed_sessions(pruned)
-    return pruned
-
-
-def codex_session_dismissed(session: dict[str, object], dismissed: dict[str, object]) -> bool:
-    key = codex_session_key(session)
-    return bool(key and key in dismissed and codex_session_dismissed_matches(session, dismissed[key]))
-
-
-def codex_session_dismiss_fingerprint(session: dict[str, object]) -> dict[str, object]:
-    return {
-        "dismissed_at": time.time(),
-        "state": str(session.get("state") or ""),
-        "state_detail": str(session.get("state_detail") or ""),
-        "updated_at": str(session.get("updated_at") or ""),
-        "open_reason": str(session.get("open_reason") or ""),
-        "needs_approval": bool(session.get("needs_approval")),
-        "needs_open": bool(session.get("needs_open")),
-    }
-
-
-def codex_session_dismissed_matches(session: dict[str, object], dismissed_value: object) -> bool:
-    if not isinstance(dismissed_value, dict):
-        return True
-    if "state" not in dismissed_value and "updated_at" not in dismissed_value:
-        return True
-    return all(
-        dismissed_value.get(key) == codex_session_dismiss_fingerprint(session).get(key)
-        for key in ("state", "state_detail", "updated_at", "open_reason", "needs_approval", "needs_open")
-    )
 
 
 def codex_is_open_session(session: dict[str, object]) -> bool:
@@ -8666,19 +8547,6 @@ def codex_session_fallback_summary(session: dict[str, object], open_style: bool)
     if state in {"run", "running"}:
         return "Thinking"
     return ""
-
-
-def codex_open_session_action_hint(session: dict[str, object]) -> str:
-    available: list[str] = []
-    if bool(session.get("can_continue")):
-        available.append("Continue")
-    if bool(session.get("can_close")):
-        available.append("Close")
-    if str(session.get("tmux_pane") or "").strip():
-        available.append("Jump")
-    if not available:
-        return "No open-session actions are available"
-    return "Hold " + "  |  ".join(available)
 
 
 def codex_settings_summary(servers: list[dict[str, object]]) -> str:
@@ -8759,7 +8627,7 @@ def codex_updated_label(value: object) -> str:
 
 
 def codex_session_action(base_url: str, session_id: str, action: str, action_token: str = "") -> None:
-    if action not in {"continue", "close"}:
+    if action != "continue":
         raise ValueError("unsupported Codex action")
     payload = json.dumps({"action_token": action_token}).encode("utf-8") if action_token else b"{}"
     http_json(
