@@ -71,7 +71,6 @@ XIAO_USB_VENDOR = "2886"
 XIAO_USB_PRODUCT_IDS = {"0065", "8044", "8065"}
 XIAO_BOOTLOADER_PRODUCT_IDS = {"0065"}
 XIAO_BOOTLOADER_HINTS = ("uf2", "bootloader", "mass storage")
-UTILS_RESET_U_USB_TARGET = "1-1.4"
 XIAO_SERIAL_BAUD = 115200
 XIAO_STILL_G_FORCE = 0.08
 XIAO_PICKUP_G_FORCE = 0.12
@@ -977,7 +976,7 @@ class UConsoleHelperWindow(Gtk.Window):
         usb_card = card_box()
         page.pack_start(usb_card, False, False, 0)
 
-        usb_header = Gtk.Label(label="USB2.0 HUB", xalign=0)
+        usb_header = Gtk.Label(label="USB Devices", xalign=0)
         usb_header.get_style_context().add_class("muted")
         usb_card.pack_start(usb_header, False, False, 0)
 
@@ -3111,7 +3110,7 @@ class UConsoleHelperWindow(Gtk.Window):
     def refresh_utils_usb_devices(self) -> None:
         selected_hub = self.utils_selected_usb_hub
         self.utils_usb_store.clear()
-        appended = append_usb_device_tree(self.utils_usb_store, UTILS_RESET_U_USB_TARGET)
+        appended = append_all_usb_device_trees(self.utils_usb_store)
         if not appended:
             self.utils_usb_store.append(None, ["-", "-", "No USB devices", "-", "-", False])
         self.utils_usb_tree.expand_all()
@@ -10092,6 +10091,23 @@ def usb_device_product(device_name: str) -> str:
     return product or device_name
 
 
+def append_all_usb_device_trees(store: Gtk.TreeStore) -> bool:
+    usb_root = Path("/sys/bus/usb/devices")
+    try:
+        root_devices = [
+            path.name
+            for path in usb_root.iterdir()
+            if re.fullmatch(r"usb\d+", path.name)
+        ]
+    except OSError:
+        return False
+    appended = False
+    visited: set[str] = set()
+    for device_name in sorted(root_devices, key=usb_device_sort_key):
+        appended = append_usb_device_tree(store, device_name, visited=visited) or appended
+    return appended
+
+
 def append_usb_device_tree(
     store: Gtk.TreeStore,
     device_name: str,
@@ -10174,6 +10190,20 @@ def usb_hub_device_rows(hub_names: tuple[str, ...]) -> list[tuple[str, str, str,
 
 
 def direct_usb_children(hub_name: str) -> list[str]:
+    root_match = re.fullmatch(r"usb(\d+)", hub_name)
+    if root_match:
+        prefix = f"{root_match.group(1)}-"
+        children: list[str] = []
+        for path in Path("/sys/bus/usb/devices").iterdir():
+            name = path.name
+            if not name.startswith(prefix):
+                continue
+            suffix = name[len(prefix) :]
+            if not suffix or "." in suffix or ":" in suffix:
+                continue
+            children.append(name)
+        return sorted(children, key=usb_device_sort_key)
+
     prefix = f"{hub_name}."
     children: list[str] = []
     for path in Path("/sys/bus/usb/devices").iterdir():
@@ -10188,12 +10218,7 @@ def direct_usb_children(hub_name: str) -> list[str]:
 
 
 def usb_device_sort_key(device_name: str) -> tuple[int, ...]:
-    parts = re.split(r"[.-]", device_name)
-    values: list[int] = []
-    for part in parts:
-        if part.isdigit():
-            values.append(int(part))
-    return tuple(values)
+    return tuple(int(part) for part in re.findall(r"\d+", device_name))
 
 
 def usb_device_driver(device_path: Path) -> str:
