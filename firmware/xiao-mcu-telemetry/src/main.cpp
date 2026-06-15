@@ -5,6 +5,7 @@
 #include <LSM6DS3.h>
 #include <PDM.h>
 #include <Wire.h>
+#include <bluefruit.h>
 #include <math.h>
 
 using namespace Adafruit_LittleFS_Namespace;
@@ -41,6 +42,7 @@ static const uint32_t LED_TMUX_NOTIFY_MS = 600000;
 static const uint32_t LED_TMUX_DOUBLE_FLASH_PERIOD_MS = 3000;
 static const uint32_t LED_CODEX_FLASH_PERIOD_MS = 1400;
 static const uint32_t LED_CODEX_FLASH_ON_MS = 820;
+static const uint32_t CODEX_BLE_REFRESH_MS = 30000;
 static const uint32_t LED_AUTO_BRIGHTNESS_STEP_MS = 1000;
 static const uint8_t LED_AUTO_BRIGHTEN_STEP_PERCENT = 2;
 static const uint8_t LED_AUTO_DARKEN_STEP_PERCENT = 8;
@@ -124,6 +126,9 @@ static int battery_percent = -1;
 static String device_state = "held";
 static String battery_status = "unknown";
 static String codex_led_state = "off";
+static bool codex_ble_enabled = false;
+static uint8_t codex_ble_seq = 0;
+static uint32_t last_codex_ble_adv_ms = 0;
 static uint32_t tmux_notify_until = 0;
 static uint32_t last_led_color = 0;
 static uint32_t last_led_brightness_step_ms = 0;
@@ -177,6 +182,27 @@ static void print_status(const char *event_name, const Sample &sample);
 static float relative_delta(float a, float b);
 static void update_brightness_targets();
 static void reset_light_filter_from_current_raw();
+static void update_codex_ble_advertising(bool dance);
+
+static void disable_board_status_leds() {
+#ifdef LED_STATE_ON
+  const uint8_t off_state = 1 - LED_STATE_ON;
+#else
+  const uint8_t off_state = LOW;
+#endif
+#ifdef LED_RED
+  pinMode(LED_RED, OUTPUT);
+  digitalWrite(LED_RED, off_state);
+#endif
+#ifdef LED_GREEN
+  pinMode(LED_GREEN, OUTPUT);
+  digitalWrite(LED_GREEN, off_state);
+#endif
+#ifdef LED_BLUE
+  pinMode(LED_BLUE, OUTPUT);
+  digitalWrite(LED_BLUE, off_state);
+#endif
+}
 
 static uint32_t pixel_color(uint8_t red, uint8_t green, uint8_t blue) {
   return status_pixel.Color(red, green, blue);
@@ -292,6 +318,71 @@ static uint32_t codex_led_color(uint32_t now) {
     return led_color(0, 255, 72);
   }
   return 0;
+}
+
+static uint8_t codex_led_code() {
+  if (codex_led_state == "approval") {
+    return 1;
+  }
+  if (codex_led_state == "attention") {
+    return 2;
+  }
+  if (codex_led_state == "working") {
+    return 3;
+  }
+  if (codex_led_state == "goal") {
+    return 4;
+  }
+  return 0;
+}
+
+static uint8_t codex_state_code() {
+  if (codex_led_state == "working") {
+    return 2;
+  }
+  if (codex_led_state == "attention") {
+    return 3;
+  }
+  if (codex_led_state == "approval") {
+    return 4;
+  }
+  if (codex_led_state == "goal") {
+    return 5;
+  }
+  return 0;
+}
+
+static void update_codex_ble_advertising(bool dance) {
+  if (!codex_ble_enabled) {
+    Bluefruit.Advertising.stop();
+    disable_board_status_leds();
+    return;
+  }
+  codex_ble_seq++;
+  last_codex_ble_adv_ms = millis();
+  const uint8_t flags = dance ? 0x01 : 0x00;
+  const uint8_t payload[] = {
+      0xFF, 0xFF,
+      'C', 'B',
+      1,
+      codex_led_code(),
+      codex_state_code(),
+      flags,
+      codex_ble_seq,
+  };
+
+  Bluefruit.Advertising.stop();
+  Bluefruit.Advertising.clearData();
+  Bluefruit.ScanResponse.clearData();
+  Bluefruit.Advertising.setType(BLE_GAP_ADV_TYPE_NONCONNECTABLE_SCANNABLE_UNDIRECTED);
+  Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
+  Bluefruit.Advertising.addData(BLE_GAP_AD_TYPE_MANUFACTURER_SPECIFIC_DATA, payload, sizeof(payload));
+  Bluefruit.ScanResponse.addName();
+  Bluefruit.Advertising.restartOnDisconnect(false);
+  Bluefruit.Advertising.setInterval(160, 320);
+  Bluefruit.Advertising.setFastTimeout(0);
+  Bluefruit.Advertising.start(0);
+  disable_board_status_leds();
 }
 
 static void update_status_pixel() {
@@ -1087,12 +1178,28 @@ static void handle_command(const Sample &sample) {
     last_led_color = UINT32_MAX;
     update_status_pixel();
     print_status("led_brightness_ack", sample);
+  } else if (command == "led codex ble on") {
+    codex_ble_enabled = true;
+    update_codex_ble_advertising(false);
+    print_status("led_codex_ble_on", sample);
+  } else if (command == "led codex ble off") {
+    codex_ble_enabled = false;
+    update_codex_ble_advertising(false);
+    print_status("led_codex_ble_off", sample);
   } else if (command.startsWith("led codex ")) {
     String state = command.substring(10);
+    bool dance = false;
+    const int space = state.indexOf(' ');
+    if (space >= 0) {
+      const String suffix = state.substring(space + 1);
+      state = state.substring(0, space);
+      dance = suffix.indexOf("dance") >= 0;
+    }
     if (state != "off" && state != "goal" && state != "approval" && state != "attention" && state != "working") {
       state = "off";
     }
     codex_led_state = state;
+    update_codex_ble_advertising(dance);
     print_status("led_codex_ack", sample);
   } else if (command == "notify tmux") {
     if (led_notify_enabled) {
@@ -1113,7 +1220,7 @@ static void handle_command(const Sample &sample) {
     update_mic_power(millis());
     print_status("mic_assist_off", sample);
   } else if (command == "help") {
-    Serial.println("{\"commands\":[\"status\",\"sample\",\"calibrate pose\",\"calibrate light\",\"screen on\",\"screen off\",\"lock timeout <seconds>\",\"stand mode on\",\"stand mode off\",\"power ac\",\"power battery\",\"battery <percent> <charging|discharging|full>\",\"led battery on\",\"led battery off\",\"led notify on\",\"led notify off\",\"led night on\",\"led night off\",\"led brightness <0-100>\",\"led brightness base <0-100>\",\"led brightness auto on\",\"led brightness auto off\",\"led codex <off|goal|approval|attention|working>\",\"notify tmux\",\"notify clear\",\"mic assist on\",\"mic assist off\",\"stream on\",\"stream off\",\"help\"]}");
+    Serial.println("{\"commands\":[\"status\",\"sample\",\"calibrate pose\",\"calibrate light\",\"screen on\",\"screen off\",\"lock timeout <seconds>\",\"stand mode on\",\"stand mode off\",\"power ac\",\"power battery\",\"battery <percent> <charging|discharging|full>\",\"led battery on\",\"led battery off\",\"led notify on\",\"led notify off\",\"led night on\",\"led night off\",\"led brightness <0-100>\",\"led brightness base <0-100>\",\"led brightness auto on\",\"led brightness auto off\",\"led codex <off|goal|approval|attention|working> [dance]\",\"led codex ble <on|off>\",\"notify tmux\",\"notify clear\",\"mic assist on\",\"mic assist off\",\"stream on\",\"stream off\",\"help\"]}");
   }
 }
 
@@ -1131,6 +1238,11 @@ void setup() {
   Serial.begin(115200);
   status_pixel.begin();
   status_pixel.setBrightness(255);
+  Bluefruit.begin();
+  Bluefruit.autoConnLed(false);
+  Bluefruit.setName("uconsole-codex-led");
+  Bluefruit.setTxPower(4);
+  disable_board_status_leds();
 
   // Do not block on Serial. The GUI may open the port after boot.
   delay(300);
@@ -1177,6 +1289,9 @@ void loop() {
   update_mic_power(now);
   update_mic_state();
   update_status_pixel();
+  if (codex_ble_enabled && now - last_codex_ble_adv_ms >= CODEX_BLE_REFRESH_MS) {
+    update_codex_ble_advertising(false);
+  }
   update_light_sensor(false);
   handle_command(sample);
   maybe_report_brightness_change(sample, now);

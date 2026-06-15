@@ -12,6 +12,7 @@ import shutil
 import signal
 import struct
 import subprocess
+import threading
 import time
 import termios
 import urllib.error
@@ -43,11 +44,14 @@ AUTO_BRIGHTNESS_APPLY_EVENTS = {"brightness_changed", "light_changed", "screen_o
 LED_POWER_POLL_SECONDS = 30
 LED_BEHAVIOR_REFRESH_SECONDS = 60
 TMUX_NOTIFY_POLL_SECONDS = 5
-CODEX_LED_POLL_SECONDS = 5
+CODEX_LED_POLL_SECONDS = 1
 CODEX_GOAL_STALE_SECONDS = 300
 CODEX_LED_REQUEST_TIMEOUT_SECONDS = 2
 CODEX_LED_REFRESH_SECONDS = 300
 CODEX_LED_STATUS_STALE_SECONDS = 60
+CODEX_SSE_TIMEOUT_SECONDS = 45
+CODEX_SSE_RECONNECT_SECONDS = 3
+CODEX_SSE_STATUS_STALE_SECONDS = 45
 TMUX_NOTIFY_MARKER = Path(f"/run/user/{os.getuid()}/uconsole-helper-tmux-notify")
 TMUX_CLEAR_MARKER = Path(f"/run/user/{os.getuid()}/uconsole-helper-tmux-clear")
 DEFAULT_BATTERY_LOCK_PAUSE_PROCESS_NAMES = "chromium,chromium-browser,chrome,google-chrome,firefox,brave-browser"
@@ -70,6 +74,7 @@ class McuSerialReader:
         self.led_battery_enabled: bool | None = None
         self.led_notify_enabled: bool | None = None
         self.led_night_mode_enabled: bool | None = None
+        self.codex_ble_enabled: bool | None = None
         self.led_brightness_percent: int | None = None
         self.led_brightness_auto: bool | None = None
         self.led_behavior_sent_at = 0.0
@@ -97,6 +102,7 @@ class McuSerialReader:
         self.led_battery_enabled = None
         self.led_notify_enabled = None
         self.led_night_mode_enabled = None
+        self.codex_ble_enabled = None
         self.led_brightness_percent = None
         self.led_brightness_auto = None
         self.led_behavior_sent_at = 0.0
@@ -205,12 +211,22 @@ class McuSerialReader:
             self.led_night_mode_enabled = night_mode_enabled
         self.led_behavior_sent_at = now
 
+    def configure_codex_ble(self, enabled: bool) -> None:
+        if self.codex_ble_enabled is enabled:
+            return
+        self.write_command("led codex ble on" if enabled else "led codex ble off")
+        self.codex_ble_enabled = enabled
+
     def configure_codex_led(self, state: str) -> None:
+        self.configure_codex_led_with_dance(state, False)
+
+    def configure_codex_led_with_dance(self, state: str, dance: bool) -> None:
         if state not in {"off", "goal", "approval", "attention", "working"}:
             state = "off"
         now = time.time()
-        if self.codex_led_state != state or now - self.codex_led_sent_at >= CODEX_LED_REFRESH_SECONDS:
-            self.write_command(f"led codex {state}")
+        if dance or self.codex_led_state != state or now - self.codex_led_sent_at >= CODEX_LED_REFRESH_SECONDS:
+            suffix = " dance" if dance else ""
+            self.write_command(f"led codex {state}{suffix}")
             self.codex_led_state = state
             self.codex_led_sent_at = now
 
@@ -219,6 +235,65 @@ class McuSerialReader:
 
     def notify_clear(self) -> None:
         self.write_command("notify clear")
+
+
+class CodexLEDStreamState:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.workers: dict[str, threading.Thread] = {}
+        self.states: dict[str, tuple[str, float]] = {}
+
+    def close(self) -> None:
+        self.stop_event.set()
+        with self.lock:
+            self.workers = {}
+            self.states = {}
+
+    def sync(self, values: dict[str, str]) -> None:
+        if self.stop_event.is_set():
+            self.stop_event = threading.Event()
+        urls = set(codex_server_urls(values))
+        with self.lock:
+            for url in list(self.states):
+                if url not in urls:
+                    self.states.pop(url, None)
+            active = {url for url, worker in self.workers.items() if worker.is_alive()}
+            for url in list(self.workers):
+                if url not in urls or url not in active:
+                    self.workers.pop(url, None)
+            for url in urls:
+                if url in self.workers:
+                    continue
+                worker = threading.Thread(target=self._worker, args=(url,), daemon=True)
+                self.workers[url] = worker
+                worker.start()
+
+    def aggregate(self) -> str | None:
+        now = time.time()
+        aggregate = "off"
+        connected = False
+        with self.lock:
+            for state, updated_at in self.states.values():
+                if now - updated_at > CODEX_SSE_STATUS_STALE_SECONDS:
+                    continue
+                connected = True
+                aggregate = stronger_codex_state(aggregate, state)
+        return aggregate if connected else None
+
+    def _worker(self, base_url: str) -> None:
+        while not self.stop_event.is_set():
+            try:
+                for status in codex_stream_status_events(base_url, self.stop_event):
+                    state = codex_status_led_state(status, base_url)
+                    with self.lock:
+                        self.states[base_url] = (state, time.time())
+                    if self.stop_event.is_set():
+                        return
+            except Exception as exc:
+                if not self.stop_event.is_set():
+                    print(f"warning: codex SSE failed for {base_url}: {exc}", flush=True)
+                    self.stop_event.wait(CODEX_SSE_RECONNECT_SECONDS)
 
 
 class AutoBrightnessState:
@@ -805,6 +880,38 @@ def load_codex_status(base_url: str) -> dict[str, object]:
     return payload
 
 
+def codex_stream_url(base_url: str) -> str:
+    if base_url.endswith("/v1/stream"):
+        return base_url
+    return base_url.rstrip("/") + "/v1/stream"
+
+
+def codex_stream_status_events(base_url: str, stop_event: threading.Event):
+    request = urllib.request.Request(codex_stream_url(base_url), headers={"Accept": "text/event-stream"})
+    with urllib.request.urlopen(request, timeout=CODEX_SSE_TIMEOUT_SECONDS) as response:
+        event = ""
+        data_lines: list[str] = []
+        while not stop_event.is_set():
+            raw_line = response.readline()
+            if not raw_line:
+                return
+            line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+            if line == "":
+                if event == "status" and data_lines:
+                    payload = json.loads("\n".join(data_lines))
+                    if isinstance(payload, dict):
+                        yield payload
+                event = ""
+                data_lines = []
+                continue
+            if line.startswith(":"):
+                continue
+            if line.startswith("event:"):
+                event = line[6:].strip()
+            elif line.startswith("data:"):
+                data_lines.append(line[5:].strip())
+
+
 def codex_session_led_state(session: dict[str, object]) -> str:
     state = str(session.get("state") or "").lower()
     detail = str(session.get("state_detail") or "").lower()
@@ -860,7 +967,7 @@ def codex_datetime_from_iso(value: str) -> float:
 
 
 def stronger_codex_state(current: str, candidate: str) -> str:
-    priority = {"off": 0, "working": 10, "attention": 20, "approval": 30, "goal": 40}
+    priority = {"off": 0, "goal": 5, "working": 10, "attention": 20, "approval": 30}
     return candidate if priority.get(candidate, 0) > priority.get(current, 0) else current
 
 
@@ -901,20 +1008,28 @@ def aggregate_codex_led_state(values: dict[str, str]) -> str:
             print(f"warning: codex status failed for {url}: {exc}", flush=True)
             continue
         connected = True
-        sessions = status.get("sessions")
-        if isinstance(sessions, list):
-            for session in sessions:
-                if isinstance(session, dict):
-                    if "server_url" not in session:
-                        session = {**session, "server_url": url.rstrip("/")}
-                    aggregate = stronger_codex_state(aggregate, codex_session_led_state(session))
-        else:
-            state = str(status.get("overall_state") or "").lower()
-            aggregate = stronger_codex_state(
-                aggregate,
-                "working" if state in {"run", "running", "running_bash"} else "attention" if state in {"open", "attention"} else "off",
-            )
+        aggregate = stronger_codex_state(aggregate, codex_status_led_state(status, url))
     return aggregate if connected else "off"
+
+
+def codex_status_led_state(status: dict[str, object], base_url: str) -> str:
+    aggregate = "off"
+    sessions = status.get("sessions")
+    if isinstance(sessions, list):
+        for session in sessions:
+            if isinstance(session, dict):
+                if "server_url" not in session:
+                    session = {**session, "server_url": base_url.rstrip("/")}
+                aggregate = stronger_codex_state(aggregate, codex_session_led_state(session))
+        return aggregate
+    state = str(status.get("overall_state") or "").lower()
+    return "working" if state in {"run", "running", "running_bash"} else "attention" if state in {"open", "attention"} else "off"
+
+
+def codex_dance_trigger(state: str, previous_state: str | None, values: dict[str, str]) -> bool:
+    if not config_enabled(values, "MCU_LED_CODEX_DANCE_MODE", "0"):
+        return False
+    return state == "goal" and previous_state != "goal"
 
 
 def int_config(values: dict[str, str], key: str, default: int) -> int:
@@ -1283,13 +1398,16 @@ def main() -> int:
     auto_last_sample_at: float | None = None
     auto_brightness_state = AutoBrightnessState()
     mcu_reader = McuSerialReader()
+    codex_streams = CodexLEDStreamState()
     host_input = HostInputMonitor()
     process_pauser = BatteryLockProcessPauser()
     atexit.register(process_pauser.close)
+    atexit.register(codex_streams.close)
     display_cache = DisplayStateCache()
     reported_display_off: bool | None = None
     last_led_power_update = 0.0
     last_codex_led_update = 0.0
+    last_codex_ble_state: str | None = None
     idle_shutdown_requested = False
     values = load_config()
     state = power_state(Path(values.get("POWERSAVER_POWER_SUPPLY_DIR", str(POWER_SUPPLY_DIR))))
@@ -1307,6 +1425,10 @@ def main() -> int:
         now = time.time()
         if now - last_config_check >= CONFIG_POLL_SECONDS:
             values = load_config()
+            if config_enabled(values, "MCU_LED_CODEX_ENABLED", "0"):
+                codex_streams.sync(values)
+            else:
+                codex_streams.close()
             state = power_state(Path(values.get("POWERSAVER_POWER_SUPPLY_DIR", str(POWER_SUPPLY_DIR))))
             last_config_check = now
         screen_mode = screen_mode_for_profile(values)
@@ -1329,8 +1451,12 @@ def main() -> int:
         led_brightness = clamped_int_config(values, "MCU_LED_BRIGHTNESS_PERCENT", 30, 0, 100)
         led_brightness_auto = config_enabled(values, "MCU_LED_BRIGHTNESS_AUTO", "0")
         mcu_reader.configure_led_behavior(battery_led_enabled, night_mode_enabled, led_brightness, led_brightness_auto)
+        mcu_reader.configure_codex_ble(config_enabled(values, "MCU_LED_CODEX_BLE_ENABLED", "0"))
         if now - last_codex_led_update >= CODEX_LED_POLL_SECONDS:
-            mcu_reader.configure_codex_led(aggregate_codex_led_state(values))
+            codex_led_state = codex_streams.aggregate() or "off"
+            dance = codex_dance_trigger(codex_led_state, last_codex_ble_state, values)
+            mcu_reader.configure_codex_led_with_dance(codex_led_state, dance)
+            last_codex_ble_state = codex_led_state
             last_codex_led_update = now
         if battery_led_enabled and now - last_led_power_update >= LED_POWER_POLL_SECONDS:
             if state in {"ac", "battery"}:

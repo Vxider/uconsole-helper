@@ -357,6 +357,8 @@ class UConsoleHelperWindow(Gtk.Window):
             "MCU_LED_BATTERY_ENABLED": Gtk.Switch(),
             "MCU_LED_NIGHT_MODE_ENABLED": Gtk.Switch(),
             "MCU_LED_CODEX_ENABLED": Gtk.Switch(),
+            "MCU_LED_CODEX_BLE_ENABLED": Gtk.Switch(),
+            "MCU_LED_CODEX_DANCE_MODE": Gtk.Switch(),
             "MCU_LED_BRIGHTNESS_AUTO": Gtk.Switch(),
         }
         for switch in self.mcu_led_controls.values():
@@ -1091,6 +1093,8 @@ class UConsoleHelperWindow(Gtk.Window):
             ("MCU_LED_BATTERY_ENABLED", "Battery", "Show low battery warning only. This has the highest LED priority."),
             ("MCU_LED_NIGHT_MODE_ENABLED", "Night Mode", "Turn off LED indicators when ambient light is at or below 0.1 lux."),
             ("MCU_LED_CODEX_ENABLED", "Codex Indicator", "Show aggregated Codex status with signal colors: green=goal complete, red=approval needed, yellow=follow-up/open needed, blue=working."),
+            ("MCU_LED_CODEX_BLE_ENABLED", "BLE Broadcast", "Broadcast the Codex LED state from the background service to the ESP32 indicator."),
+            ("MCU_LED_CODEX_DANCE_MODE", "Dance Mode", "When a goal completes, send a one-shot BLE dance flag for the ESP32 motor."),
             ("MCU_LED_BRIGHTNESS_AUTO", "Auto Brightness", "Adjust LED brightness from ambient light between 1% and 40%."),
             ("MCU_LED_BRIGHTNESS_PERCENT", "Brightness", "WS2812 brightness percentage."),
         ]
@@ -3016,7 +3020,7 @@ class UConsoleHelperWindow(Gtk.Window):
         config = helper_service_config()
         self.mcu_led_config_updating = True
         for key, switch in self.mcu_led_controls.items():
-            default = "0" if key in {"MCU_LED_CODEX_ENABLED", "MCU_LED_BRIGHTNESS_AUTO"} else "1"
+            default = "0" if key in {"MCU_LED_CODEX_ENABLED", "MCU_LED_CODEX_BLE_ENABLED", "MCU_LED_CODEX_DANCE_MODE", "MCU_LED_BRIGHTNESS_AUTO"} else "1"
             switch.set_active(config.get(key, default).lower() in {"1", "yes", "true", "on", "enabled"})
         try:
             brightness_percent = int(config.get("MCU_LED_BRIGHTNESS_PERCENT", "30"))
@@ -4077,6 +4081,9 @@ class UConsoleHelperWindow(Gtk.Window):
         values.setdefault("MCU_LED_BATTERY_ENABLED", config.get("MCU_LED_BATTERY_ENABLED", "1"))
         values.setdefault("MCU_LED_NIGHT_MODE_ENABLED", config.get("MCU_LED_NIGHT_MODE_ENABLED", "1"))
         values.setdefault("MCU_LED_CODEX_ENABLED", config.get("MCU_LED_CODEX_ENABLED", "0"))
+        values.setdefault("MCU_LED_CODEX_BLE_ENABLED", config.get("MCU_LED_CODEX_BLE_ENABLED", "0"))
+        values.setdefault("MCU_LED_CODEX_DANCE_MODE", config.get("MCU_LED_CODEX_DANCE_MODE", "0"))
+        values["MCU_LED_CODEX_BLE_ADAPTER_INDEX"] = config.get("MCU_LED_CODEX_BLE_ADAPTER_INDEX", "0")
         values.setdefault("MCU_LED_BRIGHTNESS_AUTO", config.get("MCU_LED_BRIGHTNESS_AUTO", "0"))
         brightness_spin = getattr(self, "mcu_led_brightness_spin", None)
         if brightness_spin is not None:
@@ -5078,6 +5085,9 @@ def power_policy_config_text(values: dict[str, str]) -> str:
             f"MCU_LED_BATTERY_ENABLED={values['MCU_LED_BATTERY_ENABLED']}",
             f"MCU_LED_NIGHT_MODE_ENABLED={values['MCU_LED_NIGHT_MODE_ENABLED']}",
             f"MCU_LED_CODEX_ENABLED={values['MCU_LED_CODEX_ENABLED']}",
+            f"MCU_LED_CODEX_BLE_ENABLED={values['MCU_LED_CODEX_BLE_ENABLED']}",
+            f"MCU_LED_CODEX_DANCE_MODE={values['MCU_LED_CODEX_DANCE_MODE']}",
+            f"MCU_LED_CODEX_BLE_ADAPTER_INDEX={values['MCU_LED_CODEX_BLE_ADAPTER_INDEX']}",
             f"MCU_LED_BRIGHTNESS_AUTO={values['MCU_LED_BRIGHTNESS_AUTO']}",
             "",
             "### MCU_LED_BRIGHTNESS_PERCENT --- [0~100]",
@@ -7221,6 +7231,9 @@ def helper_service_config() -> dict[str, str]:
         "MCU_LED_BATTERY_ENABLED": "1",
         "MCU_LED_NIGHT_MODE_ENABLED": "1",
         "MCU_LED_CODEX_ENABLED": "0",
+        "MCU_LED_CODEX_BLE_ENABLED": "0",
+        "MCU_LED_CODEX_DANCE_MODE": "0",
+        "MCU_LED_CODEX_BLE_ADAPTER_INDEX": "0",
         "MCU_LED_BRIGHTNESS_AUTO": "0",
         "MCU_LED_BRIGHTNESS_PERCENT": "30",
     }

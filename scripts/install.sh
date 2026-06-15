@@ -158,6 +158,9 @@ install_service() {
     remove_config_key "${config_file}" "MCU_LED_LXTERMINAL_BELL_ENABLED"
     ensure_config_key "${config_file}" "MCU_LED_NIGHT_MODE_ENABLED" "1"
     ensure_config_key "${config_file}" "MCU_LED_CODEX_ENABLED" "0"
+    ensure_config_key "${config_file}" "MCU_LED_CODEX_BLE_ENABLED" "0"
+    ensure_config_key "${config_file}" "MCU_LED_CODEX_DANCE_MODE" "0"
+    ensure_config_key "${config_file}" "MCU_LED_CODEX_BLE_ADAPTER_INDEX" "0"
     ensure_config_key "${config_file}" "MCU_LED_BRIGHTNESS_AUTO" "0"
     ensure_config_key "${config_file}" "MCU_LED_BRIGHTNESS_PERCENT" "30"
   fi
